@@ -4,15 +4,14 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 
+from PIL import Image
 from utils import load_dyes_yaml, build_emission_dict
 from optimizer import solve_minimax_inventory
-from PIL import Image
 
 st.set_page_config(page_title="Probe–Dye Optimizer", layout="wide")
 
-
-logo = Image.open("assets/lab logo.png")
-st.image(logo, width=180)   # 你可以调整 width 大小
+logo = Image.open("assets/lab logo.jpg")
+st.image(logo, width=180)
 
 st.title("Choosing Fluorophores via Spectral Similarity Minimization")
 
