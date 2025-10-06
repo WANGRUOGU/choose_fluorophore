@@ -1,9 +1,20 @@
-# wavelength grid is shared (nm)
-wavelengths: [400, 401, 402, 800]   # use your real grid
+wavelengths: [500, 510, 520, 530, 540, 550, 560, 570, 580]
 
 dyes:
-  "ATTO 488":
-    emission:  [0.00, 0.01, 0.03, 0.00]
-    excitation:[0.00, 0.04, 0.08, 0.00]
-    quantum_yield: 0.80       # optional; can be null
-    extinction_coeff:  90000  # optional; can be null
+  "Alexa Fluor 405":
+    emission:      [0.02, 0.03, 0.05, 0.08, 0.06, 0.04, 0.02, 0.01, 0.00]
+    excitation:    []
+    quantum_yield:
+    extinction_coeff:
+
+  "Alexa Fluor 488":
+    emission:      [0.00, 0.02, 0.08, 0.12, 0.10, 0.06, 0.03, 0.01, 0.00]
+    excitation:    []
+    quantum_yield:
+    extinction_coeff:
+
+  "ATTO 647N":
+    emission:      [0.00, 0.00, 0.01, 0.03, 0.06, 0.10, 0.12, 0.08, 0.03]
+    excitation:    []
+    quantum_yield:
+    extinction_coeff:
