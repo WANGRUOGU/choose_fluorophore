@@ -9,7 +9,7 @@ from optimizer import solve_minimax_inventory
 
 st.set_page_config(page_title="Probe–Dye Optimizer", layout="wide")
 
-st.title("Probe–Dye Selection via Spectral Similarity Minimization")
+st.title("Choosing Fluorophores via Spectral Similarity Minimization")
 
 # ---- Sidebar: data & settings ----
 with st.sidebar:
