@@ -13,7 +13,7 @@ st.set_page_config(page_title="Probe–Dye Optimizer", layout="wide")
 logo = Image.open("assets/lab logo.jpg")
 st.image(logo, width=180)
 
-st.title("Choosing Fluorophores via Spectral Similarity Minimization")
+st.title("Choosing Fluorophores")
 
 # ---- Sidebar: data & settings ----
 with st.sidebar:
