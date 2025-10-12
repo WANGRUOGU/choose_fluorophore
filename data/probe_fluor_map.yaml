@@ -131,7 +131,7 @@ probes:
   - Bodipy FL
 - name: STR405
   fluors:
-  - AF546/ 548
+  - AF546
   - AF594
   - AF633
   - AF660
