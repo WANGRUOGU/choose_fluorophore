@@ -1,63 +1,85 @@
-# app.py
+import os
+import yaml
+import numpy as np
 import pandas as pd
+import plotly.express as px
 import streamlit as st
-from utils import load_dyes_yaml, build_probe_to_fluors, intersect_fluors_with_spectra
 
-st.subheader("Inventory Inputs (from your spreadsheet)")
+from utils import load_dyes_yaml
+from optimizer import solve_minimax_inventory
 
-# 1) Upload your Excel or CSV file
-uploaded = st.file_uploader("Upload probe–fluor table (Excel/CSV)", type=["xlsx", "xls", "csv"])
+st.set_page_config(page_title="Probe–Dye Optimizer", layout="wide")
 
-probe_to_fluors = {}
-parse_hint = r'^([^-\s]+)'  # Extract probe name from “Probe-Fluor” format, adjust if needed
+# Optional: show a logo if you store it in assets/
+# from PIL import Image
+# logo = Image.open("assets/valm_lab_logo.png")
+# st.image(logo, width=160)
 
-if uploaded is not None:
-    # 2) Read file
-    if uploaded.name.lower().endswith((".xlsx", ".xls")):
-        df = pd.read_excel(uploaded)
-    else:
-        df = pd.read_csv(uploaded)
+st.title("Probe–Dye Selection via Spectral Similarity Minimization")
 
-    st.write("Preview of uploaded table:")
-    st.dataframe(df.head(10), use_container_width=True)
+# ---- Sidebar: load spectral DB and options ----
+with st.sidebar:
+    st.header("Data & Options")
+    yaml_path = st.text_input("Spectra YAML path", "spectra/dyes.yaml")
+    wl, dye_db = load_dyes_yaml(yaml_path)
+    all_dyes = sorted(dye_db.keys())
 
-    # 3) Let user select which columns correspond to probe and fluorophore
-    cols = list(df.columns)
-    c1, c2 = st.columns(2)
-    with c1:
-        probe_col = st.selectbox("Select the column for probe (2nd col in your description)", options=cols, index=min(1, len(cols)-1))
-    with c2:
-        fluor_col = st.selectbox("Select the column for fluorophore (3rd col)", options=cols, index=min(2, len(cols)-1))
+    st.markdown("---")
+    st.subheader("Purchasable dyes (optional)")
+    allow_purchase = st.checkbox("Allow purchasable dyes", value=False)
+    purch_pool = []
+    max_new = 0
+    if allow_purchase:
+        purch_pool = st.multiselect("Purchasable dye pool", options=all_dyes, default=[])
+        max_new = st.number_input("Max new dyes to purchase", min_value=0, value=1, step=1)
 
-    # 4) Build probe → fluor mapping
-    try:
-        mapping = build_probe_to_fluors(df, probe_col=probe_col, fluor_col=fluor_col, probe_parse=parse_hint)
-        # 5) Filter out fluors that have no spectra in dyes.yaml
-        filtered = intersect_fluors_with_spectra(mapping, dye_db)
-        missing = {p: [f for f in fls if f not in filtered.get(p, [])] for p, fls in mapping.items()}
-        missing_total = sum(len(v) for v in missing.values())
-        if missing_total > 0:
-            st.warning(f"{missing_total} fluor(s) found in the table have no spectra in dyes.yaml; they were ignored.")
+st.subheader("Probe–Fluor Mapping (from repository)")
 
-        probe_to_fluors = filtered
+# Load mapping from YAML committed to the repo
+mapping_file = "data/probe_fluor_map.yaml"
+if not os.path.exists(mapping_file):
+    st.error(f"Mapping file not found: {mapping_file}. Please add it to the repository.")
+    st.stop()
 
-        # Display a few probes and their candidate fluors for verification
-        st.write("Detected probe → candidate fluor mapping (filtered by spectra availability):")
-        preview = {k: ", ".join(v) for k, v in list(probe_to_fluors.items())[:10]}
-        st.json(preview)
-    except Exception as e:
-        st.error(f"Failed to parse the table: {e}")
+with open(mapping_file, "r", encoding="utf-8") as f:
+    pf = yaml.safe_load(f)
 
-# 6) Let user choose which probes to include in optimization
-selected_probes = []
-if probe_to_fluors:
-    all_probes = sorted(probe_to_fluors.keys())
-    selected_probes = st.multiselect("Pick probes to optimize", options=all_probes, default=all_probes[:min(5, len(all_probes))])
+# Build mapping: probe -> [fluors...]
+probe_to_fluors = {entry["name"]: entry["fluors"] for entry in pf.get("probes", [])}
 
-# 7) Build inputs for optimizer
-if probe_to_fluors and selected_probes:
+# Warn if some fluors in mapping do not exist in spectra/dyes.yaml
+missing_pairs = []
+filtered_mapping = {}
+for probe, fls in probe_to_fluors.items():
+    keep = [f for f in fls if f in dye_db]
+    if len(keep) < len(fls):
+        for f in fls:
+            if f not in dye_db:
+                missing_pairs.append((probe, f))
+    if keep:
+        filtered_mapping[probe] = keep
+
+if missing_pairs:
+    st.warning(f"{len(missing_pairs)} fluor(s) in mapping have no spectra in {yaml_path} and were ignored.")
+
+# Preview mapping
+if not filtered_mapping:
+    st.error("No valid probe→fluor mapping after filtering by spectra. Please update mapping or spectra.")
+    st.stop()
+
+preview = {k: ", ".join(v) for k, v in list(filtered_mapping.items())[:12]}
+st.write("Detected probe → available fluor mapping (filtered):")
+st.json(preview)
+
+# Let the user select which probes to optimize
+all_probes = sorted(filtered_mapping.keys())
+default_n = min(5, len(all_probes))
+selected_probes = st.multiselect("Pick probes to optimize", options=all_probes, default=all_probes[:default_n])
+
+# Prepare optimizer inputs
+if selected_probes:
     probe_names = selected_probes
-    group_options = [probe_to_fluors[p] for p in selected_probes]
+    group_options = [filtered_mapping[p] for p in selected_probes]
 else:
     probe_names = []
     group_options = []
@@ -66,21 +88,57 @@ st.divider()
 run = st.button("Optimize")
 
 if run:
-    if not probe_names:
-        st.error("Please upload the table and select at least two probes.")
-    else:
-        # Build emission dictionary from YAML (unchanged logic)
-        E_by_dye = {name: dye_db[name]["emission"] for name in dye_db.keys()}
+    if len(probe_names) < 2:
+        st.error("Please select at least two probes.")
+        st.stop()
 
-        # Call the optimizer (no modification needed)
-        res = solve_minimax_inventory(
-            probe_names=probe_names,
-            group_options=group_options,
-            emission_by_dye=E_by_dye,
-            allow_purchase=allow_purchase,
-            purchasable_pool=purch_pool,
-            max_new_dyes=max_new
-        )
+    # Build emission dictionary from spectral DB
+    E_by_dye = {name: dye_db[name]["emission"] for name in dye_db.keys()}
 
-        # Display optimization results (keep your original visualization)
-        # ...
+    # Call optimizer (single-level minimax)
+    res = solve_minimax_inventory(
+        probe_names=probe_names,
+        group_options=group_options,
+        emission_by_dye=E_by_dye,
+        allow_purchase=allow_purchase,
+        purchasable_pool=purch_pool,
+        max_new_dyes=max_new
+    )
+
+    st.success(f"Optimal max similarity t* = {res['t']:.3f}")
+
+    # Show chosen assignment
+    df_assign = pd.DataFrame({
+        "Probe": probe_names,
+        "Chosen (Probe / Dye)": res["chosen_by_probe"]
+    })
+    st.dataframe(df_assign, use_container_width=True)
+
+    # Heatmap of pairwise cosine among chosen
+    sim = np.array(res["sim_pp"])
+    fig = px.imshow(
+        sim, x=probe_names, y=probe_names, zmin(0), zmax(1),
+        color_continuous_scale="RdBu_r", aspect="auto",
+        title="Cosine Similarity (Chosen Set)"
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Top similarities
+    top_df = pd.DataFrame([
+        {"Pair": f"{probe_names[i]}–{probe_names[j]}", "Cosine": s}
+        for (i, j), s in res["top_pairs"]
+    ])
+    st.write("Top pairwise similarities (descending):")
+    st.dataframe(top_df, use_container_width=True)
+
+    # Purchases (if any)
+    if res["purchased"]:
+        st.info("Purchased dyes: " + ", ".join(res["purchased"]))
+
+    # Export
+    st.download_button(
+        "Download assignment CSV",
+        df_assign.to_csv(index=False),
+        file_name="assignment.csv",
+        mime="text/csv"
+    )
