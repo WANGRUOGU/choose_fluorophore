@@ -39,7 +39,7 @@ probes:
 - name: Caa
   fluors:
   - AF514
-  - DualAF488
+  - AF488
 - name: EUB338
   fluors:
   - Pacific Blue
@@ -62,7 +62,7 @@ probes:
   - AF668
   - AF680
   - AF700
-  - PacificBlue
+  - Pacific Blue
 - name: EUB339
   fluors:
   - ATTO542
@@ -85,7 +85,7 @@ probes:
 - name: FUS714
   fluors:
   - AF555
-  - dualAF594
+  - AF594
 - name: GAM42a
   fluors:
   - RRX
