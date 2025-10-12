@@ -1,0 +1,148 @@
+schema: probe-to-fluor/v1
+updated: '2025-10-12'
+notes: 'Auto-generated from FISH Probes_Stock_2023-2024_2025.xlsx (sheet: Conventional
+  probes)'
+probes:
+- name: ACT476
+  fluors:
+  - AF488
+  - AF514
+  - AF660
+  - AF555
+- name: ALF682
+  fluors:
+  - AF555
+- name: ALF968
+  fluors:
+  - AF555
+- name: CAM1021
+  fluors:
+  - Bodipy FL
+- name: CAP371
+  fluors:
+  - AF668
+- name: CF319a
+  fluors:
+  - AF488
+- name: CFB562
+  fluors:
+  - AF488
+- name: COR595
+  fluors:
+  - AF647
+  - AF660
+- name: COR633
+  fluors:
+  - RRX
+  - AF594
+  - AF647
+- name: Caa
+  fluors:
+  - AF514
+  - DualAF488
+- name: EUB338
+  fluors:
+  - Pacific Blue
+  - Bodipy FL
+  - FITC
+  - AF488
+  - Oregon Green 514
+  - TET
+  - AF514
+  - Pacific Orange
+  - AF532
+  - AF555
+  - AF594
+  - AF546
+  - RRX
+  - AF633
+  - AF405
+  - AF647
+  - AF660
+  - AF668
+  - AF680
+  - AF700
+  - PacificBlue
+- name: EUB339
+  fluors:
+  - ATTO542
+  - AF647
+- name: EUK516
+  fluors:
+  - RRX
+- name: Efae470
+  fluors:
+  - AF594
+- name: Eliz276
+  fluors:
+  - Cy3
+- name: Eliz656
+  fluors:
+  - Cy3
+- name: Eliz730
+  fluors:
+  - Cy3
+- name: FUS714
+  fluors:
+  - AF555
+  - dualAF594
+- name: GAM42a
+  fluors:
+  - RRX
+- name: GEM572
+  fluors:
+  - Pacific Orange
+- name: LEP568
+  fluors:
+  - AF488
+  - AF660
+- name: LEP569
+  fluors:
+  - AF661
+- name: NEI1030
+  fluors:
+  - TET
+  - AF514
+  - AF532
+  - AF633
+- name: PAS111
+  fluors:
+  - AF660
+  - RRX
+- name: PGI350
+  fluors:
+  - Pacific Blue
+  - AF488
+- name: PRV392
+  fluors:
+  - RRX
+  - AF633
+  - AF635
+- name: PsearA
+  fluors:
+  - AF488
+  - RRX
+- name: ROT491
+  fluors:
+  - AF647
+  - AF610
+- name: SEL60
+  fluors:
+  - Bodipy FL
+- name: STR405
+  fluors:
+  - AF546/ 548
+  - AF594
+  - AF633
+  - AF660
+  - AF514
+- name: STR406
+  fluors:
+  - AF532
+- name: TRP684
+  fluors:
+  - AF594
+- name: VEI488
+  fluors:
+  - AF514
+  - AF555
