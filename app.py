@@ -117,10 +117,16 @@ if run:
     # Heatmap of pairwise cosine among chosen
     sim = np.array(res["sim_pp"])
     fig = px.imshow(
-        sim, x=probe_names, y=probe_names, zmin(0), zmax(1),
-        color_continuous_scale="RdBu_r", aspect="auto",
-        title="Cosine Similarity (Chosen Set)"
-    )
+    sim, 
+    x=probe_names, 
+    y=probe_names, 
+    zmin=0, 
+    zmax=1,
+    color_continuous_scale="RdBu_r", 
+    aspect="auto",
+    title="Cosine Similarity (Chosen Set)"
+)
+
     st.plotly_chart(fig, use_container_width=True)
 
     # Top similarities
