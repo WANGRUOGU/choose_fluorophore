@@ -23,7 +23,14 @@ yaml_path = "data/dyes.yaml"
 probe_map_path = "data/probe_fluor_map.yaml"
 
 wl, dye_db = load_dyes_yaml(yaml_path)
-probe_to_fluors = load_probe_fluor_map(probe_map_path)
+
+# Load raw mapping (supports top-level or {mapping: ...})
+mapping_raw = load_probe_fluor_map(probe_map_path)
+
+# Normalize & filter against dyes.yaml so UI only shows valid probes
+from utils import normalize_probe_mapping
+probe_to_fluors = normalize_probe_mapping(mapping_raw, dye_db)
+
 
 # -----------------------------
 # Sidebar: Pipeline configuration
