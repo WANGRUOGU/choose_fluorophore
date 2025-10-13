@@ -193,7 +193,7 @@ else:
         y = En_final[:, j]  # normalized for display
         fig.add_trace(go.Scatter(x=wl, y=y, mode="lines", name=fluor))
     fig.update_layout(
-        title="Effective spectra under lasers (normalized for display)",
-        xaxis_title="Wavelength (nm)", yaxis_title="Intensity (normalized)"
+        title="Effective spectra under lasers",
+        xaxis_title="Wavelength (nm)", yaxis_title="Intensity (a.u.)"
     )
     st.plotly_chart(fig, use_container_width=True)
