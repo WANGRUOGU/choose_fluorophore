@@ -46,42 +46,46 @@ def load_text_preview(path: str, mtime: float, head_bytes: int = 1200) -> str:
         return f"[ERROR reading {path}: {e}]"
 
 @st.cache_data(show_spinner=False)
-def read_probes_and_mapping(path: str, mtime: float):
+def read_probes_and_mapping_no_cache(path: str):
     """
-    Parse probe list from YAML.
-    Supported structures:
-      A) dict with key 'probes': [ {name: ..., fluors: [...]}, ... ]
-      B) top-level list:        [ {name: ..., fluors: [...]}, ... ]  <-- 你现在用的
+    Read probes from YAML where the TOP-LEVEL is a LIST:
+    - name: PROBE
+      fluors: [ ... ]
     Returns:
       names_sorted: list[str]
       mapping: dict[str, list[str]]
     """
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
+
+    # Strictly require top-level list (that is your current file)
+    if not isinstance(data, list):
+        # Try fallback if it's a dict with 'probes'
+        if isinstance(data, dict) and isinstance(data.get("probes"), list):
+            items = data["probes"]
+        else:
+            # Show what structure we actually saw
+            st.error("probe_fluor_map.yaml is not a top-level list. Parsed type: "
+                     f"{type(data).__name__}. Keys: {list(data.keys()) if isinstance(data, dict) else 'N/A'}")
+            return [], {}
+    else:
+        items = data
+
     names = []
     mapping = {}
-
-    # Case B: top-level list
-    if isinstance(data, list):
-        items = data
-    else:
-        # Case A: dict with 'probes'
-        items = (data or {}).get("probes", [])
-
-    if isinstance(items, list):
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            name = str(item.get("name", "")).strip()
-            fls = item.get("fluors", []) or []
-            if not name:
-                continue
-            if isinstance(fls, (list, tuple)):
-                fls = [str(x).strip() for x in fls if str(x).strip()]
-            else:
-                fls = [str(fls).strip()] if str(fls).strip() else []
-            names.append(name)
-            mapping[name] = fls
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "")).strip()
+        fls = item.get("fluors", []) or []
+        if not name:
+            continue
+        if isinstance(fls, (list, tuple)):
+            fls = [str(x).strip() for x in fls if str(x).strip()]
+        else:
+            fls = [str(fls).strip()] if str(fls).strip() else []
+        names.append(name)
+        mapping[name] = fls
 
     names_sorted = sorted(dict.fromkeys(names))
     return names_sorted, mapping
@@ -172,9 +176,7 @@ with st.expander("🔧 Debug: YAML & Parsing", expanded=False):
     st.markdown("**Raw YAML preview (first ~1200 bytes)**")
     st.code(load_text_preview(PROBE_MAP_YAML, pm_mtime), language="yaml")
 
-# 真正读取 probes（缓存键包含 mtime，文件更新会自动失效）
-pm_mtime = _file_mtime(PROBE_MAP_YAML)
-all_probes, probe_to_fluors_raw = read_probes_and_mapping(PROBE_MAP_YAML, pm_mtime)
+all_probes, probe_to_fluors_raw = read_probes_and_mapping_no_cache(PROBE_MAP_YAML)
 
 with st.expander("🔧 Debug: Parsed probes (first 20)", expanded=False):
     st.write(all_probes[:20])
