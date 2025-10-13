@@ -131,15 +131,23 @@ if mode == "Emission only":
             st.write(f"- {a}  **vs**  {b}  →  {val:.3f}")
 
     # 画 emission-only（已做峰值归一）谱（展示时也可用 L2 归一后的以保持幅度可比性）
+    # 绘制 emission-only 谱线（标准化到自身最大值后绘制）
     fig = go.Figure()
     for j in sel_idx:
-        # 取我们传给优化的列（已经是峰值归一 -> L2 归一）；为了看形状，这里用峰值归一版本更直观
-        # 我们可以从 E_norm反推回列向量方向，所以直接用 E_norm 展示即可。
         y = E_norm[:, j]
-        fig.add_trace(go.Scatter(x=wl, y=y, mode="lines", name=sub_labels[sel_idx.index(j)]))
-    fig.update_layout(title="Emission-only (normalized) spectra of selected fluorophores",
-                      xaxis_title="Wavelength (nm)", yaxis_title="Intensity (a.u.)")
+        y = y / (np.max(y) + 1e-12)        # ← 这里标准化到 [0,1]
+        fig.add_trace(go.Scatter(
+            x=wl, y=y, mode="lines",
+            name=sub_labels[sel_idx.index(j)]
+        ))
+    fig.update_layout(
+        title="Emission-only spectra of selected fluorophores (normalized to max = 1)",
+        xaxis_title="Wavelength (nm)",
+        yaxis_title="Normalized intensity (0–1)",
+        yaxis_range=[0, 1.05]
+    )
     st.plotly_chart(fig, use_container_width=True)
+
 
 else:
     if not laser_list:
