@@ -21,56 +21,43 @@ def load_dyes_yaml(path):
 
 
 def load_probe_fluor_map(path):
-    """Load mapping probe -> candidate fluorophores from YAML.
-
-    Supported schemas:
-      A) Top-level mapping:
-         ProbeA: [AF488, AF546]
-         ProbeB: [ATTO647N, AF647]
-
-      B) Under 'mapping':
-         mapping:
-           ProbeA: [AF488, AF546]
-           ProbeB: [ATTO647N, AF647]
-
-      C) Under 'probes':
-         probes:
-           ProbeA: [AF488, AF546]
-           ProbeB: [ATTO647N, AF647]
+    """Load mapping: supports two YAML schemas:
+       1) {mapping: {ProbeA: [AF488, ...], ...}}
+       2) {ProbeA: [AF488, ...], ProbeB: [...]}
+       Returns a dict[str, list[str]].
     """
+    import yaml
+
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
 
     if data is None:
-        raise ValueError(f"Empty YAML file: {path}")
+        return {}
 
-    # Case B: explicit 'mapping'
+    # Accept both schemas
     if isinstance(data, dict) and "mapping" in data and isinstance(data["mapping"], dict):
         mapping = data["mapping"]
-
-    # Case C: explicit 'probes'
-    elif isinstance(data, dict) and "probes" in data and isinstance(data["probes"], dict):
-        mapping = data["probes"]
-
-    # Case A: top-level is the mapping
-    elif isinstance(data, dict) and all(isinstance(v, (list, tuple)) for v in data.values()):
-        mapping = data
-
+    elif isinstance(data, dict):
+        mapping = data  # assume direct mapping at the top level
     else:
         raise ValueError(
-            "Invalid probe_fluor_map.yaml schema. Expected one of:\n"
-            "- Top-level mapping {Probe: [fluor,...]}\n"
-            "- {mapping: {Probe: [fluor,...]}}\n"
-            "- {probes: {Probe: [fluor,...]}}"
+            "probe_fluor_map.yaml must be a mapping. "
+            "Either use {'mapping': {...}} or put the probe→fluor list at the top level."
         )
 
-    # Normalize to plain dict[str, list[str]]
-    norm = {}
+    # Normalize to dict[str, list[str]]
+    clean = {}
     for k, v in mapping.items():
-        if not isinstance(v, (list, tuple)):
-            raise ValueError(f"Probe '{k}' must map to a list of fluor names, got: {type(v)}")
-        norm[str(k)] = [str(x) for x in v]
-    return norm
+        key = str(k)
+        if v is None:
+            clean[key] = []
+        elif isinstance(v, (list, tuple)):
+            clean[key] = [str(x) for x in v]
+        else:
+            # allow single string -> wrap into list
+            clean[key] = [str(v)]
+    return clean
+
 
 
 
