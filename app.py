@@ -1,15 +1,13 @@
 import streamlit as st
 import numpy as np
 import plotly.graph_objects as go
-import yaml  # <- robustly read probe_fluor_map.yaml here
+import yaml  # <-- used to strictly read probe names
 
 from utils import (
     load_dyes_yaml,
-    load_probe_fluor_map,            # kept as fallback
-    normalize_probe_mapping,         # we will correctly unpack (clean, dropped)
     cosine_similarity_matrix,
     select_minimax_subset_grouped,
-    select_lexicographic_grouped,
+    select_lexicographic_grouped,  # keep if you want to toggle
     build_effective_emission_emission_only,
     build_effective_emission_with_lasers,
     iterate_selection_with_lasers,
@@ -26,41 +24,20 @@ probe_map_path = "data/probe_fluor_map.yaml"
 
 wl, dye_db = load_dyes_yaml(yaml_path)
 
-# Robustly read probe_fluor_map.yaml: prefer the {probes: [ {name, fluors}, ... ]} shape
-def _load_probe_mapping_only_names(path):
-    with open(path, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
-    # Preferred shape: dict with key "probes" as a list of dicts
-    if isinstance(data, dict) and isinstance(data.get("probes"), list):
-        mapping = {}
-        for item in data["probes"]:
-            if not isinstance(item, dict):
-                continue
-            name = str(item.get("name", "")).strip()
-            fls = item.get("fluors", []) or []
-            if not name:
-                continue
-            if isinstance(fls, (list, tuple)):
-                mapping[name] = [str(x).strip() for x in fls if str(x).strip()]
-            else:
-                mapping[name] = [str(fls).strip()] if str(fls).strip() else []
-        return mapping
-    # Fallback to legacy util for other shapes
-    return load_probe_fluor_map(path)
-
-# --- Strictly read probes list from YAML (ignore schema/updated/notes) ---
+# --- STRICT: read probe names & mapping ONLY from the `probes:` array ----
+@st.cache_data(show_spinner=False)
 def read_probe_names_and_map(path):
     """
     Returns:
-      probe_names: list[str]  (from data['probes'][i]['name'])
-      probe_to_fluors: dict[str, list[str]]  (from data['probes'][i]['fluors'])
-    This ignores top-level keys like schema/updated/notes.
+      probe_names: list[str] from data['probes'][i]['name']
+      probe_to_fluors: dict[str, list[str]] from data['probes'][i]['fluors']
+    Ignores top-level keys like schema/updated/notes.
     """
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
-    probe_names = []
-    probe_to_fluors_raw = {}
     plist = data.get("probes", [])
+    probe_names = []
+    probe_to_fluors = {}
     if isinstance(plist, list):
         for item in plist:
             if not isinstance(item, dict):
@@ -69,39 +46,29 @@ def read_probe_names_and_map(path):
             fls = item.get("fluors", []) or []
             if not name:
                 continue
-            # coerce to clean list of strings
             if isinstance(fls, (list, tuple)):
                 fls = [str(x).strip() for x in fls if str(x).strip()]
             else:
                 fls = [str(fls).strip()] if str(fls).strip() else []
             probe_names.append(name)
-            probe_to_fluors_raw[name] = fls
-    return probe_names, probe_to_fluors_raw
+            probe_to_fluors[name] = fls
+    # unique & sorted names for UI
+    names_sorted = sorted(dict.fromkeys(probe_names))
+    return names_sorted, probe_to_fluors
 
-# 1) 严格拿到 probe 名称列表 + 原始映射
-probe_names_raw, probe_to_fluors_raw = read_probe_names_and_map(probe_map_path)
-
-# 2) 只用于下拉菜单：直接使用 YAML 里的 probe 名称
-all_probes = sorted(probe_names_raw)
-
-# 3) 再把原始映射过一遍 normalize（做别名/去重/过滤成 dyes.yaml 中存在的光谱）
-from utils import normalize_probe_mapping
-probe_to_fluors, _dropped = normalize_probe_mapping(probe_to_fluors_raw, dye_db, alias=None)
-
+all_probes, probe_to_fluors_raw = read_probe_names_and_map(probe_map_path)
 
 # -----------------------------
 # Sidebar: Pipeline configuration
 # -----------------------------
 st.sidebar.header("Configuration")
 
-# 1) Objective flavor
 mode = st.sidebar.radio(
     "Mode",
     options=("Emission only", "Emission + Excitation + Brightness"),
     help="Choose whether to optimize using emission spectra only, or to include excitation, quantum yield, and extinction coefficient.",
 )
 
-# 2) If including lasers: strategy + lasers
 laser_strategy = None
 laser_list = []
 custom_lasers = []
@@ -111,15 +78,14 @@ if mode == "Emission + Excitation + Brightness":
         "Laser usage",
         options=("Simultaneous", "Separate"),
         help=(
-            "Simultaneous: all lasers on together. We assign powers so that the per-segment peak across fluorophores "
-            "is leveled to the same maximum.\n"
-            "Separate: lasers fired separately; each laser’s power is set so its global peak matches a common target."
+            "Simultaneous: all lasers on together. Powers are chosen so segment peaks align.\n"
+            "Separate: lasers fired separately; each laser power set so its peak aligns to a common target."
         ),
     )
     preset = st.sidebar.radio(
         "Lasers",
         options=("488/561/639 (preset)", "Custom"),
-        help="Either use a fixed set (488, 561, 639 nm) or specify your own laser wavelengths."
+        help="Use fixed (488, 561, 639 nm) or specify your own wavelengths."
     )
     if preset == "488/561/639 (preset)":
         laser_list = [488, 561, 639]
@@ -133,28 +99,25 @@ if mode == "Emission + Excitation + Brightness":
         cols = st.sidebar.columns(2)
         custom_lasers = []
         for i in range(n_lasers):
-            default_val = [488, 561, 639][i] if i < 3 else int(wl.min())
             lam = cols[i % 2].number_input(
                 f"Laser {i+1} (nm)",
                 min_value=int(wl.min()), max_value=int(wl.max()),
-                value=int(default_val),
-                step=1, help="Laser wavelength in nm on the same grid as spectra."
+                value=[488, 561, 639][i] if i < 3 else int(wl.min()),
+                step=1, help="Laser wavelength in nm."
             )
             custom_lasers.append(int(lam))
         laser_list = custom_lasers
 
-# 3) How many “largest similarities” to display (not the heatmap)
 k_top_show = st.sidebar.slider(
     "Show top-K largest pairwise similarities",
     min_value=5, max_value=50, value=10, step=1,
     help="Only the largest K similarities will be displayed (sorted)."
 )
 
-# 4) Optimization flavor: single-level or lexicographic
 lexi = st.sidebar.checkbox(
     "Lexicographic (layer-by-layer) minimization",
     value=False,
-    help="If checked, apply the multi-level (lexicographic) optimization. Otherwise, do single-level minimax."
+    help="If checked, apply multi-level (lexicographic) minimization; otherwise single-level minimax."
 )
 
 # -----------------------------
@@ -164,39 +127,63 @@ st.title("Fluorophore Selection for Multiplexed Imaging")
 
 st.markdown(
     "Use this app to select one fluorophore per probe to minimize spectral similarity. "
-    "If you include excitation and brightness, laser powers are derived automatically from your selection and the specified lasers."
+    "If you include excitation and brightness, laser powers are derived automatically from your rules."
 )
 
-# Probe selection UI (no preset number; user decides)
-
+# === Probe selection: options come ONLY from YAML's `probes:` names ===
 with st.expander("Pick probes to optimize", expanded=True):
     picked = st.multiselect(
         "Probes",
         options=all_probes,
-        help="Choose the probes you will include in the optimization. Each probe will contribute one fluorophore."
+        help="Choose the probes to include. Each probe contributes one fluorophore."
     )
 
 if not picked:
     st.info("Select at least one probe to proceed.")
     st.stop()
 
-# Build candidate groups (one group per probe)
-groups = []
+# Build groups using ONLY the raw mapping from YAML; later we will filter by spectra availability
+groups_raw = []
 group_names = []
 for probe in picked:
-    cands = [f for f in probe_to_fluors.get(probe, []) if f in dye_db]
+    cands = list(probe_to_fluors_raw.get(probe, []))
     if not cands:
-        st.warning(f"No spectra found in dyes.yaml for probe '{probe}' candidates; this probe will be skipped.")
+        st.warning(f"No candidates listed for probe '{probe}' in probe_fluor_map.yaml.")
         continue
-    groups.append(cands)
+    groups_raw.append(cands)
     group_names.append(probe)
 
+if not groups_raw:
+    st.error("No valid groups from the selected probes.")
+    st.stop()
+
+# Filter groups by dyes that actually exist in dyes.yaml (have spectra)
+groups = []
+for cands in groups_raw:
+    valid = [f for f in cands if f in dye_db]
+    if not valid:
+        groups.append([])  # keep structure; will be handled below
+    else:
+        groups.append(valid)
+
+# If any group ends empty, skip that probe now (and warn)
+kept_groups, kept_names = [], []
+for g, (cands, pname) in enumerate(zip(groups, group_names)):
+    if not cands:
+        st.warning(f"Probe '{pname}' has no candidates with spectra in dyes.yaml and will be skipped.")
+        continue
+    kept_groups.append(cands)
+    kept_names.append(pname)
+
+groups = kept_groups
+group_names = kept_names
+
 if not groups:
-    st.error("No valid groups after filtering by available spectra.")
+    st.error("No groups remain after filtering by available spectra.")
     st.stop()
 
 # -----------------------------
-# Compute effective spectra and run optimization
+# Compute & optimize
 # -----------------------------
 if mode == "Emission only":
     E, labels = build_effective_emission_emission_only(wl, dye_db, groups)
@@ -211,18 +198,18 @@ if mode == "Emission only":
     for probe, fluor in zip(group_names, selected):
         st.write(f"- **{probe}** → {fluor}")
 
-    if len(sel_indices) >= 2:
-        S = cosine_similarity_matrix(E[:, sel_indices])
-        vals, pairs = top_k_pairwise(S, k=k_top_show)
-        st.markdown("**Top pairwise similarities (largest first):**")
-        st.write(", ".join([f"{v:.3f}" for v in vals]) if vals else "None.")
-    else:
-        st.markdown("**Top pairwise similarities:** need ≥2 selections.")
+    S = cosine_similarity_matrix(E[:, sel_indices])
+    vals, pairs = top_k_pairwise(S, k=k_top_show)
+    st.markdown("**Top pairwise similarities (largest first):**")
+    st.write("None." if len(vals) == 0 else ", ".join([f"{v:.3f}" for v in vals]))
 
     fig = go.Figure()
     for i, fluor in zip(sel_indices, selected):
-        norm = np.linalg.norm(E[:, i]) + 1e-12
-        fig.add_trace(go.Scatter(x=wl, y=E[:, i] / norm, mode="lines", name=fluor))
+        y = E[:, i]
+        fig.add_trace(go.Scatter(
+            x=wl, y=y / (np.linalg.norm(y) + 1e-12),
+            mode="lines", name=fluor
+        ))
     fig.update_layout(
         title="Emission-only (normalized) spectra of selected fluorophores",
         xaxis_title="Wavelength (nm)", yaxis_title="Intensity (normalized)"
@@ -258,25 +245,23 @@ else:
 
     st.subheader("Derived Laser Powers")
     st.write(", ".join([f"{lam} nm: {p:.3g}" for lam, p in zip(sorted(laser_list), powers)]))
-    st.caption("Powers computed so that per-segment or per-laser peaks are leveled to a common maximum B, following your rules.")
 
-    if len(selected) >= 2 and E_final is not None:
-        idx_final = [labels_final.index(f) for f in selected]
-        S = cosine_similarity_matrix(E_final[:, idx_final])
-        vals, pairs = top_k_pairwise(S, k=k_top_show)
-        st.markdown("**Top pairwise similarities (largest first):**")
-        st.write(", ".join([f"{v:.3f}" for v in vals]) if vals else "None.")
-    else:
-        st.markdown("**Top pairwise similarities:** need ≥2 selections.")
+    idx_final = [labels_final.index(f) for f in selected]
+    S = cosine_similarity_matrix(E_final[:, idx_final])
+    vals, pairs = top_k_pairwise(S, k=k_top_show)
+    st.markdown("**Top pairwise similarities (largest first):**")
+    st.write("None." if len(vals) == 0 else ", ".join([f"{v:.3f}" for v in vals]))
 
-    if E_final is not None:
-        fig = go.Figure()
-        for fluor in selected:
-            j = labels_final.index(fluor)
-            y = E_final[:, j]
-            fig.add_trace(go.Scatter(x=wl, y=y / (np.linalg.norm(y) + 1e-12), mode="lines", name=fluor))
-        fig.update_layout(
-            title="Effective spectra under lasers (normalized for display)",
-            xaxis_title="Wavelength (nm)", yaxis_title="Intensity (normalized)"
-        )
-        st.plotly_chart(fig, use_container_width=True)
+    fig = go.Figure()
+    for fluor in selected:
+        j = labels_final.index(fluor)
+        y = E_final[:, j]
+        fig.add_trace(go.Scatter(
+            x=wl, y=y / (np.linalg.norm(y) + 1e-12),
+            mode="lines", name=fluor
+        ))
+    fig.update_layout(
+        title="Effective spectra under lasers (normalized for display)",
+        xaxis_title="Wavelength (nm)", yaxis_title="Intensity (normalized)"
+    )
+    st.plotly_chart(fig, use_container_width=True)
