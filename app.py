@@ -1,206 +1,197 @@
-import os
-import yaml
+# app.py
 import streamlit as st
 import numpy as np
 import plotly.graph_objects as go
 
 from utils import (
     load_dyes_yaml,
-    read_probes_and_mapping,
-    build_effective_emission_emission_only,
-    iterate_selection_with_lasers,
+    load_probe_fluor_map,
+    build_emission_only_matrix,
+    build_effective_with_lasers,
+    derive_powers_simultaneous,
+    derive_powers_separate,
+    solve_lexicographic,
     cosine_similarity_matrix,
     top_k_pairwise,
-    build_E_and_groups_from_mapping,
-    lexicographic_select_grouped_milp,
 )
 
 st.set_page_config(page_title="Choose Fluorophore", layout="wide")
 
-APP_VERSION = "v3.0-lexiMILP"
-
-# -----------------------------
-# Paths
-# -----------------------------
 DYES_YAML = "data/dyes.yaml"
 PROBE_MAP_YAML = "data/probe_fluor_map.yaml"
 
-# -----------------------------
-# Load data
-# -----------------------------
+# ---------- Load data ----------
 wl, dye_db = load_dyes_yaml(DYES_YAML)
-all_probes, probe_to_fluors_raw = read_probes_and_mapping(PROBE_MAP_YAML)
+probe_map = load_probe_fluor_map(PROBE_MAP_YAML)  # {probe: [fluor,...]}
 
-# -----------------------------
-# Sidebar: pipeline configuration (简洁版，无debug/clear-cache)
-# -----------------------------
+# ---------- Sidebar ----------
 st.sidebar.header("Configuration")
-st.sidebar.caption(APP_VERSION)
 
 mode = st.sidebar.radio(
     "Mode",
     options=("Emission only", "Emission + Excitation + Brightness"),
-    help="Optimize using emission spectra only, or include excitation, quantum yield, and extinction coefficient."
+    help=(
+        "Emission only: use emission spectra only (each emission first peak-normalized, "
+        "then cosine-based optimization).\n\n"
+        "Emission + Excitation + Brightness: build effective spectra with lasers using "
+        "excitation · QY · EC, and optimize on cosine of those effective spectra. "
+        "Plots show raw effective spectra (not normalized)."
+    ),
 )
 
 laser_strategy = None
 laser_list = []
-custom_lasers = []
 if mode == "Emission + Excitation + Brightness":
     laser_strategy = st.sidebar.radio(
-        "Laser usage",
-        options=("Simultaneous", "Separate"),
-        help=(
-            "Simultaneous: all lasers on together; powers chosen so segment peaks align.\n"
-            "Separate: lasers fired separately; each power scaled to a common peak."
-        ),
+        "Laser usage", options=("Simultaneous", "Separate"),
+        help="Simultaneous: segment leveling to a common B. Separate: each laser scaled to a common peak."
     )
     preset = st.sidebar.radio(
-        "Lasers",
-        options=("488/561/639 (preset)", "Custom"),
-        help="Use 488, 561, 639 nm, or specify your own wavelengths."
+        "Lasers", options=("488/561/639 (preset)", "Custom"),
+        help="Use preset or define your wavelengths."
     )
     if preset == "488/561/639 (preset)":
         laser_list = [488, 561, 639]
         st.sidebar.caption("Using lasers: 488, 561, 639 nm")
     else:
-        n_lasers = st.sidebar.number_input(
-            "Number of lasers", min_value=1, max_value=8, value=3, step=1
-        )
+        n = st.sidebar.number_input("Number of lasers", 1, 8, 3, 1)
         cols = st.sidebar.columns(2)
-        for i in range(n_lasers):
+        lasers = []
+        for i in range(n):
             lam = cols[i % 2].number_input(
-                f"Laser {i+1} (nm)",
-                min_value=int(wl.min()), max_value=int(wl.max()),
-                value=[488, 561, 639][i] if i < 3 else int(wl.min()),
-                step=1,
+                f"Laser {i+1} (nm)", int(wl.min()), int(wl.max()),
+                [488,561,639][i] if i < 3 else int(wl.min()), 1
             )
-            custom_lasers.append(int(lam))
-        laser_list = custom_lasers
+            lasers.append(int(lam))
+        laser_list = lasers
 
-k_top_show = st.sidebar.slider(
+k_show = st.sidebar.slider(
     "Show top-K largest pairwise similarities",
     min_value=5, max_value=50, value=10, step=1,
-    help="Only the largest K similarities will be displayed (sorted)."
 )
 
-# -----------------------------
-# Main UI
-# -----------------------------
+levels = st.sidebar.selectbox(
+    "Lexicographic levels",
+    options=[1, 2],
+    index=1,
+    help="Number of layers to minimize lexicographically (1=minimax only; 2=also shrink the second-largest)."
+)
+
+# ---------- Main ----------
 st.title("Fluorophore Selection for Multiplexed Imaging")
 
-st.markdown(
-    "Select one fluorophore per probe to minimize spectral similarity. "
-    "This version uses the **layer-by-layer (lexicographic) MILP** solver—no greedy."
-)
-
+# Probe picker
+all_probes = sorted(probe_map.keys())
 with st.expander("Pick probes to optimize", expanded=True):
-    picked = st.multiselect(
-        "Probes",
-        options=all_probes,
-        help="Choices are read from the `probes:` list in data/probe_fluor_map.yaml."
-    )
+    picked = st.multiselect("Probes", options=all_probes)
 
 if not picked:
     st.info("Select at least one probe to proceed.")
     st.stop()
 
-# -----------------------------
-# Build candidate groups from mapping, and filter by spectra availability
-# -----------------------------
-E_emission, labels_emission, groups_idx, group_names = build_E_and_groups_from_mapping(
-    wl=wl,
-    dye_db=dye_db,
-    picked_probes=picked,
-    probe_to_fluors=probe_to_fluors_raw,
-    mode="emission_only"
-)
-
-if E_emission.shape[1] == 0 or len(groups_idx) == 0:
-    st.error("No valid candidates after filtering by available spectra.")
+# Build groups dict in the chosen order
+groups = {}
+for p in picked:
+    # 只保留在 dyes.yaml 里存在的候选
+    cands = [f for f in probe_map.get(p, []) if f in dye_db]
+    if cands:
+        groups[p] = cands
+if not groups:
+    st.error("No valid candidates with spectra in dyes.yaml for the selected probes.")
     st.stop()
 
-# -----------------------------
-# Optimization
-# -----------------------------
+# ---------- Optimization ----------
 if mode == "Emission only":
-    # Columns already correspond to emission-only spectra (not normalized here)
-    # We will normalize inside the MILP builder via cosine constants.
-    sel_indices = lexicographic_select_grouped_milp(E_emission, groups_idx)
+    # E_norm 用于优化；labels_pair 形如 "Probe – Fluor"
+    E_norm, labels_pair, idx_groups = build_emission_only_matrix(wl, dye_db, groups)
+    if E_norm.shape[1] == 0:
+        st.error("No spectra available for optimization.")
+        st.stop()
 
-    selected = [labels_emission[i] for i in sel_indices]
+    sel_idx, layer_vals = solve_lexicographic(
+        E_norm, idx_groups, labels_pair, levels=levels, enforce_unique=True
+    )
+    selected = [labels_pair[j] for j in sel_idx]  # "Probe – Fluor"
+
     st.subheader("Selected Fluorophores")
-    for probe, fluor in zip(group_names, selected):
-        st.write(f"- **{probe}** → {fluor}")
+    for s in selected:
+        st.write(f"- **{s.split(' – ',1)[0]}** → {s.split(' – ',1)[1]}")
 
-    # Show top-K similarities among the selected set
-    # Normalize for cosine matrix here just for reporting
-    En = E_emission / (np.linalg.norm(E_emission, axis=0, keepdims=True) + 1e-12)
-    S = cosine_similarity_matrix(En[:, sel_indices])
-    vals, pairs = top_k_pairwise(S, k=k_top_show)
-    st.markdown("**Top pairwise similarities (largest first)**")
-    st.caption(
-        "Cosine similarity (0–1 for nonnegative spectra). "
-        "Closer to 1 ⇒ more similar; values >0.9 often indicate poor separability."
-    )
-    st.write("None." if len(vals) == 0 else ", ".join([f"{v:.3f}" for v in vals]))
+    # 相似度（在选中集合上），并标注哪两对
+    S = cosine_similarity_matrix(E_norm[:, sel_idx])
+    sub_labels = [labels_pair[j] for j in sel_idx]
+    tops = top_k_pairwise(S, sub_labels, k=k_show)
+    st.markdown("**Top pairwise similarities (largest first)**  \n"
+                "_Cosine similarity in [0, 1]. Closer to 1 ⇒ more similar; "
+                "values > 0.9 often indicate poor separability._")
+    if not tops:
+        st.write("None.")
+    else:
+        for val, a, b in tops:
+            st.write(f"- {a}  **vs**  {b}  →  {val:.3f}")
 
-
-    # Spectra viewer-like plot
+    # 画 emission-only（已做峰值归一）谱（展示时也可用 L2 归一后的以保持幅度可比性）
     fig = go.Figure()
-    for fluor in selected:
-    # 这里直接从 dye_db 取 emission（我们在 load_dyes_yaml 时已做“峰值=1”的归一化）
-        y = np.array(dye_db[fluor]["emission"], dtype=float)
-        fig.add_trace(go.Scatter(x=wl, y=y, mode="lines", name=fluor))
-    fig.update_layout(
-        title="Emission-only spectra (peak-normalized to 1.0)",
-        xaxis_title="Wavelength (nm)",
-        yaxis_title="Intensity (0–1)"
-    )
+    for j in sel_idx:
+        # 取我们传给优化的列（已经是峰值归一 -> L2 归一）；为了看形状，这里用峰值归一版本更直观
+        # 我们可以从 E_norm反推回列向量方向，所以直接用 E_norm 展示即可。
+        y = E_norm[:, j]
+        fig.add_trace(go.Scatter(x=wl, y=y, mode="lines", name=sub_labels[sel_idx.index(j)]))
+    fig.update_layout(title="Emission-only (normalized) spectra of selected fluorophores",
+                      xaxis_title="Wavelength (nm)", yaxis_title="Intensity (a.u.)")
     st.plotly_chart(fig, use_container_width=True)
 
 else:
-    # Full pipeline with lasers:
-    if len(laser_list) == 0:
+    if not laser_list:
         st.error("Please specify laser wavelengths.")
         st.stop()
 
-    # 迭代：由 emission-only 的首次选择出发，每次重建有效谱并用“分层MILP”重新选择
-    selected, powers, iters, converged, E_final, labels_final, groups_idx_final = iterate_selection_with_lasers(
-        wl=wl,
-        dye_db=dye_db,
-        picked_probes=picked,
-        probe_to_fluors=probe_to_fluors_raw,
-        laser_wavelengths=laser_list,
-        mode=laser_strategy,
-        solver="lexi_milp",
-        max_iter=8
+    # 先用 emission-only 建 A
+    E0_norm, labels0, idx0 = build_emission_only_matrix(wl, dye_db, groups)
+    sel0, _ = solve_lexicographic(E0_norm, idx0, labels0, levels=levels, enforce_unique=True)
+    A_labels = [labels0[j] for j in sel0]
+
+    # 由 A 计算功率
+    if laser_strategy == "Simultaneous":
+        powers = derive_powers_simultaneous(wl, dye_db, A_labels, laser_list)
+    else:
+        powers = derive_powers_separate(wl, dye_db, A_labels, laser_list)
+
+    # 用功率重建 “全候选” 的有效光谱（原始 + 归一）
+    E_raw_all, E_norm_all, labels_all, idx_groups_all = build_effective_with_lasers(
+        wl, dye_db, groups, laser_list, laser_strategy, powers
     )
+
+    # 基于有效光谱（L2 归一）再做层级优化
+    sel_idx, layer_vals = solve_lexicographic(
+        E_norm_all, idx_groups_all, labels_all, levels=levels, enforce_unique=True
+    )
+    selected = [labels_all[j] for j in sel_idx]
 
     st.subheader("Selected Fluorophores (with lasers)")
-    for probe, fluor in zip(picked, selected):
-        st.write(f"- **{probe}** → {fluor}")
-    st.caption(f"Iterations: {iters}  |  Converged: {converged}")
-
-    st.subheader("Derived Laser Powers")
+    for s in selected:
+        st.write(f"- **{s.split(' – ',1)[0]}** → {s.split(' – ',1)[1]}")
+    st.caption("Laser powers derived via your B-leveling rule; plots show raw effective spectra (not normalized).")
     st.write(", ".join([f"{lam} nm: {p:.3g}" for lam, p in zip(sorted(laser_list), powers)]))
 
-    # Report top-K on final selection (normalize for cosine)
-    En_final = E_final / (np.linalg.norm(E_final, axis=0, keepdims=True) + 1e-12)
-    idx_final = [labels_final.index(f) for f in selected]
-    S = cosine_similarity_matrix(En_final[:, idx_final])
-    vals, _ = top_k_pairwise(S, k=k_top_show)
-    st.markdown("**Top pairwise similarities (largest first):**")
-    st.write("None." if len(vals) == 0 else ", ".join([f"{v:.3f}" for v in vals]))
+    # 相似度（基于 E_norm_all 的选中列）
+    S = cosine_similarity_matrix(E_norm_all[:, sel_idx])
+    sub_labels = [labels_all[j] for j in sel_idx]
+    tops = top_k_pairwise(S, sub_labels, k=k_show)
+    st.markdown("**Top pairwise similarities (largest first)**  \n"
+                "_Cosine similarity in [0, 1]. Closer to 1 ⇒ more similar; "
+                "values > 0.9 often indicate poor separability._")
+    if not tops:
+        st.write("None.")
+    else:
+        for val, a, b in tops:
+            st.write(f"- {a}  **vs**  {b}  →  {val:.3f}")
 
-    # Spectra viewer-like plot
+    # 画“原始有效光谱”（不做归一化）
     fig = go.Figure()
-    for fluor in selected:
-        j = labels_final.index(fluor)
-        y = En_final[:, j]  # normalized for display
-        fig.add_trace(go.Scatter(x=wl, y=y, mode="lines", name=fluor))
-    fig.update_layout(
-        title="Effective spectra under lasers",
-        xaxis_title="Wavelength (nm)", yaxis_title="Intensity (a.u.)"
-    )
+    for j in sel_idx:
+        lbl = labels_all[j]
+        fig.add_trace(go.Scatter(x=wl, y=E_raw_all[:, j], mode="lines", name=lbl))
+    fig.update_layout(title="Effective spectra under lasers (raw, not normalized)",
+                      xaxis_title="Wavelength (nm)", yaxis_title="Intensity (a.u.)")
     st.plotly_chart(fig, use_container_width=True)
