@@ -12,6 +12,7 @@ from utils import (
     build_effective_emission_with_lasers,
     iterate_selection_with_lasers,
     top_k_pairwise,
+    normalize_probe_mapping,  # <- we will correctly unpack its return
 )
 
 st.set_page_config(page_title="Choose Fluorophore", layout="wide")
@@ -24,13 +25,11 @@ probe_map_path = "data/probe_fluor_map.yaml"
 
 wl, dye_db = load_dyes_yaml(yaml_path)
 
-# Load raw mapping (supports top-level or {mapping: ...})
+# Load raw mapping (supports multiple shapes)
 mapping_raw = load_probe_fluor_map(probe_map_path)
 
-# Normalize & filter against dyes.yaml so UI only shows valid probes
-from utils import normalize_probe_mapping
-probe_to_fluors = normalize_probe_mapping(mapping_raw, dye_db)
-
+# Normalize & filter (returning (clean_mapping, dropped_report))
+probe_to_fluors, _dropped = normalize_probe_mapping(mapping_raw, dye_db, alias=None)
 
 # -----------------------------
 # Sidebar: Pipeline configuration
@@ -76,10 +75,11 @@ if mode == "Emission + Excitation + Brightness":
         cols = st.sidebar.columns(2)
         custom_lasers = []
         for i in range(n_lasers):
+            default_val = [488, 561, 639][i] if i < 3 else int(wl.min())
             lam = cols[i % 2].number_input(
                 f"Laser {i+1} (nm)",
                 min_value=int(wl.min()), max_value=int(wl.max()),
-                value= [488,561,639][i] if i < 3 else int(wl.min()),
+                value=int(default_val),
                 step=1, help="Laser wavelength in nm on the same grid as spectra."
             )
             custom_lasers.append(int(lam))
@@ -125,8 +125,9 @@ if not picked:
 # Build candidate groups (one group per probe)
 groups = []
 group_names = []
-for g, probe in enumerate(picked):
-    cands = [f for f in probe_to_fluors[probe] if f in dye_db]  # filter to those having spectra
+for probe in picked:
+    # keep only candidates that exist in dye_db (others have no spectra)
+    cands = [f for f in probe_to_fluors.get(probe, []) if f in dye_db]
     if not cands:
         st.warning(f"No spectra found in dyes.yaml for probe '{probe}' candidates; this probe will be skipped.")
         continue
@@ -157,19 +158,23 @@ if mode == "Emission only":
         st.write(f"- **{probe}** → {fluor}")
 
     # Similarity (top-K only)
-    S = cosine_similarity_matrix(E[:, sel_indices])
-    vals, pairs = top_k_pairwise(S, k=k_top_show)
-    st.markdown("**Top pairwise similarities (largest first):**")
-    if len(vals) == 0:
-        st.write("None.")
+    if len(sel_indices) >= 2:
+        S = cosine_similarity_matrix(E[:, sel_indices])
+        vals, pairs = top_k_pairwise(S, k=k_top_show)
+        st.markdown("**Top pairwise similarities (largest first):**")
+        if len(vals) == 0:
+            st.write("None.")
+        else:
+            st.write(", ".join([f"{v:.3f}" for v in vals]))
     else:
-        st.write(", ".join([f"{v:.3f}" for v in vals]))
+        st.markdown("**Top pairwise similarities:** need ≥2 selections.")
 
     # Spectra viewer-like plot (emission only, normalized per fluor)
     fig = go.Figure()
     for i, fluor in zip(sel_indices, selected):
+        norm = np.linalg.norm(E[:, i]) + 1e-12
         fig.add_trace(go.Scatter(
-            x=wl, y=E[:, i] / (np.linalg.norm(E[:, i]) + 1e-12),
+            x=wl, y=E[:, i] / norm,
             mode="lines", name=fluor
         ))
     fig.update_layout(
@@ -210,31 +215,35 @@ else:
     st.caption(f"Iterations: {iters}  |  Converged: {converged}")
 
     st.subheader("Derived Laser Powers")
-    st.write(", ".join([f"{lam} nm: {p:.3g}" for lam, p in zip(laser_list, powers)]))
+    st.write(", ".join([f"{lam} nm: {p:.3g}" for lam, p in zip(sorted(laser_list), powers)]))
     st.caption("Powers computed so that per-segment or per-laser peaks are leveled to a common maximum B, following your rules.")
 
     # Similarity (top-K only)
-    idx_final = [labels_final.index(f) for f in selected]
-    S = cosine_similarity_matrix(E_final[:, idx_final])
-    vals, pairs = top_k_pairwise(S, k=k_top_show)
-    st.markdown("**Top pairwise similarities (largest first):**")
-    if len(vals) == 0:
-        st.write("None.")
+    if len(selected) >= 2 and E_final is not None:
+        idx_final = [labels_final.index(f) for f in selected]
+        S = cosine_similarity_matrix(E_final[:, idx_final])
+        vals, pairs = top_k_pairwise(S, k=k_top_show)
+        st.markdown("**Top pairwise similarities (largest first):**")
+        if len(vals) == 0:
+            st.write("None.")
+        else:
+            st.write(", ".join([f"{v:.3f}" for v in vals]))
     else:
-        st.write(", ".join([f"{v:.3f}" for v in vals]))
+        st.markdown("**Top pairwise similarities:** need ≥2 selections.")
 
     # Spectra viewer-like plot (effective emission with lasers)
-    fig = go.Figure()
-    for fluor in selected:
-        j = labels_final.index(fluor)
-        y = E_final[:, j]
-        # normalize for visualization only
-        fig.add_trace(go.Scatter(
-            x=wl, y=y / (np.linalg.norm(y) + 1e-12),
-            mode="lines", name=fluor
-        ))
-    fig.update_layout(
-        title="Effective spectra under lasers (normalized for display)",
-        xaxis_title="Wavelength (nm)", yaxis_title="Intensity (normalized)"
-    )
-    st.plotly_chart(fig, use_container_width=True)
+    if E_final is not None:
+        fig = go.Figure()
+        for fluor in selected:
+            j = labels_final.index(fluor)
+            y = E_final[:, j]
+            # normalize for visualization only
+            fig.add_trace(go.Scatter(
+                x=wl, y=y / (np.linalg.norm(y) + 1e-12),
+                mode="lines", name=fluor
+            ))
+        fig.update_layout(
+            title="Effective spectra under lasers (normalized for display)",
+            xaxis_title="Wavelength (nm)", yaxis_title="Intensity (normalized)"
+        )
+        st.plotly_chart(fig, use_container_width=True)
