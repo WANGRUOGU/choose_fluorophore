@@ -48,20 +48,28 @@ def load_text_preview(path: str, mtime: float, head_bytes: int = 1200) -> str:
 @st.cache_data(show_spinner=False)
 def read_probes_and_mapping(path: str, mtime: float):
     """
-    Parse ONLY the `probes:` array from probe_fluor_map.yaml.
+    Parse probe list from YAML.
+    Supported structures:
+      A) dict with key 'probes': [ {name: ..., fluors: [...]}, ... ]
+      B) top-level list:        [ {name: ..., fluors: [...]}, ... ]  <-- 你现在用的
     Returns:
       names_sorted: list[str]
       mapping: dict[str, list[str]]
-    Cache key includes (path, mtime) to auto-invalidate when file changes.
     """
     with open(path, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
-
-    plist = data.get("probes", [])
+        data = yaml.safe_load(f)
     names = []
     mapping = {}
-    if isinstance(plist, list):
-        for item in plist:
+
+    # Case B: top-level list
+    if isinstance(data, list):
+        items = data
+    else:
+        # Case A: dict with 'probes'
+        items = (data or {}).get("probes", [])
+
+    if isinstance(items, list):
+        for item in items:
             if not isinstance(item, dict):
                 continue
             name = str(item.get("name", "")).strip()
@@ -74,8 +82,10 @@ def read_probes_and_mapping(path: str, mtime: float):
                 fls = [str(fls).strip()] if str(fls).strip() else []
             names.append(name)
             mapping[name] = fls
+
     names_sorted = sorted(dict.fromkeys(names))
     return names_sorted, mapping
+
 
 # -----------------------------
 # Load dyes
