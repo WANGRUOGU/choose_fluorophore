@@ -21,11 +21,16 @@ def load_dyes_yaml(path):
 
 
 def load_probe_fluor_map(path):
-    """Load mapping probe -> list[fluor], supporting several YAML layouts:
-       1) {probes: {ProbeA: [AF488, ...], ...}, notes: ..., schema: ..., updated: ...}
-       2) {mapping: {ProbeA: [...], ...}}
-       3) {ProbeA: [...], ProbeB: [...]}  # direct top-level (legacy)
-    Returns dict[str, list[str]].
+    """Load mapping probe -> list[str] from YAML.
+
+    Supports:
+      A) {probes: [ {name: "...", fluors: [..]}, ... ], notes:..., schema:..., updated:...}
+         <-- THIS IS YOUR CURRENT FILE
+      B) {probes: {ProbeA: [..], ProbeB: [..], ...}}
+      C) {mapping: {ProbeA: [..], ...}}
+      D) {ProbeA: [..], ProbeB: [..]}  # legacy top-level map
+
+    Returns: dict[str, list[str]]
     """
     import yaml
 
@@ -35,38 +40,126 @@ def load_probe_fluor_map(path):
     if data is None:
         return {}
 
-    # Prefer 'probes' block if present (your current file)
+    # Case A: probes is a LIST of {name, fluors}
+    if isinstance(data, dict) and "probes" in data and isinstance(data["probes"], list):
+        mapping = {}
+        for item in data["probes"]:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip()
+            fls  = item.get("fluors", [])
+            if not name:
+                continue
+            if isinstance(fls, (list, tuple)):
+                mapping[name] = [str(x).strip() for x in fls if str(x).strip()]
+            elif fls is None:
+                mapping[name] = []
+            else:
+                mapping[name] = [str(fls).strip()]
+        return mapping
+
+    # Case B: probes is a DICT
     if isinstance(data, dict) and "probes" in data and isinstance(data["probes"], dict):
-        mapping = data["probes"]
+        raw = data["probes"]
+        mapping = {}
+        for k, v in raw.items():
+            k2 = str(k).strip()
+            if not k2:
+                continue
+            if isinstance(v, (list, tuple)):
+                mapping[k2] = [str(x).strip() for x in v if str(x).strip()]
+            elif v is None:
+                mapping[k2] = []
+            else:
+                mapping[k2] = [str(v).strip()]
+        return mapping
 
-    # Else accept 'mapping'
-    elif isinstance(data, dict) and "mapping" in data and isinstance(data["mapping"], dict):
-        mapping = data["mapping"]
+    # Case C: mapping key
+    if isinstance(data, dict) and "mapping" in data and isinstance(data["mapping"], dict):
+        raw = data["mapping"]
+        mapping = {}
+        for k, v in raw.items():
+            k2 = str(k).strip()
+            if not k2:
+                continue
+            if isinstance(v, (list, tuple)):
+                mapping[k2] = [str(x).strip() for x in v if str(x).strip()]
+            elif v is None:
+                mapping[k2] = []
+            else:
+                mapping[k2] = [str(v).strip()]
+        return mapping
 
-    # Else, assume the whole dict is the mapping,
-    # but drop common meta keys if they exist by mistake.
-    elif isinstance(data, dict):
+    # Case D: assume top-level dict is the mapping, but drop common meta keys if present
+    if isinstance(data, dict):
         meta_keys = {"notes", "schema", "updated", "version", "$schema"}
-        mapping = {k: v for k, v in data.items() if k not in meta_keys}
-    else:
-        raise ValueError(
-            "probe_fluor_map.yaml must be a mapping. "
-            "Use a 'probes:' or 'mapping:' section, or a direct probe→list form."
-        )
+        raw = {k: v for k, v in data.items() if k not in meta_keys}
+        mapping = {}
+        for k, v in raw.items():
+            k2 = str(k).strip()
+            if not k2:
+                continue
+            if isinstance(v, (list, tuple)):
+                mapping[k2] = [str(x).strip() for x in v if str(x).strip()]
+            elif v is None:
+                mapping[k2] = []
+            else:
+                mapping[k2] = [str(v).strip()]
+        return mapping
 
-    # Normalize to dict[str, list[str]]
+    raise ValueError("Unrecognized YAML structure for probe_fluor_map.yaml")
+
+
+def normalize_probe_mapping(mapping_raw, dye_db, alias=None):
+    """Clean and filter the probe→fluor mapping:
+       - strip whitespace on probe & fluor names
+       - apply alias map (to match names in dyes.yaml)
+       - deduplicate candidates
+       - keep ONLY candidates that appear in dye_db
+       - drop probes that end up with empty candidate lists
+       Returns (clean_mapping, dropped_report)
+         clean_mapping: dict[str, list[str]]
+         dropped_report: dict with diagnostics to optionally display in UI
+    """
+    alias = alias or {}
     clean = {}
-    for k, v in mapping.items():
-        key = str(k).strip()
-        if not key:
+    dropped = {"unknown_dyes": {}, "empty_probes": []}
+
+    for probe, vals in (mapping_raw or {}).items():
+        p = str(probe).strip()
+        if not p:
             continue
-        if v is None:
-            clean[key] = []
-        elif isinstance(v, (list, tuple)):
-            clean[key] = [str(x).strip() for x in v if str(x).strip()]
+        # coerce to list
+        if isinstance(vals, (list, tuple)):
+            lst = [str(v).strip() for v in vals if str(v).strip()]
+        elif vals is None:
+            lst = []
         else:
-            clean[key] = [str(v).strip()]
-    return clean
+            lst = [str(vals).strip()]
+
+        # apply aliases
+        lst2 = []
+        unknown_for_this_probe = []
+        for v in lst:
+            v2 = alias.get(v, v)  # translate if alias exists
+            if v2 in dye_db:
+                lst2.append(v2)
+            else:
+                unknown_for_this_probe.append(v)
+
+        # unique + sorted
+        lst2 = sorted(set(lst2))
+
+        if lst2:
+            clean[p] = lst2
+        else:
+            dropped["empty_probes"].append(p)
+
+        if unknown_for_this_probe:
+            dropped["unknown_dyes"][p] = unknown_for_this_probe
+
+    return clean, dropped
+
 
 
 
@@ -432,28 +525,3 @@ def top_k_pairwise(S, k=10):
     pairs = list(zip(tri[0][order], tri[1][order]))
     return top_vals, pairs
 
-def normalize_probe_mapping(mapping_raw, dye_db):
-    """Clean and filter the probe→fluor mapping:
-       - strip whitespace on probe & fluor names
-       - coerce non-list values to list
-       - deduplicate candidates
-       - keep ONLY candidates that appear in dye_db
-       - drop probes that end up with empty candidate lists
-       Returns dict[str, list[str]].
-    """
-    clean = {}
-    for probe, vals in (mapping_raw or {}).items():
-        p = str(probe).strip()
-        if not p:
-            continue
-        if isinstance(vals, (list, tuple)):
-            lst = [str(v).strip() for v in vals if str(v).strip()]
-        elif vals is None:
-            lst = []
-        else:
-            lst = [str(vals).strip()]
-        # unique, keep only dyes present in dye_db
-        lst = sorted({v for v in lst if v in dye_db})
-        if lst:
-            clean[p] = lst
-    return clean
