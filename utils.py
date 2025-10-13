@@ -232,118 +232,90 @@ def build_E_and_groups_from_mapping(
 # ------------- Laser power derivation & iteration -------------
 
 def derive_powers_simultaneous(wl, dye_db, selection, laser_wavelengths):
-    """Compute laser powers for 'Simultaneous' per the segment-wise leveling rule.
-
-    Steps:
-      1) Find first informative segment start_seg; set P[start_seg]=1.
-      2) Let B = max over dyes in selection of peak(em_segment * ex(λ_start)*QY*EC).
-      3) For each later segment s, choose the *smallest* P[s] ≥ 0 such that
-         for all dyes i in selection and all wavelength samples k in segment s:
-           pre_i,k + em_i[k]*ex_i(λ_s)*QY_i*EC_i*P[s] ≤ B,
-         where pre_i,k = em_i[k] * sum_{m< s} ex_i(λ_m)*QY_i*EC_i*P[m].
+    """Simultaneous lasers with per-segment peak equalization.
+    For the selected set A, compute powers P so that in every segment s
+    the maximum over i∈A of [ M_i(s) * sum_{m≤s} c_i(m) P_m ] == B,
+    where B is defined from the first informative segment with P[start]=1.
     """
-    W = len(wl)
     lam = np.array(sorted(laser_wavelengths), dtype=float)
+    W = len(wl)
+    recs = [dye_db[name] for name in selection]
 
-    # Build segments as index ranges
-    seg_ranges = []
-    for i in range(len(lam)):
-        lo = lam[i]
-        hi = lam[i+1] if i+1 < len(lam) else wl[-1] + 1
+    def coef_at_l(rec, l):
+        em = np.array(rec["emission"], dtype=float)
+        ex = np.array(rec["excitation"], dtype=float)
+        qy = rec["quantum_yield"]
+        ec = rec["extinction_coeff"]
+        if any(v is None for v in (qy, ec)) or ex.size != W or em.size != W:
+            return None
+        idx = int(l - wl[0])
+        if idx < 0 or idx >= W:
+            return 0.0
+        return float(ex[idx] * qy * ec)
+
+    def seg_idx(s):
+        lo = lam[s]
+        hi = lam[s+1] if s+1 < len(lam) else wl[-1] + 1
         loi = int(max(lo - wl[0], 0))
         hii = int(min(hi - wl[0], W))
-        seg_ranges.append((loi, hii))
+        return loi, hii
 
-    recs = [dye_db[nm] for nm in selection]
+    def seg_peak_of_emission(rec, loi, hii):
+        em = np.array(rec["emission"], dtype=float)
+        if em.size != W or loi >= hii:
+            return 0.0
+        return float(np.max(em[loi:hii]))
 
-    # helper: coefficient at laser λ for a record
-    def coef_at(rec, L):
-        ex = np.array(rec.get("excitation", []), dtype=float)
-        qy = rec.get("quantum_yield", None)
-        ec = rec.get("extinction_coeff", None)
-        if ex.size != W or qy is None or ec is None:
-            return None
-        idx = int(L - wl[0])
-        if 0 <= idx < W:
-            return float(ex[idx] * qy * ec)
-        return 0.0
-
-    # find first informative segment
-    start_seg = None
-    for s, (loi, hii) in enumerate(seg_ranges):
-        informative = False
-        for rec in recs:
-            em = np.array(rec.get("emission", []), dtype=float)
-            c0 = coef_at(rec, lam[s])
-            if em.size == W and c0 not in (None, 0.0) and np.max(em[loi:hii]) > 0:
-                informative = True
-                break
-        if informative:
-            start_seg = s
+    # 找到起始段 start_seg（选中集合 A 在该段内至少有一个非零峰）
+    start_seg = 0
+    while start_seg < len(lam):
+        loi, hii = seg_idx(start_seg)
+        if any(seg_peak_of_emission(r, loi, hii) > 0 for r in recs):
             break
-
-    if start_seg is None:
-        # degenerate case: no emission anywhere
+        start_seg += 1
+    if start_seg >= len(lam):
+        # A 的所有段都没发射，退化：功率全 1
         return [1.0] * len(lam)
 
-    # init powers
     P = np.zeros(len(lam), dtype=float)
     P[start_seg] = 1.0
 
-    # compute B on start segment using *true* segment vector peaks
-    loi, hii = seg_ranges[start_seg]
-    peaks = []
-    for rec in recs:
-        em = np.array(rec.get("emission", []), dtype=float)
-        c = coef_at(rec, lam[start_seg])
-        if em.size != W or c in (None, 0.0):
-            continue
-        vec = em[loi:hii] * c * P[start_seg]
-        if vec.size:
-            peaks.append(np.max(vec))
-    B = float(max(peaks) if peaks else 0.0)
+    # 计算第一段的 B
+    loi, hii = seg_idx(start_seg)
+    a = np.array([coef_at_l(r, lam[start_seg]) or 0.0 for r in recs])
+    Mseg = np.array([seg_peak_of_emission(r, loi, hii) for r in recs])
+    B = float(np.max(a * Mseg)) if np.any(Mseg > 0) else 0.0
 
-    # accumulate pre-sums per record as a scalar “sum of coefficients so far”
-    # BUT constraints用逐点：pre_i,k = em_i[k] * sum_prev
-    sum_prev = np.zeros(len(recs), dtype=float)
-    sum_prev += np.array([coef_at(rec, lam[start_seg]) or 0.0 for rec in recs]) * P[start_seg]
-
-    # iterate later segments
+    # ===== 逐段推进 =====
     for s in range(start_seg + 1, len(lam)):
-        loi, hii = seg_ranges[s]
-        if loi >= hii:
+        loi, hii = seg_idx(s)
+        Mseg = np.array([seg_peak_of_emission(r, loi, hii) for r in recs])
+        # 先算已有段的“常数项” pre_i = sum_{m< s} c_i(m) P[m]
+        pre = np.zeros(len(recs), dtype=float)
+        for m in range(start_seg, s):
+            c_m = np.array([coef_at_l(r, lam[m]) or 0.0 for r in recs])
+            pre += c_m * P[m]
+
+        c_s = np.array([coef_at_l(r, lam[s]) or 0.0 for r in recs])
+        feasible = (Mseg > 0) & (c_s > 0)
+
+        if not np.any(feasible):
+            # 这一段所有 i 的 Mseg 或 c_s 都为 0，设为 0 功率并继续
             P[s] = 0.0
-            continue
-
-        # collect feasible upper bounds for P[s]
-        bounds = []
-        for i, rec in enumerate(recs):
-            em = np.array(rec.get("emission", []), dtype=float)
-            c_s = coef_at(rec, lam[s])
-            if em.size != W or c_s in (None, 0.0):
-                continue
-            em_seg = em[loi:hii]
-            if em_seg.size == 0 or np.all(em_seg <= 0):
-                continue
-            # per-sample constraint: pre_i,k + em_i[k]*c_s*P[s] ≤ B
-            # where pre_i,k = em_i[k] * sum_prev[i]
-            # rearrange (em_i[k]*c_s) * P[s] ≤ B - em_i[k]*sum_prev[i]
-            denom = em_seg * c_s
-            numer = B - em_seg * sum_prev[i]
-            mask = (denom > 0) & (numer >= 0)
-            if np.any(mask):
-                ub = np.min(numer[mask] / denom[mask])  # smallest upper bound across k
-                bounds.append(ub)
-
-        if bounds:
-            P[s] = max(0.0, float(min(bounds)))
         else:
-            P[s] = 0.0
+            # 先取能保证 “≤B” 的最小上界
+            bounds = (B / (Mseg[feasible] * c_s[feasible])) - (pre[feasible] / c_s[feasible])
+            P[s] = max(0.0, float(np.min(bounds)))
 
-        # update cumulative coefficient sum for later segments
-        sum_prev += np.array([coef_at(rec, lam[s]) or 0.0 for rec in recs]) * P[s]
+            # —— 关键：用当前 P[s] 真实评估这一段的峰值 C，并强制缩放到 B ——
+            # 对每个 i，段内峰值是 M_i(s) * (pre_i + c_i(s)*P[s])
+            peak_vals = Mseg * (pre + c_s * P[s])
+            C = float(np.max(peak_vals)) if np.any(Mseg > 0) else 0.0
+            if C > 0:
+                P[s] *= (B / C)  # 令该段最大值精确等于 B
 
     return [float(x) for x in P]
+
 
 
 
