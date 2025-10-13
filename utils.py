@@ -11,75 +11,65 @@ import yaml
 import numpy as np
 
 def load_dyes_yaml(path):
-    """
-    Load dyes.yaml -> (wavelengths, dye_db).
+    """Load dyes.yaml -> (wavelengths, dye_db).
 
-    Changes:
-      - Peak-normalize ALL emission spectra at load time (divide by per-dye max, if max>0).
-      - Impute missing quantum_yield with the mean of available values (fallback=1.0 if none).
-    dye_db: dict[name] = {
-        "emission": np.array,           # already peak-normalized here
-        "excitation": np.array,
-        "quantum_yield": float,
-        "extinction_coeff": float|None
-    }
+    - Normalize every emission to its own max (peak) = 1.0  (if max>0)
+    - Keep excitation原样 (不做归一化)
+    - Fill missing quantum_yield with the mean of available QYs
     """
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
 
     wl = np.array(data["wavelengths"], dtype=float)
+    raw_db = data["dyes"]
 
-    # First pass: raw read
-    raw = {}
+    # 先收一遍 QY，计算均值
     qy_list = []
-    for name, rec in (data.get("dyes", {}) or {}).items():
+    for name, rec in raw_db.items():
+        qy = rec.get("quantum_yield", None)
+        if qy is not None:
+            try:
+                qy_val = float(qy)
+                if np.isfinite(qy_val):
+                    qy_list.append(qy_val)
+            except Exception:
+                pass
+    qy_mean = float(np.mean(qy_list)) if len(qy_list) else 1.0  # 没有的话用 1.0 兜底
+
+    dye_db = {}
+    for name, rec in raw_db.items():
         em = np.array(rec.get("emission", []), dtype=float)
         ex = np.array(rec.get("excitation", []), dtype=float)
-
-        # NOTE: don't normalize excitation here
-        # Peak-normalize emission (divide by its own max)
-        if em.size > 0:
-            m = float(np.max(em))
-            if m > 0:
-                em = em / m
-
         qy = rec.get("quantum_yield", None)
         ec = rec.get("extinction_coeff", None)
 
-        # Collect numeric qy for mean
-        if qy is not None:
+        # emission：峰值归一化到 1
+        if em.size > 0:
+            m = np.max(em)
+            if m > 0:
+                em = em / m
+
+        # QY 缺失回填为均值
+        if qy is None or (isinstance(qy, float) and not np.isfinite(qy)):
+            qy = qy_mean
+        else:
             try:
-                qy_list.append(float(qy))
+                qy = float(qy)
             except Exception:
-                pass
+                qy = qy_mean
 
-        raw[name] = dict(emission=em, excitation=ex, quantum_yield=qy, extinction_coeff=ec)
-
-    # Compute mean QY for imputation
-    if len(qy_list) > 0 and np.isfinite(qy_list).any():
-        qy_mean = float(np.nanmean(qy_list))
-    else:
-        qy_mean = 1.0  # safe fallback when all missing
-
-    # Second pass: impute missing qy
-    dye_db = {}
-    for name, rec in raw.items():
-        qy_val = rec["quantum_yield"]
-        try:
-            qy_val = float(qy_val)
-        except Exception:
-            qy_val = None
-        if (qy_val is None) or (not np.isfinite(qy_val)):
-            qy_val = qy_mean
+        # 允许 EC 缺失（算法里会照常参与乘法；缺失可视需求再决定是否设为 1）
+        if ec is not None:
+            try:
+                ec = float(ec)
+            except Exception:
+                ec = None
 
         dye_db[name] = dict(
-            emission=rec["emission"],
-            excitation=rec["excitation"],
-            quantum_yield=qy_val,
-            extinction_coeff=rec["extinction_coeff"],
+            emission=em, excitation=ex, quantum_yield=qy, extinction_coeff=ec
         )
-
     return wl, dye_db
+
 
 
 
