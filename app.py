@@ -48,11 +48,46 @@ def _load_probe_mapping_only_names(path):
     # Fallback to legacy util for other shapes
     return load_probe_fluor_map(path)
 
-# Build raw mapping strictly from the "probes" array
-mapping_raw = _load_probe_mapping_only_names(probe_map_path)
+# --- Strictly read probes list from YAML (ignore schema/updated/notes) ---
+def read_probe_names_and_map(path):
+    """
+    Returns:
+      probe_names: list[str]  (from data['probes'][i]['name'])
+      probe_to_fluors: dict[str, list[str]]  (from data['probes'][i]['fluors'])
+    This ignores top-level keys like schema/updated/notes.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    probe_names = []
+    probe_to_fluors_raw = {}
+    plist = data.get("probes", [])
+    if isinstance(plist, list):
+        for item in plist:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip()
+            fls = item.get("fluors", []) or []
+            if not name:
+                continue
+            # coerce to clean list of strings
+            if isinstance(fls, (list, tuple)):
+                fls = [str(x).strip() for x in fls if str(x).strip()]
+            else:
+                fls = [str(fls).strip()] if str(fls).strip() else []
+            probe_names.append(name)
+            probe_to_fluors_raw[name] = fls
+    return probe_names, probe_to_fluors_raw
 
-# Normalize & filter (returning (clean_mapping, dropped_report))
-probe_to_fluors, _dropped = normalize_probe_mapping(mapping_raw, dye_db, alias=None)
+# 1) 严格拿到 probe 名称列表 + 原始映射
+probe_names_raw, probe_to_fluors_raw = read_probe_names_and_map(probe_map_path)
+
+# 2) 只用于下拉菜单：直接使用 YAML 里的 probe 名称
+all_probes = sorted(probe_names_raw)
+
+# 3) 再把原始映射过一遍 normalize（做别名/去重/过滤成 dyes.yaml 中存在的光谱）
+from utils import normalize_probe_mapping
+probe_to_fluors, _dropped = normalize_probe_mapping(probe_to_fluors_raw, dye_db, alias=None)
+
 
 # -----------------------------
 # Sidebar: Pipeline configuration
@@ -133,7 +168,7 @@ st.markdown(
 )
 
 # Probe selection UI (no preset number; user decides)
-all_probes = sorted(probe_to_fluors.keys())
+
 with st.expander("Pick probes to optimize", expanded=True):
     picked = st.multiselect(
         "Probes",
