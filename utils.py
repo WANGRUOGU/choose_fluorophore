@@ -12,63 +12,50 @@ import numpy as np
 
 def load_dyes_yaml(path):
     """Load dyes.yaml -> (wavelengths, dye_db).
-
-    - Normalize every emission to its own max (peak) = 1.0  (if max>0)
-    - Keep excitation原样 (不做归一化)
-    - Fill missing quantum_yield with the mean of available QYs
+    - Emission is normalized by its own max (peak=1) if max>0.
+    - If quantum_yield is missing -> impute by mean of available QY.
     """
+    import yaml, numpy as np
+
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
-
     wl = np.array(data["wavelengths"], dtype=float)
-    raw_db = data["dyes"]
 
-    # 先收一遍 QY，计算均值
+    # first pass: collect QY
+    raw = {}
     qy_list = []
-    for name, rec in raw_db.items():
-        qy = rec.get("quantum_yield", None)
-        if qy is not None:
-            try:
-                qy_val = float(qy)
-                if np.isfinite(qy_val):
-                    qy_list.append(qy_val)
-            except Exception:
-                pass
-    qy_mean = float(np.mean(qy_list)) if len(qy_list) else 1.0  # 没有的话用 1.0 兜底
-
-    dye_db = {}
-    for name, rec in raw_db.items():
+    for name, rec in data["dyes"].items():
         em = np.array(rec.get("emission", []), dtype=float)
         ex = np.array(rec.get("excitation", []), dtype=float)
         qy = rec.get("quantum_yield", None)
         ec = rec.get("extinction_coeff", None)
 
-        # emission：峰值归一化到 1
-        if em.size > 0:
-            m = np.max(em)
+        # emission peak-normalize
+        if em.size:
+            m = float(np.max(em))
             if m > 0:
                 em = em / m
 
-        # QY 缺失回填为均值
-        if qy is None or (isinstance(qy, float) and not np.isfinite(qy)):
+        raw[name] = dict(emission=em, excitation=ex, quantum_yield=qy, extinction_coeff=ec)
+        if isinstance(qy, (int, float)) and np.isfinite(qy):
+            qy_list.append(float(qy))
+
+    qy_mean = float(np.mean(qy_list)) if qy_list else 1.0
+
+    # second pass: impute missing QY
+    dye_db = {}
+    for name, rec in raw.items():
+        qy = rec["quantum_yield"]
+        if (qy is None) or (not np.isfinite(qy)):
             qy = qy_mean
-        else:
-            try:
-                qy = float(qy)
-            except Exception:
-                qy = qy_mean
-
-        # 允许 EC 缺失（算法里会照常参与乘法；缺失可视需求再决定是否设为 1）
-        if ec is not None:
-            try:
-                ec = float(ec)
-            except Exception:
-                ec = None
-
         dye_db[name] = dict(
-            emission=em, excitation=ex, quantum_yield=qy, extinction_coeff=ec
+            emission=rec["emission"],
+            excitation=rec["excitation"],
+            quantum_yield=float(qy),
+            extinction_coeff=rec["extinction_coeff"],
         )
     return wl, dye_db
+
 
 
 
@@ -231,90 +218,139 @@ def build_E_and_groups_from_mapping(
 
 # ------------- Laser power derivation & iteration -------------
 
-def derive_powers_simultaneous(wl, dye_db, selection, laser_wavelengths):
-    """Simultaneous lasers with per-segment peak equalization.
-    For the selected set A, compute powers P so that in every segment s
-    the maximum over i∈A of [ M_i(s) * sum_{m≤s} c_i(m) P_m ] == B,
-    where B is defined from the first informative segment with P[start]=1.
+def derive_powers_simultaneous(wl, dye_db, selection, laser_wavelengths, eps=1e-12):
     """
+    严格分段等峰：
+    - 设 L1<L2<...<LS。把谱分成 S 段：[L1,L2), [L2,L3), ..., [LS, +inf)
+    - 第一段设 P1=1，B = max_i{ M_i(1) * c_i(L1) }，其中 M_i(s) 是第 s 段 emission 的最大值，
+      c_i(Lk)=ex_i(Lk)*QY_i*EC_i。
+    - 对 s=2..S：令 pre_i = sum_{m=1..s-1} c_i(Lm) Pm。
+      约束：forall i,  M_i(s)*(pre_i + c_i(Ls) Ps) ≤ B。
+      取满足不等式的 **最小上界** Ps = min_i  (B/M_i(s) - pre_i)/c_i(Ls) （仅在 M_i(s)>0 且 c_i>0 且分子>0 上取）。
+      这个最小上界对应的 i 会“卡紧”，从而该段的最大值 = B（数值误差除外）。
+    """
+    import numpy as np
+
     lam = np.array(sorted(laser_wavelengths), dtype=float)
     W = len(wl)
-    recs = [dye_db[name] for name in selection]
 
-    def coef_at_l(rec, l):
+    # handy helpers
+    def seg_slice(lo_nm, hi_nm):
+        lo_i = int(max(lo_nm - wl[0], 0))
+        hi_i = int(min((hi_nm if np.isfinite(hi_nm) else wl[-1] + 1) - wl[0], W))
+        return lo_i, hi_i
+
+    def Mseg(rec, lo_i, hi_i):
         em = np.array(rec["emission"], dtype=float)
+        if em.size != W or lo_i >= hi_i:
+            return 0.0
+        return float(np.max(em[lo_i:hi_i]))
+
+    def coef(rec, lnm):
         ex = np.array(rec["excitation"], dtype=float)
-        qy = rec["quantum_yield"]
+        if ex.size != W:
+            return 0.0
+        qy = float(rec["quantum_yield"])
         ec = rec["extinction_coeff"]
-        if any(v is None for v in (qy, ec)) or ex.size != W or em.size != W:
-            return None
-        idx = int(l - wl[0])
+        if ec is None or not np.isfinite(ec):
+            return 0.0
+        idx = int(lnm - wl[0])
         if idx < 0 or idx >= W:
             return 0.0
-        return float(ex[idx] * qy * ec)
+        return float(ex[idx]) * qy * float(ec)
 
-    def seg_idx(s):
-        lo = lam[s]
-        hi = lam[s+1] if s+1 < len(lam) else wl[-1] + 1
-        loi = int(max(lo - wl[0], 0))
-        hii = int(min(hi - wl[0], W))
-        return loi, hii
-
-    def seg_peak_of_emission(rec, loi, hii):
-        em = np.array(rec["emission"], dtype=float)
-        if em.size != W or loi >= hii:
-            return 0.0
-        return float(np.max(em[loi:hii]))
-
-    # 找到起始段 start_seg（选中集合 A 在该段内至少有一个非零峰）
-    start_seg = 0
-    while start_seg < len(lam):
-        loi, hii = seg_idx(start_seg)
-        if any(seg_peak_of_emission(r, loi, hii) > 0 for r in recs):
-            break
-        start_seg += 1
-    if start_seg >= len(lam):
-        # A 的所有段都没发射，退化：功率全 1
+    # build selected records
+    A = [dye_db[n] for n in selection]
+    if len(A) == 0:
         return [1.0] * len(lam)
 
+    # segments
+    seg_bounds = []
+    for s in range(len(lam)):
+        lo = lam[s]
+        hi = lam[s+1] if s+1 < len(lam) else float("inf")
+        seg_bounds.append((lo, hi))
+
+    # 找到第一个“可用”的起始段：该段存在 M_i(s)>0 且 c_i(Ls)>0
+    start = None
+    for s, (lo, hi) in enumerate(seg_bounds):
+        lo_i, hi_i = seg_slice(lo, hi)
+        feas = False
+        for rec in A:
+            if Mseg(rec, lo_i, hi_i) > 0 and coef(rec, lam[s]) > 0:
+                feas = True
+                break
+        if feas:
+            start = s
+            break
+    if start is None:
+        return [1.0] * len(lam)  # 无法驱动任何段
+
+    # P 初始化
     P = np.zeros(len(lam), dtype=float)
-    P[start_seg] = 1.0
+    P[start] = 1.0
 
-    # 计算第一段的 B
-    loi, hii = seg_idx(start_seg)
-    a = np.array([coef_at_l(r, lam[start_seg]) or 0.0 for r in recs])
-    Mseg = np.array([seg_peak_of_emission(r, loi, hii) for r in recs])
-    B = float(np.max(a * Mseg)) if np.any(Mseg > 0) else 0.0
+    # 定义 B
+    lo_i, hi_i = seg_slice(*seg_bounds[start])
+    B = 0.0
+    for rec in A:
+        Mi = Mseg(rec, lo_i, hi_i)
+        ci = coef(rec, lam[start])
+        B = max(B, Mi * ci)
+    # 若 B=0（极端），直接全 1
+    if B <= eps:
+        return [1.0] * len(lam)
 
-    # ===== 逐段推进 =====
-    for s in range(start_seg + 1, len(lam)):
-        loi, hii = seg_idx(s)
-        Mseg = np.array([seg_peak_of_emission(r, loi, hii) for r in recs])
-        # 先算已有段的“常数项” pre_i = sum_{m< s} c_i(m) P[m]
-        pre = np.zeros(len(recs), dtype=float)
-        for m in range(start_seg, s):
-            c_m = np.array([coef_at_l(r, lam[m]) or 0.0 for r in recs])
-            pre += c_m * P[m]
+    # 逐段推进
+    # 为了简洁，我们从 start+1 开始；之前段的 P 已定
+    for s in range(start + 1, len(lam)):
+        lo, hi = seg_bounds[s]
+        lo_i, hi_i = seg_slice(lo, hi)
 
-        c_s = np.array([coef_at_l(r, lam[s]) or 0.0 for r in recs])
-        feasible = (Mseg > 0) & (c_s > 0)
+        # pre_i 和 c_s
+        pre = []
+        c_s = []
+        M_s = []
+        for rec in A:
+            # 该段的发射峰
+            Mi = Mseg(rec, lo_i, hi_i)
+            M_s.append(Mi)
+            # 该段对应激发系数
+            cs = coef(rec, lam[s])
+            c_s.append(cs)
+            # 累积前面段的贡献系数和（注意这些系数在“这一段”的放大倍数一样乘以 M_i(s)）
+            acc = 0.0
+            for m in range(start, s):
+                cm = coef(rec, lam[m])
+                acc += cm * P[m]
+            pre.append(acc)
 
-        if not np.any(feasible):
-            # 这一段所有 i 的 Mseg 或 c_s 都为 0，设为 0 功率并继续
+        M_s = np.array(M_s, dtype=float)
+        c_s = np.array(c_s, dtype=float)
+        pre  = np.array(pre, dtype=float)
+
+        # 可行 i：M_i(s)>0, c_i>0, 且 B/M_i(s) - pre_i > 0
+        feas = (M_s > eps) & (c_s > eps) & ((B / np.maximum(M_s, eps) - pre) > eps)
+        if not np.any(feas):
+            # 这一段任何选中染料都无法把峰抬到 B（比如全是 c_i=0），按规则功率设 0
             P[s] = 0.0
-        else:
-            # 先取能保证 “≤B” 的最小上界
-            bounds = (B / (Mseg[feasible] * c_s[feasible])) - (pre[feasible] / c_s[feasible])
-            P[s] = max(0.0, float(np.min(bounds)))
+            continue
 
-            # —— 关键：用当前 P[s] 真实评估这一段的峰值 C，并强制缩放到 B ——
-            # 对每个 i，段内峰值是 M_i(s) * (pre_i + c_i(s)*P[s])
-            peak_vals = Mseg * (pre + c_s * P[s])
-            C = float(np.max(peak_vals)) if np.any(Mseg > 0) else 0.0
-            if C > 0:
-                P[s] *= (B / C)  # 令该段最大值精确等于 B
+        # 取最小上界：Ps = min_i (B/M_i - pre_i)/c_i
+        bounds = (B / M_s[feas] - pre[feas]) / c_s[feas]
+        Ps = float(np.min(bounds))
+        if Ps < 0:
+            Ps = 0.0
+        P[s] = Ps
+
+        # 数值校正（把该段真实峰值钉到 B±eps）
+        # 真实峰值 = max_i M_i(s)*(pre_i + c_i Ps)
+        real = float(np.max(M_s * (pre + c_s * P[s])))
+        if real > eps:
+            P[s] *= (B / real)
 
     return [float(x) for x in P]
+
 
 
 
@@ -546,72 +582,66 @@ def lexicographic_select_grouped_milp(E, groups_idx, tol_eq=1e-6):
 def build_effective_emission_with_lasers(
     wl, dye_db, candidates, laser_wavelengths, mode, powers, selection_for_base=None
 ):
-    """Build effective spectra under lasers for a list of candidate fluorophores.
-
-    Simultaneous:
-      - Divide spectrum into segments [λ1,λ2), [λ2,λ3), ..., [λK, end)
-      - In segment s, sum contributions from *all lasers with index m ≤ s*:
-          eff_segment += emission_segment * (sum_m≤s ex(λ_m)*QY*EC*P_m)
-
-    Separate:
-      - Each laser produces a full-spectrum emission scaled by ex(λ)*QY*EC*P.
-        We sum the lasers’ full spectra.
+    """Return [W x N] effective spectra.
+    - Emission 已在 load 时做了 peak=1 归一；此处不再改动。
+    - Simultaneous: 每段只加对应段的贡献，段边界按激光波长划分。
+    - Separate: 整段全谱都加（每束激光都产生全谱发射）。
     """
+    import numpy as np
+
     W = len(wl)
     if len(candidates) == 0:
         return np.zeros((W, 0)), []
 
     lam_sorted = np.array(sorted(laser_wavelengths), dtype=float)
-    # map original powers to sorted order
-    pw_sorted = np.array([powers[laser_wavelengths.index(L)] for L in lam_sorted], dtype=float)
+    # 对应功率按排序对齐
+    P = np.array([powers[laser_wavelengths.index(L)] for L in lam_sorted], dtype=float)
 
-    # precompute segment index ranges
-    segments = []
-    for i in range(len(lam_sorted)):
-        lo = lam_sorted[i]
-        hi = lam_sorted[i+1] if i+1 < len(lam_sorted) else wl[-1] + 1
-        loi = int(max(lo - wl[0], 0))
-        hii = int(min(hi - wl[0], W))
-        segments.append((loi, hii))
+    def seg_slice(lo_nm, hi_nm):
+        lo_i = int(max(lo_nm - wl[0], 0))
+        hi_i = int(min((hi_nm if np.isfinite(hi_nm) else wl[-1] + 1) - wl[0], W))
+        return lo_i, hi_i
 
-    cols, labels = [], []
-    for name in candidates:
+    # 预先切好段
+    segs = []
+    for s in range(len(lam_sorted)):
+        lo = lam_sorted[s]
+        hi = lam_sorted[s+1] if s+1 < len(lam_sorted) else float("inf")
+        segs.append((lo, hi))
+
+    M = np.zeros((W, len(candidates)), dtype=float)
+    labels = []
+
+    for j, name in enumerate(candidates):
         rec = dye_db[name]
-        em = np.array(rec.get("emission", []), dtype=float)
-        ex = np.array(rec.get("excitation", []), dtype=float)
-        qy = rec.get("quantum_yield", None)
-        ec = rec.get("extinction_coeff", None)
-
-        if em.size != W or ex.size != W or qy is None or ec is None:
-            cols.append(np.zeros(W))
+        em = np.array(rec["emission"], dtype=float)  # 已 peak-normalized
+        ex = np.array(rec["excitation"], dtype=float)
+        qy = float(rec["quantum_yield"])
+        ec = rec["extinction_coeff"]
+        if em.size != W or ex.size != W or ec is None or not np.isfinite(ec):
             labels.append(name)
             continue
 
-        # coefficients at laser wavelengths
-        c = np.zeros(len(lam_sorted))
-        for i, L in enumerate(lam_sorted):
-            idx = int(L - wl[0])
-            if 0 <= idx < W:
-                c[i] = ex[idx] * qy * ec * pw_sorted[i]
-
-        eff = np.zeros(W)
+        y = np.zeros(W, dtype=float)
         if mode == "Separate":
-            # full-spectrum sum over lasers
-            scale = np.sum(c)  # sum_i ex(L_i)*QY*EC*P_i
-            eff += em * scale
+            # 每束激光：全谱贡献
+            for s, L in enumerate(lam_sorted):
+                idx = int(L - wl[0])
+                if 0 <= idx < W:
+                    k = ex[idx] * qy * float(ec) * P[s]
+                    y += em * k
         else:
-            # Simultaneous (cumulative inside each segment)
-            for s, (loi, hii) in enumerate(segments):
-                if loi >= hii:
-                    continue
-                # sum contributions from all lasers up to s (inclusive)
-                scale = np.sum(c[:s+1])
-                if scale > 0:
-                    eff[loi:hii] += em[loi:hii] * scale
+            # Simultaneous：分段贡献
+            for s, L in enumerate(lam_sorted):
+                lo, hi = segs[s]
+                lo_i, hi_i = seg_slice(lo, hi)
+                idx = int(L - wl[0])
+                if 0 <= idx < W and lo_i < hi_i:
+                    k = ex[idx] * qy * float(ec) * P[s]
+                    y[lo_i:hi_i] += em[lo_i:hi_i] * k
 
-        cols.append(eff)
+        M[:, j] = y
         labels.append(name)
 
-    if not cols:
-        return np.zeros((W, 0)), []
-    return np.stack(cols, axis=1), labels
+    return M, labels
+
