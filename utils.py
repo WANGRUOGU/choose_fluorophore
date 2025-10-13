@@ -7,19 +7,80 @@ import pulp
 
 # ---------------- I/O ----------------
 
+import yaml
+import numpy as np
+
 def load_dyes_yaml(path):
-    """Load dyes.yaml -> (wavelengths, dye_db)."""
+    """
+    Load dyes.yaml -> (wavelengths, dye_db).
+
+    Changes:
+      - Peak-normalize ALL emission spectra at load time (divide by per-dye max, if max>0).
+      - Impute missing quantum_yield with the mean of available values (fallback=1.0 if none).
+    dye_db: dict[name] = {
+        "emission": np.array,           # already peak-normalized here
+        "excitation": np.array,
+        "quantum_yield": float,
+        "extinction_coeff": float|None
+    }
+    """
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
+
     wl = np.array(data["wavelengths"], dtype=float)
-    dye_db = {}
-    for name, rec in data["dyes"].items():
+
+    # First pass: raw read
+    raw = {}
+    qy_list = []
+    for name, rec in (data.get("dyes", {}) or {}).items():
         em = np.array(rec.get("emission", []), dtype=float)
         ex = np.array(rec.get("excitation", []), dtype=float)
+
+        # NOTE: don't normalize excitation here
+        # Peak-normalize emission (divide by its own max)
+        if em.size > 0:
+            m = float(np.max(em))
+            if m > 0:
+                em = em / m
+
         qy = rec.get("quantum_yield", None)
         ec = rec.get("extinction_coeff", None)
-        dye_db[name] = dict(emission=em, excitation=ex, quantum_yield=qy, extinction_coeff=ec)
+
+        # Collect numeric qy for mean
+        if qy is not None:
+            try:
+                qy_list.append(float(qy))
+            except Exception:
+                pass
+
+        raw[name] = dict(emission=em, excitation=ex, quantum_yield=qy, extinction_coeff=ec)
+
+    # Compute mean QY for imputation
+    if len(qy_list) > 0 and np.isfinite(qy_list).any():
+        qy_mean = float(np.nanmean(qy_list))
+    else:
+        qy_mean = 1.0  # safe fallback when all missing
+
+    # Second pass: impute missing qy
+    dye_db = {}
+    for name, rec in raw.items():
+        qy_val = rec["quantum_yield"]
+        try:
+            qy_val = float(qy_val)
+        except Exception:
+            qy_val = None
+        if (qy_val is None) or (not np.isfinite(qy_val)):
+            qy_val = qy_mean
+
+        dye_db[name] = dict(
+            emission=rec["emission"],
+            excitation=rec["excitation"],
+            quantum_yield=qy_val,
+            extinction_coeff=rec["extinction_coeff"],
+        )
+
     return wl, dye_db
+
 
 
 def read_probes_and_mapping(path):
