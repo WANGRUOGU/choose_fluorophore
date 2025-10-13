@@ -242,67 +242,119 @@ def build_E_and_groups_from_mapping(
 # ------------- Laser power derivation & iteration -------------
 
 def derive_powers_simultaneous(wl, dye_db, selection, laser_wavelengths):
-    lam = np.array(sorted(laser_wavelengths), dtype=float)
+    """Compute laser powers for 'Simultaneous' per the segment-wise leveling rule.
+
+    Steps:
+      1) Find first informative segment start_seg; set P[start_seg]=1.
+      2) Let B = max over dyes in selection of peak(em_segment * ex(λ_start)*QY*EC).
+      3) For each later segment s, choose the *smallest* P[s] ≥ 0 such that
+         for all dyes i in selection and all wavelength samples k in segment s:
+           pre_i,k + em_i[k]*ex_i(λ_s)*QY_i*EC_i*P[s] ≤ B,
+         where pre_i,k = em_i[k] * sum_{m< s} ex_i(λ_m)*QY_i*EC_i*P[m].
+    """
     W = len(wl)
-    recs = [dye_db[name] for name in selection]
+    lam = np.array(sorted(laser_wavelengths), dtype=float)
 
-    def _seg_idx(s):
-        lo = lam[s]
-        hi = lam[s+1] if s+1 < len(lam) else wl[-1] + 1
-        loi = int(max(lo - wl[0], 0)); hii = int(min(hi - wl[0], W))
-        return loi, hii
+    # Build segments as index ranges
+    seg_ranges = []
+    for i in range(len(lam)):
+        lo = lam[i]
+        hi = lam[i+1] if i+1 < len(lam) else wl[-1] + 1
+        loi = int(max(lo - wl[0], 0))
+        hii = int(min(hi - wl[0], W))
+        seg_ranges.append((loi, hii))
 
-    def coef_at_l(rec, l):
-        em = np.array(rec["emission"], dtype=float)
-        ex = np.array(rec["excitation"], dtype=float)
-        qy = rec["quantum_yield"]; ec = rec["extinction_coeff"]
-        if any(v is None for v in (qy, ec)) or ex.size != W or em.size != W:
+    recs = [dye_db[nm] for nm in selection]
+
+    # helper: coefficient at laser λ for a record
+    def coef_at(rec, L):
+        ex = np.array(rec.get("excitation", []), dtype=float)
+        qy = rec.get("quantum_yield", None)
+        ec = rec.get("extinction_coeff", None)
+        if ex.size != W or qy is None or ec is None:
             return None
-        idx = int(l - wl[0])
-        if idx < 0 or idx >= W:
-            return 0.0
-        return float(ex[idx] * qy * ec)
-
-    def seg_peak(rec, loi, hii):
-        em = np.array(rec["emission"], dtype=float)
-        if em.size != W or loi >= hii:
-            return 0.0
-        return float(np.max(em[loi:hii]))
+        idx = int(L - wl[0])
+        if 0 <= idx < W:
+            return float(ex[idx] * qy * ec)
+        return 0.0
 
     # find first informative segment
-    start_seg = 0
-    while start_seg < len(lam):
-        loi, hii = _seg_idx(start_seg)
-        has_peak = any(seg_peak(r, loi, hii) > 0 for r in recs)
-        if has_peak:
+    start_seg = None
+    for s, (loi, hii) in enumerate(seg_ranges):
+        informative = False
+        for rec in recs:
+            em = np.array(rec.get("emission", []), dtype=float)
+            c0 = coef_at(rec, lam[s])
+            if em.size == W and c0 not in (None, 0.0) and np.max(em[loi:hii]) > 0:
+                informative = True
+                break
+        if informative:
+            start_seg = s
             break
-        start_seg += 1
-    if start_seg >= len(lam):
+
+    if start_seg is None:
+        # degenerate case: no emission anywhere
         return [1.0] * len(lam)
 
-    P = np.zeros(len(lam))
+    # init powers
+    P = np.zeros(len(lam), dtype=float)
     P[start_seg] = 1.0
-    loi, hii = _seg_idx(start_seg)
-    a = np.array([coef_at_l(r, lam[start_seg]) or 0.0 for r in recs])
-    Mseg = np.array([seg_peak(r, loi, hii) for r in recs])
-    B = float(np.max(a * Mseg)) if np.any(Mseg > 0) else 0.0
 
+    # compute B on start segment using *true* segment vector peaks
+    loi, hii = seg_ranges[start_seg]
+    peaks = []
+    for rec in recs:
+        em = np.array(rec.get("emission", []), dtype=float)
+        c = coef_at(rec, lam[start_seg])
+        if em.size != W or c in (None, 0.0):
+            continue
+        vec = em[loi:hii] * c * P[start_seg]
+        if vec.size:
+            peaks.append(np.max(vec))
+    B = float(max(peaks) if peaks else 0.0)
+
+    # accumulate pre-sums per record as a scalar “sum of coefficients so far”
+    # BUT constraints用逐点：pre_i,k = em_i[k] * sum_prev
+    sum_prev = np.zeros(len(recs), dtype=float)
+    sum_prev += np.array([coef_at(rec, lam[start_seg]) or 0.0 for rec in recs]) * P[start_seg]
+
+    # iterate later segments
     for s in range(start_seg + 1, len(lam)):
-        loi, hii = _seg_idx(s)
-        Mseg = np.array([seg_peak(r, loi, hii) for r in recs])
-        pre = np.zeros(len(recs))
-        for m in range(start_seg, s):
-            c = np.array([coef_at_l(r, lam[m]) or 0.0 for r in recs])
-            pre += c * P[m]
-        c_s = np.array([coef_at_l(r, lam[s]) or 0.0 for r in recs])
-        feasible = (Mseg > 0) & (c_s > 0)
-        if not np.any(feasible):
+        loi, hii = seg_ranges[s]
+        if loi >= hii:
             P[s] = 0.0
             continue
-        bounds = (B / (Mseg[feasible] * c_s[feasible])) - (pre[feasible] / c_s[feasible])
-        P[s] = max(0.0, float(np.min(bounds)))
 
-    return [float(p) for p in P]
+        # collect feasible upper bounds for P[s]
+        bounds = []
+        for i, rec in enumerate(recs):
+            em = np.array(rec.get("emission", []), dtype=float)
+            c_s = coef_at(rec, lam[s])
+            if em.size != W or c_s in (None, 0.0):
+                continue
+            em_seg = em[loi:hii]
+            if em_seg.size == 0 or np.all(em_seg <= 0):
+                continue
+            # per-sample constraint: pre_i,k + em_i[k]*c_s*P[s] ≤ B
+            # where pre_i,k = em_i[k] * sum_prev[i]
+            # rearrange (em_i[k]*c_s) * P[s] ≤ B - em_i[k]*sum_prev[i]
+            denom = em_seg * c_s
+            numer = B - em_seg * sum_prev[i]
+            mask = (denom > 0) & (numer >= 0)
+            if np.any(mask):
+                ub = np.min(numer[mask] / denom[mask])  # smallest upper bound across k
+                bounds.append(ub)
+
+        if bounds:
+            P[s] = max(0.0, float(min(bounds)))
+        else:
+            P[s] = 0.0
+
+        # update cumulative coefficient sum for later segments
+        sum_prev += np.array([coef_at(rec, lam[s]) or 0.0 for rec in recs]) * P[s]
+
+    return [float(x) for x in P]
+
 
 
 def derive_powers_separate(wl, dye_db, selection, laser_wavelengths):
@@ -529,3 +581,75 @@ def lexicographic_select_grouped_milp(E, groups_idx, tol_eq=1e-6):
         picked = sorted(idxs, key=lambda j: -x_sol.get(j, 0))
         sel.append(picked[0])
     return sel
+def build_effective_emission_with_lasers(
+    wl, dye_db, candidates, laser_wavelengths, mode, powers, selection_for_base=None
+):
+    """Build effective spectra under lasers for a list of candidate fluorophores.
+
+    Simultaneous:
+      - Divide spectrum into segments [λ1,λ2), [λ2,λ3), ..., [λK, end)
+      - In segment s, sum contributions from *all lasers with index m ≤ s*:
+          eff_segment += emission_segment * (sum_m≤s ex(λ_m)*QY*EC*P_m)
+
+    Separate:
+      - Each laser produces a full-spectrum emission scaled by ex(λ)*QY*EC*P.
+        We sum the lasers’ full spectra.
+    """
+    W = len(wl)
+    if len(candidates) == 0:
+        return np.zeros((W, 0)), []
+
+    lam_sorted = np.array(sorted(laser_wavelengths), dtype=float)
+    # map original powers to sorted order
+    pw_sorted = np.array([powers[laser_wavelengths.index(L)] for L in lam_sorted], dtype=float)
+
+    # precompute segment index ranges
+    segments = []
+    for i in range(len(lam_sorted)):
+        lo = lam_sorted[i]
+        hi = lam_sorted[i+1] if i+1 < len(lam_sorted) else wl[-1] + 1
+        loi = int(max(lo - wl[0], 0))
+        hii = int(min(hi - wl[0], W))
+        segments.append((loi, hii))
+
+    cols, labels = [], []
+    for name in candidates:
+        rec = dye_db[name]
+        em = np.array(rec.get("emission", []), dtype=float)
+        ex = np.array(rec.get("excitation", []), dtype=float)
+        qy = rec.get("quantum_yield", None)
+        ec = rec.get("extinction_coeff", None)
+
+        if em.size != W or ex.size != W or qy is None or ec is None:
+            cols.append(np.zeros(W))
+            labels.append(name)
+            continue
+
+        # coefficients at laser wavelengths
+        c = np.zeros(len(lam_sorted))
+        for i, L in enumerate(lam_sorted):
+            idx = int(L - wl[0])
+            if 0 <= idx < W:
+                c[i] = ex[idx] * qy * ec * pw_sorted[i]
+
+        eff = np.zeros(W)
+        if mode == "Separate":
+            # full-spectrum sum over lasers
+            scale = np.sum(c)  # sum_i ex(L_i)*QY*EC*P_i
+            eff += em * scale
+        else:
+            # Simultaneous (cumulative inside each segment)
+            for s, (loi, hii) in enumerate(segments):
+                if loi >= hii:
+                    continue
+                # sum contributions from all lasers up to s (inclusive)
+                scale = np.sum(c[:s+1])
+                if scale > 0:
+                    eff[loi:hii] += em[loi:hii] * scale
+
+        cols.append(eff)
+        labels.append(name)
+
+    if not cols:
+        return np.zeros((W, 0)), []
+    return np.stack(cols, axis=1), labels
