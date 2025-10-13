@@ -21,10 +21,57 @@ def load_dyes_yaml(path):
 
 
 def load_probe_fluor_map(path):
-    """Load mapping probe -> candidate fluorophores."""
+    """Load mapping probe -> candidate fluorophores from YAML.
+
+    Supported schemas:
+      A) Top-level mapping:
+         ProbeA: [AF488, AF546]
+         ProbeB: [ATTO647N, AF647]
+
+      B) Under 'mapping':
+         mapping:
+           ProbeA: [AF488, AF546]
+           ProbeB: [ATTO647N, AF647]
+
+      C) Under 'probes':
+         probes:
+           ProbeA: [AF488, AF546]
+           ProbeB: [ATTO647N, AF647]
+    """
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
-    return data["mapping"]  # {"ProbeA": ["AF488", ...], ...}
+
+    if data is None:
+        raise ValueError(f"Empty YAML file: {path}")
+
+    # Case B: explicit 'mapping'
+    if isinstance(data, dict) and "mapping" in data and isinstance(data["mapping"], dict):
+        mapping = data["mapping"]
+
+    # Case C: explicit 'probes'
+    elif isinstance(data, dict) and "probes" in data and isinstance(data["probes"], dict):
+        mapping = data["probes"]
+
+    # Case A: top-level is the mapping
+    elif isinstance(data, dict) and all(isinstance(v, (list, tuple)) for v in data.values()):
+        mapping = data
+
+    else:
+        raise ValueError(
+            "Invalid probe_fluor_map.yaml schema. Expected one of:\n"
+            "- Top-level mapping {Probe: [fluor,...]}\n"
+            "- {mapping: {Probe: [fluor,...]}}\n"
+            "- {probes: {Probe: [fluor,...]}}"
+        )
+
+    # Normalize to plain dict[str, list[str]]
+    norm = {}
+    for k, v in mapping.items():
+        if not isinstance(v, (list, tuple)):
+            raise ValueError(f"Probe '{k}' must map to a list of fluor names, got: {type(v)}")
+        norm[str(k)] = [str(x) for x in v]
+    return norm
+
 
 
 # ------------- Spectra builders -------------
