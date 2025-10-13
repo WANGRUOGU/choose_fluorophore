@@ -138,17 +138,24 @@ if mode == "Emission only":
     En = E_emission / (np.linalg.norm(E_emission, axis=0, keepdims=True) + 1e-12)
     S = cosine_similarity_matrix(En[:, sel_indices])
     vals, pairs = top_k_pairwise(S, k=k_top_show)
-    st.markdown("**Top pairwise similarities (largest first):**")
+    st.markdown("**Top pairwise similarities (largest first)**")
+    st.caption(
+        "Cosine similarity (0–1 for nonnegative spectra). "
+        "Closer to 1 ⇒ more similar; values >0.9 often indicate poor separability."
+    )
     st.write("None." if len(vals) == 0 else ", ".join([f"{v:.3f}" for v in vals]))
+
 
     # Spectra viewer-like plot
     fig = go.Figure()
-    for i, fluor in zip(sel_indices, selected):
-        y = En[:, i]  # normalized for visual
+    for fluor in selected:
+    # 这里直接从 dye_db 取 emission（我们在 load_dyes_yaml 时已做“峰值=1”的归一化）
+        y = np.array(dye_db[fluor]["emission"], dtype=float)
         fig.add_trace(go.Scatter(x=wl, y=y, mode="lines", name=fluor))
     fig.update_layout(
-        title="Emission (normalized) spectra of selected fluorophores",
-        xaxis_title="Wavelength (nm)", yaxis_title="Intensity (normalized)"
+        title="Emission-only spectra (peak-normalized to 1.0)",
+        xaxis_title="Wavelength (nm)",
+        yaxis_title="Intensity (0–1)"
     )
     st.plotly_chart(fig, use_container_width=True)
 
