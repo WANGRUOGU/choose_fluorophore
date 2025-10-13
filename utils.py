@@ -21,10 +21,11 @@ def load_dyes_yaml(path):
 
 
 def load_probe_fluor_map(path):
-    """Load mapping: supports two YAML schemas:
-       1) {mapping: {ProbeA: [AF488, ...], ...}}
-       2) {ProbeA: [AF488, ...], ProbeB: [...]}
-       Returns a dict[str, list[str]].
+    """Load mapping probe -> list[fluor], supporting several YAML layouts:
+       1) {probes: {ProbeA: [AF488, ...], ...}, notes: ..., schema: ..., updated: ...}
+       2) {mapping: {ProbeA: [...], ...}}
+       3) {ProbeA: [...], ProbeB: [...]}  # direct top-level (legacy)
+    Returns dict[str, list[str]].
     """
     import yaml
 
@@ -34,29 +35,39 @@ def load_probe_fluor_map(path):
     if data is None:
         return {}
 
-    # Accept both schemas
-    if isinstance(data, dict) and "mapping" in data and isinstance(data["mapping"], dict):
+    # Prefer 'probes' block if present (your current file)
+    if isinstance(data, dict) and "probes" in data and isinstance(data["probes"], dict):
+        mapping = data["probes"]
+
+    # Else accept 'mapping'
+    elif isinstance(data, dict) and "mapping" in data and isinstance(data["mapping"], dict):
         mapping = data["mapping"]
+
+    # Else, assume the whole dict is the mapping,
+    # but drop common meta keys if they exist by mistake.
     elif isinstance(data, dict):
-        mapping = data  # assume direct mapping at the top level
+        meta_keys = {"notes", "schema", "updated", "version", "$schema"}
+        mapping = {k: v for k, v in data.items() if k not in meta_keys}
     else:
         raise ValueError(
             "probe_fluor_map.yaml must be a mapping. "
-            "Either use {'mapping': {...}} or put the probe→fluor list at the top level."
+            "Use a 'probes:' or 'mapping:' section, or a direct probe→list form."
         )
 
     # Normalize to dict[str, list[str]]
     clean = {}
     for k, v in mapping.items():
-        key = str(k)
+        key = str(k).strip()
+        if not key:
+            continue
         if v is None:
             clean[key] = []
         elif isinstance(v, (list, tuple)):
-            clean[key] = [str(x) for x in v]
+            clean[key] = [str(x).strip() for x in v if str(x).strip()]
         else:
-            # allow single string -> wrap into list
-            clean[key] = [str(v)]
+            clean[key] = [str(v).strip()]
     return clean
+
 
 
 
