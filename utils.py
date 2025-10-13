@@ -1,655 +1,467 @@
+# utils.py
 import yaml
 import numpy as np
-
-# MILP
 import pulp
 
-
-# ---------------- I/O ----------------
-
-import yaml
-import numpy as np
+# =============== I/O =================
 
 def load_dyes_yaml(path):
-    """Load dyes.yaml -> (wavelengths, dye_db).
-    - Emission is normalized by its own max (peak=1) if max>0.
-    - If quantum_yield is missing -> impute by mean of available QY.
     """
-    import yaml, numpy as np
-
+    Load dyes.yaml -> (wavelengths, dye_db).
+    dye_db[name] = {
+        "emission": np.array(W,),
+        "excitation": np.array(W,),
+        "quantum_yield": float|None,
+        "extinction_coeff": float|None
+    }
+    """
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
     wl = np.array(data["wavelengths"], dtype=float)
 
-    # first pass: collect QY
-    raw = {}
-    qy_list = []
+    dye_db = {}
     for name, rec in data["dyes"].items():
         em = np.array(rec.get("emission", []), dtype=float)
         ex = np.array(rec.get("excitation", []), dtype=float)
         qy = rec.get("quantum_yield", None)
         ec = rec.get("extinction_coeff", None)
+        dye_db[name] = dict(emission=em, excitation=ex, quantum_yield=qy, extinction_coeff=ec)
 
-        # emission peak-normalize
-        if em.size:
-            m = float(np.max(em))
-            if m > 0:
-                em = em / m
+    # Fill missing QY with mean of available ones (used later in builders)
+    qys = [v["quantum_yield"] for v in dye_db.values() if v.get("quantum_yield") is not None]
+    mean_qy = float(np.mean(qys)) if len(qys) else 1.0
+    for v in dye_db.values():
+        if v.get("quantum_yield") is None:
+            v["quantum_yield"] = mean_qy
 
-        raw[name] = dict(emission=em, excitation=ex, quantum_yield=qy, extinction_coeff=ec)
-        if isinstance(qy, (int, float)) and np.isfinite(qy):
-            qy_list.append(float(qy))
-
-    qy_mean = float(np.mean(qy_list)) if qy_list else 1.0
-
-    # second pass: impute missing QY
-    dye_db = {}
-    for name, rec in raw.items():
-        qy = rec["quantum_yield"]
-        if (qy is None) or (not np.isfinite(qy)):
-            qy = qy_mean
-        dye_db[name] = dict(
-            emission=rec["emission"],
-            excitation=rec["excitation"],
-            quantum_yield=float(qy),
-            extinction_coeff=rec["extinction_coeff"],
-        )
     return wl, dye_db
 
 
-
-
-
-def read_probes_and_mapping(path):
+def load_probe_fluor_map(path):
     """
-    Parse ONLY the `probes:` array from probe_fluor_map.yaml.
-    Returns:
-      names_sorted: list[str]
-      mapping: dict[str, list[str]]
+    Expect YAML either:
+      - a list of {name: <probe>, fluors: [..]} at top-level
+      - or {probes: [...] } with同样的结构
+    Return: dict[probe] -> list[fluor]
     """
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
 
-    plist = data if isinstance(data, list) else data.get("probes", [])
-    names = []
+    if isinstance(data, list):
+        items = data
+    elif isinstance(data, dict) and isinstance(data.get("probes"), list):
+        items = data["probes"]
+    else:
+        # Fallback: empty
+        return {}
+
     mapping = {}
-    if isinstance(plist, list):
-        for item in plist:
-            if not isinstance(item, dict):
-                continue
-            name = str(item.get("name", "")).strip()
-            fls = item.get("fluors", []) or []
-            if not name:
-                continue
-            if isinstance(fls, (list, tuple)):
-                fls = [str(x).strip() for x in fls if str(x).strip()]
-            else:
-                fls = [str(fls).strip()] if str(fls).strip() else []
-            names.append(name)
-            mapping[name] = fls
-    names_sorted = sorted(dict.fromkeys(names))
-    return names_sorted, mapping
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        name = str(it.get("name", "")).strip()
+        fls = it.get("fluors", []) or []
+        if not name:
+            continue
+        if not isinstance(fls, (list, tuple)):
+            fls = [str(fls).strip()] if str(fls).strip() else []
+        mapping[name] = [str(x).strip() for x in fls if str(x).strip()]
+    return mapping
 
 
-# ------------- Helpers -------------
+# =============== Helpers ===============
 
-def _safe_norm(x):
-    n = np.linalg.norm(x)
-    return x / (n + 1e-12)
-
+def _safe_l2norm_cols(E):
+    """L2-normalize each column; avoid divide by zero."""
+    denom = np.linalg.norm(E, axis=0, keepdims=True) + 1e-12
+    return E / denom
 
 def cosine_similarity_matrix(E):
-    """Cosine similarity matrix of columns of E (E: W x N)."""
-    N = E.shape[1]
+    """Cosine similarity of columns; diagonal set to 0."""
     norms = np.linalg.norm(E, axis=0) + 1e-12
     G = (E.T @ E) / np.outer(norms, norms)
     np.fill_diagonal(G, 0.0)
     return G
 
-
-def top_k_pairwise(S, k=10):
-    """Return top-k largest off-diagonal similarities and their pairs."""
-    N = S.shape[0]
-    tri = np.triu_indices(N, k=1)
-    vals = S[tri]
-    if vals.size == 0:
-        return [], []
-    order = np.argsort(-vals)  # descending
-    order = order[: min(k, vals.size)]
-    top_vals = vals[order].tolist()
-    pairs = list(zip(tri[0][order], tri[1][order]))
-    return top_vals, pairs
-
-
-# ------------- Spectra builders -------------
-
-def build_effective_emission_emission_only(wl, dye_db, groups_as_lists_of_names):
-    """(Deprecated for MILP building directly) — kept for compatibility."""
-    W = len(wl)
-    cols, labels = [], []
-    for cands in groups_as_lists_of_names:
-        for name in cands:
-            em = np.array(dye_db[name]["emission"], dtype=float)
-            if em.size != W:
-                continue
-            cols.append(_safe_norm(em))
-            labels.append(name)
-    if not cols:
-        return np.zeros((W, 0)), []
-    return np.stack(cols, axis=1), labels
-
-
-def build_E_and_groups_from_mapping(
-    wl, dye_db, picked_probes, probe_to_fluors, mode="emission_only",
-    laser_wavelengths=None, laser_mode=None, laser_powers=None
-):
+def top_k_pairwise(S, labels_pair, k=10):
     """
-    Build a big matrix E (W x N) across all picked probes & their candidates,
-    along with `labels` (length N) and `groups_idx` (list of list of indices into columns of E).
-    mode:
-      - "emission_only"
-      - "lasers" (requires wavelengths, mode, and powers to be provided; E columns are effective spectra)
+    S: NxN cosine similarity (diag=0)
+    labels_pair: list[str] length N, each like "Probe – Fluor"
+    Return list of (value, label_i, label_j) sorted desc by value.
+    """
+    N = S.shape[0]
+    iu = np.triu_indices(N, k=1)
+    vals = S[iu]
+    if vals.size == 0:
+        return []
+    order = np.argsort(-vals)
+    order = order[: min(k, vals.size)]
+    out = []
+    for idx in order:
+        i = iu[0][idx]
+        j = iu[1][idx]
+        out.append((float(vals[idx]), labels_pair[i], labels_pair[j]))
+    return out
+
+
+# =============== Spectra builders ===============
+
+def build_emission_only_matrix(wl, dye_db, groups):
+    """
+    Build emission-only spectra matrix for optimization.
+    Rule: BEFORE any calculation, normalize emission by its own max (peak=1).
+    Return:
+      E_norm: W x N (L2-normalized columns for cosine),
+      labels_pair: ["Probe – Fluor", ...],
+      idx_groups: list[list] column indices per probe group in same order as E.
     """
     W = len(wl)
     cols = []
     labels = []
-    groups_idx = []
-    group_names = []
-    cur = 0
-    for probe in picked_probes:
-        cands = list(probe_to_fluors.get(probe, []))
-        # filter by spectra availability
-        cands = [f for f in cands if f in dye_db]
-        if not cands:
-            continue
+    idx_groups = []
+    col_id = 0
+    for probe, cand_list in groups.items():
         idxs = []
-        for name in cands:
-            rec = dye_db[name]
-            if mode == "emission_only":
-                em = np.array(rec["emission"], dtype=float)
-                if em.size != W:
-                    continue
-                cols.append(em.copy())  # raw emission; we will normalize when computing cosine constants
-                labels.append(name)
-                idxs.append(cur)
-                cur += 1
-            else:
-                # lasers mode: need effective spectrum built from powers
-                em = np.array(rec["emission"], dtype=float)
-                ex = np.array(rec["excitation"], dtype=float)
-                qy = rec["quantum_yield"]
-                ec = rec["extinction_coeff"]
-                if any(v is None for v in (qy, ec)) or em.size != W or ex.size != W:
-                    continue
-                lam = np.array(sorted(laser_wavelengths), dtype=float)
-                pw = np.array([laser_powers[laser_wavelengths.index(l)] for l in lam], dtype=float)
-                eff = np.zeros(W)
-                if laser_mode == "Separate":
-                    for i, l in enumerate(lam):
-                        idx = int(l - wl[0])
-                        if 0 <= idx < W:
-                            k_i = ex[idx] * qy * ec * pw[i]
-                            eff += em * k_i
-                else:
-                    # Simultaneous: piecewise segments
-                    for i, l in enumerate(lam):
-                        lo = l
-                        hi = lam[i+1] if i+1 < len(lam) else wl[-1] + 1
-                        loi = int(max(lo - wl[0], 0))
-                        hii = int(min(hi - wl[0], W))
-                        idx_l = int(l - wl[0])
-                        if 0 <= idx_l < W and loi < hii:
-                            k_i = ex[idx_l] * qy * ec * pw[i]
-                            eff[loi:hii] += em[loi:hii] * k_i
-                cols.append(eff)
-                labels.append(name)
-                idxs.append(cur)
-                cur += 1
+        for fluor in cand_list:
+            rec = dye_db.get(fluor)
+            if rec is None: 
+                continue
+            em = np.array(rec["emission"], dtype=float)
+            if em.size != W:
+                continue
+            # normalize by max peak first
+            m = np.max(em) if np.max(em) > 0 else 1.0
+            em_peak = em / m
+            cols.append(em_peak)
+            labels.append(f"{probe} – {fluor}")
+            idxs.append(col_id)
+            col_id += 1
         if idxs:
-            groups_idx.append(idxs)
-            group_names.append(probe)
-
+            idx_groups.append(idxs)
     if not cols:
-        return np.zeros((W, 0)), [], [], []
-
+        return np.zeros((W, 0)), [], []
     E = np.stack(cols, axis=1)
-    return E, labels, groups_idx, group_names
+    E_norm = _safe_l2norm_cols(E)
+    return E_norm, labels, idx_groups
 
 
-# ------------- Laser power derivation & iteration -------------
+def _nearest_idx_from_grid(wl, lam):
+    """Assume integer or 1nm grid; pick nearest index of wavelength lam."""
+    idx = int(round(lam - wl[0]))
+    if idx < 0: idx = 0
+    if idx >= len(wl): idx = len(wl) - 1
+    return idx
 
-def derive_powers_simultaneous(wl, dye_db, selection, laser_wavelengths, eps=1e-12):
+def _segments_from_lasers(wl, lasers_sorted):
     """
-    严格分段等峰：
-    - 设 L1<L2<...<LS。把谱分成 S 段：[L1,L2), [L2,L3), ..., [LS, +inf)
-    - 第一段设 P1=1，B = max_i{ M_i(1) * c_i(L1) }，其中 M_i(s) 是第 s 段 emission 的最大值，
-      c_i(Lk)=ex_i(Lk)*QY_i*EC_i。
-    - 对 s=2..S：令 pre_i = sum_{m=1..s-1} c_i(Lm) Pm。
-      约束：forall i,  M_i(s)*(pre_i + c_i(Ls) Ps) ≤ B。
-      取满足不等式的 **最小上界** Ps = min_i  (B/M_i(s) - pre_i)/c_i(Ls) （仅在 M_i(s)>0 且 c_i>0 且分子>0 上取）。
-      这个最小上界对应的 i 会“卡紧”，从而该段的最大值 = B（数值误差除外）。
+    Build segments [lo, hi) in wavelength for simultaneous mode.
     """
-    import numpy as np
+    segs = []
+    for i, l in enumerate(lasers_sorted):
+        lo = l
+        hi = lasers_sorted[i+1] if i+1 < len(lasers_sorted) else wl[-1] + 1
+        segs.append((lo, hi))
+    return segs
 
+def derive_powers_simultaneous(wl, dye_db, selection_labels, laser_wavelengths):
+    """
+    Your 'B-leveling' rule when lasers fire simultaneously.
+    selection_labels: list like ["Probe – Fluor", ...] for A
+    Return powers aligned to sorted lasers.
+    """
     lam = np.array(sorted(laser_wavelengths), dtype=float)
+    segs = _segments_from_lasers(wl, lam)
     W = len(wl)
 
-    # handy helpers
-    def seg_slice(lo_nm, hi_nm):
-        lo_i = int(max(lo_nm - wl[0], 0))
-        hi_i = int(min((hi_nm if np.isfinite(hi_nm) else wl[-1] + 1) - wl[0], W))
-        return lo_i, hi_i
+    # Extract fluor names from "Probe – Fluor"
+    fls = [s.split(" – ", 1)[1] for s in selection_labels]
+    recs = [dye_db[f] for f in fls if f in dye_db]
 
-    def Mseg(rec, lo_i, hi_i):
-        em = np.array(rec["emission"], dtype=float)
-        if em.size != W or lo_i >= hi_i:
+    # Helper coefficients c_i(l) = ex(l)*QY*EC
+    def coef(rec, l):
+        ex = rec["excitation"]; qy = rec["quantum_yield"]; ec = rec["extinction_coeff"]
+        if ex is None or len(ex) != W or qy is None or ec is None:
             return 0.0
-        return float(np.max(em[lo_i:hi_i]))
+        idx = _nearest_idx_from_grid(wl, l)
+        return float(ex[idx] * qy * (ec if ec is not None else 1.0))
 
-    def coef(rec, lnm):
-        ex = np.array(rec["excitation"], dtype=float)
-        if ex.size != W:
+    # Peak in segment for emission
+    def seg_peak(rec, lo, hi):
+        em = rec["emission"]
+        if em is None or len(em) != W:
             return 0.0
-        qy = float(rec["quantum_yield"])
-        ec = rec["extinction_coeff"]
-        if ec is None or not np.isfinite(ec):
+        loi = _nearest_idx_from_grid(wl, lo)
+        hii = _nearest_idx_from_grid(wl, hi-1) + 1
+        if loi >= hii:
             return 0.0
-        idx = int(lnm - wl[0])
-        if idx < 0 or idx >= W:
-            return 0.0
-        return float(ex[idx]) * qy * float(ec)
+        return float(np.max(em[loi:hii]))
 
-    # build selected records
-    A = [dye_db[n] for n in selection]
-    if len(A) == 0:
-        return [1.0] * len(lam)
-
-    # segments
-    seg_bounds = []
-    for s in range(len(lam)):
-        lo = lam[s]
-        hi = lam[s+1] if s+1 < len(lam) else float("inf")
-        seg_bounds.append((lo, hi))
-
-    # 找到第一个“可用”的起始段：该段存在 M_i(s)>0 且 c_i(Ls)>0
+    # Find first informative segment and set its power = 1, define B
     start = None
-    for s, (lo, hi) in enumerate(seg_bounds):
-        lo_i, hi_i = seg_slice(lo, hi)
-        feas = False
-        for rec in A:
-            if Mseg(rec, lo_i, hi_i) > 0 and coef(rec, lam[s]) > 0:
-                feas = True
-                break
-        if feas:
-            start = s
-            break
+    for s, (lo, hi) in enumerate(segs):
+        ok = any(seg_peak(r, lo, hi) > 0 for r in recs)
+        if ok:
+            start = s; break
     if start is None:
-        return [1.0] * len(lam)  # 无法驱动任何段
+        return [1.0] * len(lam)  # degenerate
 
-    # P 初始化
-    P = np.zeros(len(lam), dtype=float)
+    P = np.zeros(len(lam))
     P[start] = 1.0
 
-    # 定义 B
-    lo_i, hi_i = seg_slice(*seg_bounds[start])
-    B = 0.0
-    for rec in A:
-        Mi = Mseg(rec, lo_i, hi_i)
-        ci = coef(rec, lam[start])
-        B = max(B, Mi * ci)
-    # 若 B=0（极端），直接全 1
-    if B <= eps:
-        return [1.0] * len(lam)
+    lo, hi = segs[start]
+    M = np.array([seg_peak(r, lo, hi) for r in recs])
+    a = np.array([coef(r, lam[start]) for r in recs])
+    B = float(np.max(a * M)) if np.any(M > 0) else 0.0
 
-    # 逐段推进
-    # 为了简洁，我们从 start+1 开始；之前段的 P 已定
-    for s in range(start + 1, len(lam)):
-        lo, hi = seg_bounds[s]
-        lo_i, hi_i = seg_slice(lo, hi)
-
-        # pre_i 和 c_s
-        pre = []
-        c_s = []
-        M_s = []
-        for rec in A:
-            # 该段的发射峰
-            Mi = Mseg(rec, lo_i, hi_i)
-            M_s.append(Mi)
-            # 该段对应激发系数
-            cs = coef(rec, lam[s])
-            c_s.append(cs)
-            # 累积前面段的贡献系数和（注意这些系数在“这一段”的放大倍数一样乘以 M_i(s)）
-            acc = 0.0
-            for m in range(start, s):
-                cm = coef(rec, lam[m])
-                acc += cm * P[m]
-            pre.append(acc)
-
-        M_s = np.array(M_s, dtype=float)
-        c_s = np.array(c_s, dtype=float)
-        pre  = np.array(pre, dtype=float)
-
-        # 可行 i：M_i(s)>0, c_i>0, 且 B/M_i(s) - pre_i > 0
-        feas = (M_s > eps) & (c_s > eps) & ((B / np.maximum(M_s, eps) - pre) > eps)
-        if not np.any(feas):
-            # 这一段任何选中染料都无法把峰抬到 B（比如全是 c_i=0），按规则功率设 0
+    # March forward segments
+    for s in range(start+1, len(lam)):
+        lo, hi = segs[s]
+        M = np.array([seg_peak(r, lo, hi) for r in recs])
+        c_s = np.array([coef(r, lam[s]) for r in recs])
+        # contribution from already-set lasers
+        pre = np.zeros(len(recs))
+        for m in range(start, s):
+            c_m = np.array([coef(r, lam[m]) for r in recs])
+            pre += c_m * P[m]
+        feasible = (M > 0) & (c_s > 0)
+        if not np.any(feasible):
             P[s] = 0.0
-            continue
-
-        # 取最小上界：Ps = min_i (B/M_i - pre_i)/c_i
-        bounds = (B / M_s[feas] - pre[feas]) / c_s[feas]
-        Ps = float(np.min(bounds))
-        if Ps < 0:
-            Ps = 0.0
-        P[s] = Ps
-
-        # 数值校正（把该段真实峰值钉到 B±eps）
-        # 真实峰值 = max_i M_i(s)*(pre_i + c_i Ps)
-        real = float(np.max(M_s * (pre + c_s * P[s])))
-        if real > eps:
-            P[s] *= (B / real)
-
+        else:
+            bounds = (B / (M[feasible] * c_s[feasible])) - (pre[feasible] / c_s[feasible])
+            P[s] = max(0.0, float(np.min(bounds)))
     return [float(x) for x in P]
 
 
-
-
-
-def derive_powers_separate(wl, dye_db, selection, laser_wavelengths):
+def derive_powers_separate(wl, dye_db, selection_labels, laser_wavelengths):
+    """
+    Lasers fired separately; each laser power set so its global peak across A equals a common B.
+    """
     lam = np.array(sorted(laser_wavelengths), dtype=float)
     W = len(wl)
-    recs = [dye_db[name] for name in selection]
+    fls = [s.split(" – ", 1)[1] for s in selection_labels]
+    recs = [dye_db[f] for f in fls if f in dye_db]
 
-    def coef_at_l(rec, l):
-        em = np.array(rec["emission"], dtype=float)
-        ex = np.array(rec["excitation"], dtype=float)
-        qy = rec["quantum_yield"]; ec = rec["extinction_coeff"]
-        if any(v is None for v in (qy, ec)) or ex.size != W or em.size != W:
-            return None
-        idx = int(l - wl[0])
-        if idx < 0 or idx >= W:
+    def coef(rec, l):
+        ex = rec["excitation"]; qy = rec["quantum_yield"]; ec = rec["extinction_coeff"]
+        if ex is None or len(ex) != W or qy is None or ec is None:
             return 0.0
-        return float(ex[idx] * qy * ec)
+        idx = _nearest_idx_from_grid(wl, l)
+        return float(ex[idx] * qy * (ec if ec is not None else 1.0))
 
-    M_l = []
+    M = []
     for l in lam:
         peaks = []
-        for rec in recs:
-            em = np.array(rec["emission"], dtype=float)
-            c = coef_at_l(rec, l)
-            if em.size != W or c is None:
+        for r in recs:
+            em = r["emission"]
+            if em is None or len(em) != W:
                 continue
-            peaks.append(np.max(em) * c)
-        M_l.append(max(peaks) if peaks else 0.0)
-    M_l = np.array(M_l, dtype=float)
-    if np.all(M_l <= 0):
+            peaks.append(np.max(em) * coef(r, l))
+        M.append(max(peaks) if peaks else 0.0)
+    M = np.array(M, dtype=float)
+    if np.all(M <= 0):  # degenerate
         return [1.0] * len(lam)
-    B = float(np.max(M_l))
-    P = [0.0 if val <= 0 else float(B / val) for val in M_l]
+    B = float(np.max(M))
+    P = [float(B / v) if v > 0 else 0.0 for v in M]
     return P
 
 
-def iterate_selection_with_lasers(
-    wl, dye_db, picked_probes, probe_to_fluors, laser_wavelengths, mode,
-    solver="lexi_milp", max_iter=8
-):
+def build_effective_with_lasers(wl, dye_db, groups, laser_wavelengths, mode, powers):
     """
-    Start from emission-only selection A, derive laser powers, rebuild effective spectra for ALL candidates,
-    re-solve with chosen solver (lexicographic MILP), repeat to fixed point or max_iter.
-    Returns: (selected_labels, powers, iters, converged, E_final, labels_final, groups_idx_final)
+    Build effective spectra for ALL candidates under lasers.
+    mode: "Simultaneous" or "Separate"
+    powers: aligned to sorted(laser_wavelengths)
+    Return:
+      E_raw: W x N (not normalized,用于展示),
+      E_norm: W x N (列向量 L2 归一化，用于相似度/优化),
+      labels_pair, idx_groups
     """
-    # Build emission-only E for initial A
-    E0, labels0, groups0, _ = build_E_and_groups_from_mapping(
-        wl, dye_db, picked_probes, probe_to_fluors, mode="emission_only"
-    )
-    # Normalize for cosine constants internally in MILP; here just pass raw emission
-    A_idx = lexicographic_select_grouped_milp(E0, groups0)
-    A = [labels0[i] for i in A_idx]
+    W = len(wl)
+    lam = np.array(sorted(laser_wavelengths), dtype=float)
+    pw = np.array(powers, dtype=float)
+    segs = _segments_from_lasers(wl, lam)
 
-    selected = list(A)
-    powers = None
-    converged = False
-    E_final = None
-    labels_final = None
-    groups_idx_final = None
+    cols = []
+    labels = []
+    idx_groups = []
+    col_id = 0
 
-    for it in range(1, max_iter + 1):
-        # powers from current selection
-        if mode == "Simultaneous":
-            powers = derive_powers_simultaneous(wl, dye_db, selected, laser_wavelengths)
-        else:
-            powers = derive_powers_separate(wl, dye_db, selected, laser_wavelengths)
-
-        # Build effective spectra of all candidates
-        E_all, labels_all, groups_all, _ = build_E_and_groups_from_mapping(
-            wl, dye_db, picked_probes, probe_to_fluors,
-            mode="lasers",
-            laser_wavelengths=laser_wavelengths,
-            laser_mode=mode,
-            laser_powers=powers
-        )
-
-        # Re-select with lexicographic MILP
-        sel_idx = lexicographic_select_grouped_milp(E_all, groups_all)
-        new_selected = [labels_all[i] for i in sel_idx]
-
-        E_final, labels_final, groups_idx_final = E_all, labels_all, groups_all
-
-        if new_selected == selected:
-            converged = True
-            break
-        selected = new_selected
-
-    return selected, powers, it, converged, E_final, labels_final, groups_idx_final
-
-
-# ------------- Lexicographic MILP (layer-by-layer) -------------
-
-def _build_cosine_constants(E):
-    """Return normalized columns and pairwise cosine constants matrix C (N x N, diag 0)."""
-    En = E / (np.linalg.norm(E, axis=0, keepdims=True) + 1e-12)
-    C = (En.T @ En)
-    np.fill_diagonal(C, 0.0)
-    return En, C
-
-
-def lexicographic_select_grouped_milp(E, groups_idx, tol_eq=1e-6):
-    """
-    Layer-1: minimize t, s.t. choose exactly one per group, and for every cross-group pair (a,b):
-        t >= c_ab * y_ab, with y_ab = 1 if both a and b are selected
-    Layer-2: with t fixed to t*, minimize the "second largest" via the standard convexification:
-        min  2*lambda2 + sum mu_p
-        s.t. mu_p >= c_p y_p - lambda2, mu_p >= 0
-             (carry over Layer-1 constraints, and fix t <= t*)
-    Implementation notes:
-      - We use PuLP + CBC.
-      - We only build pair variables for pairs across different groups.
-    """
-    _, C = _build_cosine_constants(E)
-    N = E.shape[1]
-
-    # Build a reverse map: for each candidate index -> group id
-    cand_to_group = {}
-    for g, idxs in enumerate(groups_idx):
-        for j in idxs:
-            cand_to_group[j] = g
-
-    # List all cross-group pairs once (i < j and group different)
-    pairs = []
-    for i in range(N):
-        gi = cand_to_group.get(i, None)
-        if gi is None:
-            continue
-        for j in range(i+1, N):
-            gj = cand_to_group.get(j, None)
-            if gj is None or gj == gi:
+    for probe, cand_list in groups.items():
+        idxs = []
+        for fluor in cand_list:
+            rec = dye_db.get(fluor)
+            if rec is None: 
                 continue
-            pairs.append((i, j))
+            em = rec["emission"]; ex = rec["excitation"]
+            qy = rec["quantum_yield"]; ec = rec["extinction_coeff"]
+            if em is None or ex is None or len(em) != W or len(ex) != W:
+                continue
 
-    # ------------ Layer 1 ------------
-    prob1 = pulp.LpProblem("Layer1_Minimax", sense=pulp.LpMinimize)
+            eff = np.zeros(W, dtype=float)
+            if mode == "Separate":
+                for i, l in enumerate(lam):
+                    idx_l = _nearest_idx_from_grid(wl, l)
+                    k = ex[idx_l] * qy * (ec if ec is not None else 1.0) * pw[i]
+                    eff += em * k
+            else:
+                for i, (lo, hi) in enumerate(segs):
+                    idx_l = _nearest_idx_from_grid(wl, lam[i])
+                    k = ex[idx_l] * qy * (ec if ec is not None else 1.0) * pw[i]
+                    loi = _nearest_idx_from_grid(wl, lo)
+                    hii = _nearest_idx_from_grid(wl, hi - 1) + 1
+                    eff[loi:hii] += em[loi:hii] * k
 
-    # x_j: select candidate j
-    x = {j: pulp.LpVariable(f"x_{j}", lowBound=0, upBound=1, cat=pulp.LpBinary) for j in range(N)}
-    # y_ij: both i and j selected
-    y = { (i,j): pulp.LpVariable(f"y_{i}_{j}", lowBound=0, upBound=1, cat=pulp.LpBinary) for (i,j) in pairs }
-    # t: maximum similarity among selected pairs
+            cols.append(eff)
+            labels.append(f"{probe} – {fluor}")
+            idxs.append(col_id)
+            col_id += 1
+        if idxs:
+            idx_groups.append(idxs)
+
+    if not cols:
+        return np.zeros((W, 0)), np.zeros((W, 0)), [], []
+    E_raw = np.stack(cols, axis=1)          # for plotting
+    E_norm = _safe_l2norm_cols(E_raw)       # for cosine similarity
+    return E_raw, E_norm, labels, idx_groups
+
+
+# =============== Layer-by-layer MILP (with unique-fluor constraint) ===============
+
+def _unique_dye_constraints(prob, x_vars, labels_pair, groups, fluor_names):
+    """
+    Add 'each fluor ≤ 1 time globally' constraints.
+    fluor_names: list[str] aligned with labels_pair, where labels are "Probe – Fluor".
+    """
+    # Map dye -> indices of columns using that dye
+    dye_to_cols = {}
+    for j, d in enumerate(fluor_names):
+        dye_to_cols.setdefault(d, []).append(j)
+    for d, cols in dye_to_cols.items():
+        prob += pulp.lpSum(x_vars[j] for j in cols) <= 1, f"Unique_{d}"
+
+
+def solve_minimax_layer(E_norm, idx_groups, labels_pair, enforce_unique=True):
+    """
+    Minimize max pairwise cosine among selected one per group.
+    Decision: pick exactly one column per group.
+    y_ij = AND(x_i, x_j)
+    t >= c_ij * y_ij
+    Return (x_star_indices, t_star)
+    """
+    N = E_norm.shape[1]
+    # Precompute pairwise cosine constants
+    C = cosine_similarity_matrix(E_norm)
+    # Variables
+    prob = pulp.LpProblem("minimax", pulp.LpMinimize)
+    x = [pulp.LpVariable(f"x_{j}", lowBound=0, upBound=1, cat="Binary") for j in range(N)]
+    y = {}
+    for i in range(N):
+        for j in range(i+1, N):
+            y[(i,j)] = pulp.LpVariable(f"y_{i}_{j}", lowBound=0, upBound=1, cat="Binary")
     t = pulp.LpVariable("t", lowBound=0)
 
-    # group constraints: pick exactly one per group
-    for g, idxs in enumerate(groups_idx):
-        prob1 += (pulp.lpSum(x[j] for j in idxs) == 1), f"group_{g}_one"
+    # One per group
+    for g, idxs in enumerate(idx_groups):
+        prob += pulp.lpSum(x[j] for j in idxs) == 1, f"OnePerGroup_{g}"
 
-    # linking y with x
-    for (i,j) in pairs:
-        prob1 += (y[(i,j)] <= x[i])
-        prob1 += (y[(i,j)] <= x[j])
-        prob1 += (y[(i,j)] >= x[i] + x[j] - 1)
+    # Unique-dye constraint (global)
+    if enforce_unique:
+        fluor_names = [s.split(" – ", 1)[1] for s in labels_pair]
+        _unique_dye_constraints(prob, x, labels_pair, idx_groups, fluor_names)
 
-    # t >= c_ij * y_ij
-    for (i,j) in pairs:
-        cij = float(C[i, j])
-        if cij <= 0:
-            # c<=0 不会影响最大值，仍然保留个下界 t>=0
-            continue
-        prob1 += (t >= cij * y[(i,j)])
+    # y-AND linking
+    for (i,j), yij in y.items():
+        prob += yij <= x[i]
+        prob += yij <= x[j]
+        prob += yij >= x[i] + x[j] - 1
 
-    # objective
-    prob1 += t
+    # t constraints
+    for (i,j), yij in y.items():
+        cij = float(C[i,j])
+        prob += t >= cij * yij
 
-    # solve
-    prob1.solve(pulp.PULP_CBC_CMD(msg=False))
-    t_star = pulp.value(t)
+    prob += t
+    prob.solve(pulp.PULP_CBC_CMD(msg=False))
 
-    # record chosen x to warm-start Layer 2 (optional)
-    x_val1 = {j: pulp.value(var) for j, var in x.items()}
+    x_star = [j for j, var in enumerate(x) if var.value() >= 0.5]
+    return x_star, float(t.value())
 
-    # ------------ Layer 2 ------------
-    prob2 = pulp.LpProblem("Layer2_SecondLargest", sense=pulp.LpMinimize)
 
-    # re-create variables (or clone) to keep clean model
-    x2 = {j: pulp.LpVariable(f"x2_{j}", lowBound=0, upBound=1, cat=pulp.LpBinary) for j in range(N)}
-    y2 = { (i,j): pulp.LpVariable(f"y2_{i}_{j}", lowBound=0, upBound=1, cat=pulp.LpBinary) for (i,j) in pairs }
-    t2 = pulp.LpVariable("t2", lowBound=0)  # will be constrained to <= t_star
-    lam2 = pulp.LpVariable("lambda2", lowBound=0)
-    mu = { (i,j): pulp.LpVariable(f"mu_{i}_{j}", lowBound=0) for (i,j) in pairs }
-
-    # group constraints
-    for g, idxs in enumerate(groups_idx):
-        prob2 += (pulp.lpSum(x2[j] for j in idxs) == 1), f"group2_{g}_one"
-
-    # link y2 and x2
-    for (i,j) in pairs:
-        prob2 += (y2[(i,j)] <= x2[i])
-        prob2 += (y2[(i,j)] <= x2[j])
-        prob2 += (y2[(i,j)] >= x2[i] + x2[j] - 1)
-
-    # t2 constraints (same as layer-1) and fix t2 <= t_star (+ small tol)
-    for (i,j) in pairs:
-        cij = float(C[i, j])
-        if cij <= 0:
-            continue
-        prob2 += (t2 >= cij * y2[(i,j)])
-    prob2 += (t2 <= t_star + tol_eq)
-
-    # lambda2 / mu formulation to minimize the second largest:
-    #   mu_p >= c_p*y_p - lambda2
-    #   mu_p >= 0
-    for (i,j) in pairs:
-        cij = float(C[i, j])
-        prob2 += (mu[(i,j)] >= cij * y2[(i,j)] - lam2)
-
-    # objective: 2*lambda2 + sum mu
-    prob2 += (2 * lam2 + pulp.lpSum(mu.values()))
-
-    # (optional) warm start x2 with layer1 solution
-    for j, v in x2.items():
-        if x_val1.get(j, 0) > 0.5:
-            v.setInitialValue(1)
-            v.fixValue()  # fix to layer-1 choice ensures the same t* face; comment this line to allow tie-breaking within t*
-    # Note: 如果你希望在 t*=const 的可行面上重新自由优化第二大值，可以去掉 fixValue()
-
-    # solve
-    prob2.solve(pulp.PULP_CBC_CMD(msg=False))
-
-    x_sol = {j: int(round(pulp.value(var))) for j, var in x2.items()}
-    sel = []
-    for g, idxs in enumerate(groups_idx):
-        # find chosen j in this group
-        picked = sorted(idxs, key=lambda j: -x_sol.get(j, 0))
-        sel.append(picked[0])
-    return sel
-def build_effective_emission_with_lasers(
-    wl, dye_db, candidates, laser_wavelengths, mode, powers, selection_for_base=None
-):
-    """Return [W x N] effective spectra.
-    - Emission 已在 load 时做了 peak=1 归一；此处不再归一。
-    - Simultaneous: 在第 s 段累加 **所有 m<=s** 的激光贡献（与你的功率推导一致）。
-    - Separate: 每束激光产生全谱贡献并叠加。
+def solve_lexicographic(E_norm, idx_groups, labels_pair, levels=3, enforce_unique=True):
     """
-    import numpy as np
+    Layer-by-layer per论文思路：
+      第1层：min t1 = max c_ij*y_ij
+      第2层：在保留 t1*=常数 的同时，最小化第二大 —— 我们用常见的“阈值-偏差”表达。
+    这里实现：逐层固定上一层的最大值（允许一个很小松弛），然后最小化
+      sum_k (z_ij - lambda_k)^+ 形式，等价于线性引入mu_ij >= z_ij - lambda_k, mu>=0
+    简化实现：每一层都新解一个LP，在上一层基础上添加“ t <= t_prev + eps ”并引入新的lambda/mu。
+    """
+    # 先做第1层
+    sel, t1 = solve_minimax_layer(E_norm, idx_groups, labels_pair, enforce_unique=enforce_unique)
 
-    W = len(wl)
-    if len(candidates) == 0:
-        return np.zeros((W, 0)), []
+    # 若只要第一层
+    if levels <= 1:
+        return sel, [t1]
 
-    lam_sorted = np.array(sorted(laser_wavelengths), dtype=float)
-    # 对应功率按排序对齐
-    P = np.array([powers[laser_wavelengths.index(L)] for L in lam_sorted], dtype=float)
+    # 为更高层，重新建立模型
+    N = E_norm.shape[1]
+    C = cosine_similarity_matrix(E_norm)
 
-    def seg_slice(lo_nm, hi_nm):
-        lo_i = int(max(lo_nm - wl[0], 0))
-        hi_i = int(min((hi_nm if np.isfinite(hi_nm) else wl[-1] + 1) - wl[0], W))
-        return lo_i, hi_i
+    # 通用变量
+    prob = pulp.LpProblem("lexi", pulp.LpMinimize)
+    x = [pulp.LpVariable(f"x_{j}", lowBound=0, upBound=1, cat="Binary") for j in range(N)]
+    y = {}
+    for i in range(N):
+        for j in range(i+1, N):
+            y[(i,j)] = pulp.LpVariable(f"y_{i}_{j}", lowBound=0, upBound=1, cat="Binary")
+    # z_ij = c_ij*y_ij （常数*binary 可直接通过目标/约束使用，无需新变量）
+    # 但为了后续层方便，我们定义 z 连续变量并强制 z = c*y
+    z = {}
+    for i in range(N):
+        for j in range(i+1, N):
+            z[(i,j)] = pulp.LpVariable(f"z_{i}_{j}", lowBound=0)
 
-    # 预先切好段
-    segs = []
-    for s in range(len(lam_sorted)):
-        lo = lam_sorted[s]
-        hi = lam_sorted[s+1] if s+1 < len(lam_sorted) else float("inf")
-        segs.append((lo, hi))
+    # 组约束
+    for g, idxs in enumerate(idx_groups):
+        prob += pulp.lpSum(x[j] for j in idxs) == 1, f"OnePerGroup_{g}"
 
-    M = np.zeros((W, len(candidates)), dtype=float)
-    labels = []
+    if enforce_unique:
+        fluor_names = [s.split(" – ", 1)[1] for s in labels_pair]
+        _unique_dye_constraints(prob, x, labels_pair, idx_groups, fluor_names)
 
-    for j, name in enumerate(candidates):
-        rec = dye_db[name]
-        em = np.array(rec["emission"], dtype=float)   # 已 peak-normalized
-        ex = np.array(rec["excitation"], dtype=float)
-        qy = float(rec["quantum_yield"])
-        ec = rec["extinction_coeff"]
+    # y-AND 约束
+    for (i,j), yij in y.items():
+        prob += yij <= x[i]
+        prob += yij <= x[j]
+        prob += yij >= x[i] + x[j] - 1
 
-        y = np.zeros(W, dtype=float)
-        if em.size != W or ex.size != W or ec is None or not np.isfinite(ec):
-            labels.append(name)
-            M[:, j] = y
-            continue
+    # z = c * y
+    for (i,j), zij in z.items():
+        cij = float(C[i,j])
+        # 等式：z == c*y  （c>=0）可用两条不等式夹住
+        prob += zij <= cij * y[(i,j)]
+        prob += zij >= cij * y[(i,j)]
 
-        if mode == "Separate":
-            # 每束激光：全谱贡献
-            for s, L in enumerate(lam_sorted):
-                idx = int(L - wl[0])
-                if 0 <= idx < W:
-                    k = ex[idx] * qy * float(ec) * P[s]
-                    y += em * k
-        else:
-            # Simultaneous：第 s 段要把 **所有 m<=s** 的贡献加起来
-            for s, (lo_nm, hi_nm) in enumerate(segs):
-                lo_i, hi_i = seg_slice(lo_nm, hi_nm)
-                if lo_i >= hi_i:
-                    continue
-                seg_sum = 0.0
-                for m in range(s + 1):                 # 关键修正：累加 m<=s
-                    Lm = lam_sorted[m]
-                    idx = int(Lm - wl[0])
-                    if 0 <= idx < W:
-                        seg_sum += ex[idx] * qy * float(ec) * P[m]
-                if seg_sum != 0.0:
-                    y[lo_i:hi_i] += em[lo_i:hi_i] * seg_sum
+    # 第1层值固定（给一点松弛 eps 避免数值问题）
+    eps = 1e-6
+    # t1 = max z_ij
+    t1_var = pulp.LpVariable("t1", lowBound=0)
+    for (i,j), zij in z.items():
+        prob += t1_var >= zij
+    prob += t1_var <= t1 + eps
 
-        M[:, j] = y
-        labels.append(name)
+    # 第2层：最小化第二大
+    # 标准技巧：min lambda2 + (1/|P|)*sum mu_ij  近似收缩
+    lam2 = pulp.LpVariable("lambda2", lowBound=0)
+    mu2 = {k: pulp.LpVariable(f"mu2_{k[0]}_{k[1]}", lowBound=0) for k in z.keys()}
+    for k, zij in z.items():
+        prob += mu2[k] >= zij - lam2
+        prob += mu2[k] >= 0
 
-    return M, labels
+    # 如果需要第三层，可继续引入 lam3/mu3 等；这里实现到第二层（常用）
+    prob += lam2 + (1.0 / max(1, len(z))) * pulp.lpSum(mu2.values())
 
+    prob.solve(pulp.PULP_CBC_CMD(msg=False))
+    x_star = [j for j, var in enumerate(x) if var.value() >= 0.5]
 
+    # 返回各层最优值（第一层用 t1 的数值，第二层用 lam2）
+    return x_star, [float(t1), float(lam2.value())]
