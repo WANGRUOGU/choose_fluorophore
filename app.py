@@ -141,9 +141,9 @@ if mode == "Emission only":
             name=sub_labels[sel_idx.index(j)]
         ))
     fig.update_layout(
-        title="Emission-only spectra of selected fluorophores (normalized to max = 1)",
+        title="Normalized spectra of selected fluorophores",
         xaxis_title="Wavelength (nm)",
-        yaxis_title="Normalized intensity (0–1)",
+        yaxis_title="Normalized intensity",
         yaxis_range=[0, 1.05]
     )
     st.plotly_chart(fig, use_container_width=True)
