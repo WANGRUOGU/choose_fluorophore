@@ -420,3 +420,29 @@ def top_k_pairwise(S, k=10):
     top_vals = vals[order].tolist()
     pairs = list(zip(tri[0][order], tri[1][order]))
     return top_vals, pairs
+
+def normalize_probe_mapping(mapping_raw, dye_db):
+    """Clean and filter the probe→fluor mapping:
+       - strip whitespace on probe & fluor names
+       - coerce non-list values to list
+       - deduplicate candidates
+       - keep ONLY candidates that appear in dye_db
+       - drop probes that end up with empty candidate lists
+       Returns dict[str, list[str]].
+    """
+    clean = {}
+    for probe, vals in (mapping_raw or {}).items():
+        p = str(probe).strip()
+        if not p:
+            continue
+        if isinstance(vals, (list, tuple)):
+            lst = [str(v).strip() for v in vals if str(v).strip()]
+        elif vals is None:
+            lst = []
+        else:
+            lst = [str(vals).strip()]
+        # unique, keep only dyes present in dye_db
+        lst = sorted({v for v in lst if v in dye_db})
+        if lst:
+            clean[p] = lst
+    return clean
