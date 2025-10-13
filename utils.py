@@ -583,9 +583,9 @@ def build_effective_emission_with_lasers(
     wl, dye_db, candidates, laser_wavelengths, mode, powers, selection_for_base=None
 ):
     """Return [W x N] effective spectra.
-    - Emission 已在 load 时做了 peak=1 归一；此处不再改动。
-    - Simultaneous: 每段只加对应段的贡献，段边界按激光波长划分。
-    - Separate: 整段全谱都加（每束激光都产生全谱发射）。
+    - Emission 已在 load 时做了 peak=1 归一；此处不再归一。
+    - Simultaneous: 在第 s 段累加 **所有 m<=s** 的激光贡献（与你的功率推导一致）。
+    - Separate: 每束激光产生全谱贡献并叠加。
     """
     import numpy as np
 
@@ -614,15 +614,17 @@ def build_effective_emission_with_lasers(
 
     for j, name in enumerate(candidates):
         rec = dye_db[name]
-        em = np.array(rec["emission"], dtype=float)  # 已 peak-normalized
+        em = np.array(rec["emission"], dtype=float)   # 已 peak-normalized
         ex = np.array(rec["excitation"], dtype=float)
         qy = float(rec["quantum_yield"])
         ec = rec["extinction_coeff"]
-        if em.size != W or ex.size != W or ec is None or not np.isfinite(ec):
-            labels.append(name)
-            continue
 
         y = np.zeros(W, dtype=float)
+        if em.size != W or ex.size != W or ec is None or not np.isfinite(ec):
+            labels.append(name)
+            M[:, j] = y
+            continue
+
         if mode == "Separate":
             # 每束激光：全谱贡献
             for s, L in enumerate(lam_sorted):
@@ -631,17 +633,23 @@ def build_effective_emission_with_lasers(
                     k = ex[idx] * qy * float(ec) * P[s]
                     y += em * k
         else:
-            # Simultaneous：分段贡献
-            for s, L in enumerate(lam_sorted):
-                lo, hi = segs[s]
-                lo_i, hi_i = seg_slice(lo, hi)
-                idx = int(L - wl[0])
-                if 0 <= idx < W and lo_i < hi_i:
-                    k = ex[idx] * qy * float(ec) * P[s]
-                    y[lo_i:hi_i] += em[lo_i:hi_i] * k
+            # Simultaneous：第 s 段要把 **所有 m<=s** 的贡献加起来
+            for s, (lo_nm, hi_nm) in enumerate(segs):
+                lo_i, hi_i = seg_slice(lo_nm, hi_nm)
+                if lo_i >= hi_i:
+                    continue
+                seg_sum = 0.0
+                for m in range(s + 1):                 # 关键修正：累加 m<=s
+                    Lm = lam_sorted[m]
+                    idx = int(Lm - wl[0])
+                    if 0 <= idx < W:
+                        seg_sum += ex[idx] * qy * float(ec) * P[m]
+                if seg_sum != 0.0:
+                    y[lo_i:hi_i] += em[lo_i:hi_i] * seg_sum
 
         M[:, j] = y
         labels.append(name)
 
     return M, labels
+
 
