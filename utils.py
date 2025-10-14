@@ -304,11 +304,14 @@ def build_effective_with_lasers(wl, dye_db, groups, laser_wavelengths, mode, pow
                     eff += em * k
             else:
                 for i, (lo, hi) in enumerate(segs):
-                    idx_l = _nearest_idx_from_grid(wl, lam[i])
-                    k = ex[idx_l] * qy * (ec if ec is not None else 1.0) * pw[i]
                     loi = _nearest_idx_from_grid(wl, lo)
                     hii = _nearest_idx_from_grid(wl, hi - 1) + 1
-                    eff[loi:hii] += em[loi:hii] * k
+                    total_k = 0.0
+                    for m in range(i + 1):
+                        idx_lm = _nearest_idx_from_grid(wl, lam[m])
+                        k_m = ex[idx_lm] * qy * (ec if ec is not None else 1.0) * pw[m]
+                        total_k += k_m
+                    eff[loi:hii] += em[loi:hii] * total_k
 
             cols.append(eff)
             labels.append(f"{probe} – {fluor}")
