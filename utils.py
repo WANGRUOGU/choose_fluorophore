@@ -308,8 +308,7 @@ def build_effective_with_lasers(wl, dye_db, groups, laser_wavelengths, mode, pow
                     hii = _nearest_idx_from_grid(wl, hi - 1) + 1
                     total_k = 0.0
                     for m in range(i + 1):
-                        idx_lm = _nearest_idx_from_grid(wl, lam[m])
-                        k_m = ex[idx_lm] * qy * (ec if ec is not None else 1.0) * pw[m]
+                        k_m = _interp_at(wl, ex, lam[m]) * qy * (ec if ec is not None else 1.0) * pw[m]
                         total_k += k_m
                     eff[loi:hii] += em[loi:hii] * total_k
 
