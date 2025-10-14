@@ -91,6 +91,34 @@ if not picked:
 
 # Build groups dict in the chosen order
 groups = {}
+
+dropped_msgs = []
+
+def _em_len_ok(dname):
+    rec = dye_db.get(dname)
+    return (rec is not None) and (isinstance(rec.get("emission"), np.ndarray)) and (rec["emission"].size == wl.size)
+
+for p in picked:
+    raw = probe_map.get(p, []) or []
+    raw = [str(x).strip() for x in raw]
+    not_in_db = [f for f in raw if f not in dye_db]
+    in_db_bad = [f for f in raw if (f in dye_db and not _em_len_ok(f))]
+    ok = [f for f in raw if (f in dye_db and _em_len_ok(f))]
+
+    if ok:
+        groups[p] = ok
+    else:
+        reason = []
+        if not raw:
+            reason.append("no candidates in probe_fluor_map.yaml")
+        if not_in_db:
+            reason.append("not in dyes.yaml: " + ", ".join(not_in_db))
+        if in_db_bad:
+            reason.append("emission length mismatch: " + ", ".join(in_db_bad))
+        dropped_msgs.append(f"{p} → " + "; ".join(reason) if reason else f"{p} → no valid candidates")
+
+if dropped_msgs:
+    st.warning("Probes skipped due to invalid candidates:  " + " | ".join(dropped_msgs))
 for p in picked:
     # 只保留在 dyes.yaml 里存在的候选
     cands = [f for f in probe_map.get(p, []) if f in dye_db]
