@@ -3,6 +3,21 @@ import yaml
 import numpy as np
 import pulp
 
+_SOLVER = pulp.PULP_CBC_CMD(msg=False, mip=True)
+
+def _pick_integral_from_relaxed(x_vars, idx_groups):
+    """
+    从（可能分数的）x 解里做“组内 argmax”，确保每个 probe 组只选一个。
+    """
+    xvals = np.array([(v.value() or 0.0) for v in x_vars], dtype=float)
+    sel = []
+    for idxs in idx_groups:
+        if not idxs:
+            continue
+        j_local = int(np.argmax(xvals[idxs]))
+        sel.append(int(idxs[j_local]))
+    return sel
+
 # =============== I/O =================
 
 def load_dyes_yaml(path):
@@ -352,15 +367,9 @@ def _unique_dye_constraints(prob, x_vars, labels_pair, groups, fluor_names):
 def solve_minimax_layer(E_norm, idx_groups, labels_pair, enforce_unique=True):
     """
     Minimize max pairwise cosine among selected one per group.
-    Decision: pick exactly one column per group.
-    y_ij = AND(x_i, x_j)
-    t >= c_ij * y_ij
-    Return (x_star_indices, t_star)
     """
     N = E_norm.shape[1]
-    # Precompute pairwise cosine constants
     C = cosine_similarity_matrix(E_norm)
-    # Variables
     prob = pulp.LpProblem("minimax", pulp.LpMinimize)
     x = [pulp.LpVariable(f"x_{j}", lowBound=0, upBound=1, cat="Binary") for j in range(N)]
     y = {}
@@ -369,68 +378,63 @@ def solve_minimax_layer(E_norm, idx_groups, labels_pair, enforce_unique=True):
             y[(i,j)] = pulp.LpVariable(f"y_{i}_{j}", lowBound=0, upBound=1, cat="Binary")
     t = pulp.LpVariable("t", lowBound=0)
 
-    # One per group
+    # 一组选一个
     for g, idxs in enumerate(idx_groups):
         prob += pulp.lpSum(x[j] for j in idxs) == 1, f"OnePerGroup_{g}"
 
-    # Unique-dye constraint (global)
+    # 染料全局唯一（可选）
     if enforce_unique:
         fluor_names = [s.split(" – ", 1)[1] for s in labels_pair]
         _unique_dye_constraints(prob, x, labels_pair, idx_groups, fluor_names)
 
-    # y-AND linking
+    # y = AND(x_i, x_j)
     for (i,j), yij in y.items():
         prob += yij <= x[i]
         prob += yij <= x[j]
         prob += yij >= x[i] + x[j] - 1
 
-    # t constraints
+    # t >= c_ij * y_ij
     for (i,j), yij in y.items():
         cij = float(C[i,j])
         prob += t >= cij * yij
 
+    # 目标
     prob += t
-    prob.solve(pulp.PULP_CBC_CMD(msg=False))
 
-    x_star = [j for j, var in enumerate(x) if var.value() >= 0.5]
-    return x_star, float(t.value())
+    # 求解（显式 MIP）
+    status = prob.solve(_SOLVER)
+
+    # 读取：无论状态如何，都做“组内 argmax”兜底，确保每组唯一
+    x_star = _pick_integral_from_relaxed(x, idx_groups)
+    t_val = float(t.value() or 0.0)
+    return x_star, t_val
+
 
 
 def solve_lexicographic(E_norm, idx_groups, labels_pair, levels=3, enforce_unique=True):
     """
-    Layer-by-layer per论文思路：
-      第1层：min t1 = max c_ij*y_ij
-      第2层：在保留 t1*=常数 的同时，最小化第二大 —— 我们用常见的“阈值-偏差”表达。
-    这里实现：逐层固定上一层的最大值（允许一个很小松弛），然后最小化
-      sum_k (z_ij - lambda_k)^+ 形式，等价于线性引入mu_ij >= z_ij - lambda_k, mu>=0
-    简化实现：每一层都新解一个LP，在上一层基础上添加“ t <= t_prev + eps ”并引入新的lambda/mu。
+    先做第一层 minimax；若 levels>1，则在固定 t1 的前提下收缩第二大。
     """
-    # 先做第1层
+    # 第一层
     sel, t1 = solve_minimax_layer(E_norm, idx_groups, labels_pair, enforce_unique=enforce_unique)
-
-    # 若只要第一层
     if levels <= 1:
         return sel, [t1]
 
-    # 为更高层，重新建立模型
     N = E_norm.shape[1]
     C = cosine_similarity_matrix(E_norm)
 
-    # 通用变量
     prob = pulp.LpProblem("lexi", pulp.LpMinimize)
     x = [pulp.LpVariable(f"x_{j}", lowBound=0, upBound=1, cat="Binary") for j in range(N)]
     y = {}
     for i in range(N):
         for j in range(i+1, N):
             y[(i,j)] = pulp.LpVariable(f"y_{i}_{j}", lowBound=0, upBound=1, cat="Binary")
-    # z_ij = c_ij*y_ij （常数*binary 可直接通过目标/约束使用，无需新变量）
-    # 但为了后续层方便，我们定义 z 连续变量并强制 z = c*y
     z = {}
     for i in range(N):
         for j in range(i+1, N):
             z[(i,j)] = pulp.LpVariable(f"z_{i}_{j}", lowBound=0)
 
-    # 组约束
+    # 一组选一个
     for g, idxs in enumerate(idx_groups):
         prob += pulp.lpSum(x[j] for j in idxs) == 1, f"OnePerGroup_{g}"
 
@@ -447,31 +451,30 @@ def solve_lexicographic(E_norm, idx_groups, labels_pair, levels=3, enforce_uniqu
     # z = c * y
     for (i,j), zij in z.items():
         cij = float(C[i,j])
-        # 等式：z == c*y  （c>=0）可用两条不等式夹住
         prob += zij <= cij * y[(i,j)]
         prob += zij >= cij * y[(i,j)]
 
-    # 第1层值固定（给一点松弛 eps 避免数值问题）
+    # 固定第一层最优值（加一点 eps 防数值问题）
     eps = 1e-6
-    # t1 = max z_ij
     t1_var = pulp.LpVariable("t1", lowBound=0)
     for (i,j), zij in z.items():
         prob += t1_var >= zij
     prob += t1_var <= t1 + eps
 
-    # 第2层：最小化第二大
-    # 标准技巧：min lambda2 + (1/|P|)*sum mu_ij  近似收缩
+    # 第二层：lambda2 + 平均超额
     lam2 = pulp.LpVariable("lambda2", lowBound=0)
     mu2 = {k: pulp.LpVariable(f"mu2_{k[0]}_{k[1]}", lowBound=0) for k in z.keys()}
     for k, zij in z.items():
         prob += mu2[k] >= zij - lam2
         prob += mu2[k] >= 0
 
-    # 如果需要第三层，可继续引入 lam3/mu3 等；这里实现到第二层（常用）
     prob += lam2 + (1.0 / max(1, len(z))) * pulp.lpSum(mu2.values())
 
-    prob.solve(pulp.PULP_CBC_CMD(msg=False))
-    x_star = [j for j, var in enumerate(x) if var.value() >= 0.5]
+    # 求解（显式 MIP）
+    status = prob.solve(_SOLVER)
 
-    # 返回各层最优值（第一层用 t1 的数值，第二层用 lam2）
-    return x_star, [float(t1), float(lam2.value())]
+    # 读取：组内 argmax 兜底，确保每组唯一
+    x_star = _pick_integral_from_relaxed(x, idx_groups)
+    lam2_val = float(lam2.value() or 0.0)
+    return x_star, [float(t1), lam2_val]
+
