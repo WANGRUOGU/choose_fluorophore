@@ -264,6 +264,14 @@ def derive_powers_separate(wl, dye_db, selection_labels, laser_wavelengths):
     P = [float(B / v) if v > 0 else 0.0 for v in M]
     return P
 
+def _interp_at(wl, y, lam):
+    # 简单线性插值（边界截断）
+    if lam <= wl[0]: return float(y[0])
+    if lam >= wl[-1]: return float(y[-1])
+    i = int(np.searchsorted(wl, lam)) - 1
+    t = (lam - wl[i]) / (wl[i+1] - wl[i])
+    return float(y[i] * (1 - t) + y[i+1] * t)
+
 
 def build_effective_with_lasers(wl, dye_db, groups, laser_wavelengths, mode, powers):
     """
