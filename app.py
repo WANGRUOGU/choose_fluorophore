@@ -278,56 +278,62 @@ if laser_strategy == "Separate":
     L = len(lam_sorted)
     W = len(wl)
 
-    gap = 12.0  # 段与段之间的视觉间隙（单位：nm 视觉等效）
-    # 每段的“视觉长度”定义为 (1000 - 激光波长)
-    seg_spans = [max(0.0, 1000.0 - float(l)) for l in lam_sorted]
+    gap = 12.0  # 段间视觉间隙（坐标单位）
+    wl_max_vis = float(min(1000.0, wl[-1]))  # 可视范围上限
 
-    # 计算每段的起点偏移（累加之前段的 span+gap）
+    # 每段“可视宽度”= min(1000, wl[-1]) - laser_nm（若为负则置 0）
+    seg_widths = [max(0.0, wl_max_vis - float(l)) for l in lam_sorted]
+
+    # offsets：用 seg_widths 累加（与曲线长度完全一致）
     offsets = []
     acc = 0.0
-    for span in seg_spans:
+    for wseg in seg_widths:
         offsets.append(acc)
-        acc += span + gap
+        acc += wseg + gap
 
-    # 为每条选中曲线构造拼接后的 x/y（注意：只取 >= 该激光波长 的部分）
+    # 画曲线：逐段切 wl，再做位移；y 用拼接块同样切 mask，二者长度一致
     for j in sel_idx:
-        xs_cat = []
-        ys_cat = []
+        xs_cat, ys_cat = [], []
         for i, l in enumerate(lam_sorted):
+            if seg_widths[i] <= 0:
+                continue
             off = offsets[i]
-            # 取该段的 wl 片段（从该激光波长开始）
-            mask = wl >= l
+            # 该段可视 wl 片段：laser_nm .. min(1000, wl[-1])
+            mask = (wl >= l) & (wl <= wl_max_vis)
             wl_seg = wl[mask]
-            # 该条曲线在第 i 段的 y 数据来自 E_raw_all 的第 i 个区块
+            # 对应的 y 从第 i 个拼接块取再按相同 mask 切
             block = E_raw_all[i * W:(i + 1) * W, j] / (B + 1e-12)
             y_seg = block[mask]
-            # 把该段的 wl 映射到自定义轴：加上该段 offset
+            # 平移到自定义拼接轴
             xs_cat.append(wl_seg + off)
             ys_cat.append(y_seg)
-        x_concat = np.concatenate(xs_cat) if xs_cat else np.array([])
-        y_concat = np.concatenate(ys_cat) if ys_cat else np.array([])
-        fig.add_trace(go.Scatter(x=x_concat, y=y_concat, mode="lines", name=labels_all[j]))
+        if xs_cat:
+            x_concat = np.concatenate(xs_cat)
+            y_concat = np.concatenate(ys_cat)
+            fig.add_trace(go.Scatter(x=x_concat, y=y_concat, mode="lines", name=labels_all[j]))
 
-    # 白色虚线分隔：画在每段“右边界”处（紧贴下一段的起点）
+    # 白色虚线分隔：画在每段右边界（= offset + seg_width）
     for i in range(L - 1):
-        # 第 i 段的右边界（= 起点偏移 + 该段视觉长度）
-        sep_x = offsets[i] + seg_spans[i]
+        if seg_widths[i] <= 0:
+            continue
+        sep_x = offsets[i] + seg_widths[i]
         fig.add_shape(
             type="line",
             x0=sep_x, x1=sep_x,
             y0=0, y1=1, yref="paper", xref="x",
             line=dict(color="white", width=2, dash="dash"),
-            layer="above"  # 画在曲线之上
+            layer="above"
         )
 
-
-    # 每段的小标题（无背景），放在各段中心；交错高度避免重叠
-    mids = [offsets[i] + seg_spans[i] / 2.0 for i in range(L)]
-    for i, midx in enumerate(mids):
+    # 段标题：放在段中点；交错高度 + 轻微 xshift，减少重叠
+    for i, l in enumerate(lam_sorted):
+        if seg_widths[i] <= 0:
+            continue
+        midx = offsets[i] + seg_widths[i] / 2.0
         fig.add_annotation(
             x=midx, xref="x",
             y=1.12 if (i % 2 == 0) else 1.06, yref="paper",
-            text=f"{int(lam_sorted[i])} nm",
+            text=f"{int(l)} nm",
             showarrow=False,
             font=dict(size=12),
             align="center",
@@ -335,12 +341,12 @@ if laser_strategy == "Separate":
             xshift=(-12 if (i % 2 == 0) else 12)
         )
 
-    # x 轴刻度：每段仅显示 1 个刻度，文本为“laser–1000 nm”
-    tick_positions = mids
-    tick_texts = [f"{int(l)}–1000 nm" for l in lam_sorted]
+    # x 轴刻度：每段仅 1 个（中点），文本“laser–upper”
+    tick_positions = [offsets[i] + seg_widths[i] / 2.0 for i in range(L) if seg_widths[i] > 0]
+    tick_texts = [f"{int(l)}–{int(wl_max_vis)} nm" for i, l in enumerate(lam_sorted) if seg_widths[i] > 0]
 
     fig.update_layout(
-        title_text="",  # 避免 'undefined'
+        title_text="",  # 防止 'undefined'
         xaxis_title="Wavelength (nm)",
         yaxis_title="Normalized intensity",
         xaxis=dict(
@@ -375,6 +381,8 @@ else:
             ticktext=["0", "0.2", "0.4", "0.6", "0.8", "1"]
         )
     )
+
+st.plotly_chart(fig, use_container_width=True)
 
 st.plotly_chart(fig, use_container_width=True)
 
