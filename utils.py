@@ -244,7 +244,7 @@ def derive_powers_simultaneous(wl, dye_db, selection_labels, laser_wavelengths):
         else:
             bounds = (B / (M[feasible] * c_s[feasible])) - (pre[feasible] / c_s[feasible])
             P[s] = max(0.0, float(np.min(bounds)))
-    return [float(x) for x in P]
+    return [float(x) for x in P], float(B)
 
 
 def derive_powers_separate(wl, dye_db, selection_labels, laser_wavelengths):
@@ -277,7 +277,7 @@ def derive_powers_separate(wl, dye_db, selection_labels, laser_wavelengths):
         return [1.0] * len(lam)
     B = float(np.max(M))
     P = [float(B / v) if v > 0 else 0.0 for v in M]
-    return P
+    return P, B
 
 def _interp_at(wl, y, lam):
     # 简单线性插值（边界截断）
