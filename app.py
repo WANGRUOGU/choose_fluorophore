@@ -269,7 +269,7 @@ else:
     html_two_row_table("Pair", "Similarity", pairs, sims,
                        color_second_row=True, color_thresh=0.9, format_second_row=True)
 
-        # ======== 光谱图：Spectra viewer ========
+# ======== Spectra viewer ========
 st.subheader("Spectra viewer")
 fig = go.Figure()
 
@@ -278,22 +278,39 @@ if laser_strategy == "Separate":
     L = len(lam_sorted)
     W = len(wl)
 
-    gap = 12.0  # 视觉间隙
-    span = (wl[-1] - wl[0])
-    offsets = [i * (span + gap) for i in range(L)]
+    gap = 12.0  # 段与段之间的视觉间隙（单位：nm 视觉等效）
+    # 每段的“视觉长度”定义为 (1000 - 激光波长)
+    seg_spans = [max(0.0, 1000.0 - float(l)) for l in lam_sorted]
 
-    # 拼接后的 x 轴
-    x_blocks = [wl + off for off in offsets]
-    x_concat = np.concatenate(x_blocks)
+    # 计算每段的起点偏移（累加之前段的 span+gap）
+    offsets = []
+    acc = 0.0
+    for span in seg_spans:
+        offsets.append(acc)
+        acc += span + gap
 
-    # 曲线（统一 ÷B）
+    # 为每条选中曲线构造拼接后的 x/y（注意：只取 >= 该激光波长 的部分）
     for j in sel_idx:
-        y = E_raw_all[:, j] / (B + 1e-12)
-        fig.add_trace(go.Scatter(x=x_concat, y=y, mode="lines", name=labels_all[j]))
+        xs_cat = []
+        ys_cat = []
+        for i, l in enumerate(lam_sorted):
+            off = offsets[i]
+            # 取该段的 wl 片段（从该激光波长开始）
+            mask = wl >= l
+            wl_seg = wl[mask]
+            # 该条曲线在第 i 段的 y 数据来自 E_raw_all 的第 i 个区块
+            block = E_raw_all[i * W:(i + 1) * W, j] / (B + 1e-12)
+            y_seg = block[mask]
+            # 把该段的 wl 映射到自定义轴：加上该段 offset
+            xs_cat.append(wl_seg + off)
+            ys_cat.append(y_seg)
+        x_concat = np.concatenate(xs_cat) if xs_cat else np.array([])
+        y_concat = np.concatenate(ys_cat) if ys_cat else np.array([])
+        fig.add_trace(go.Scatter(x=x_concat, y=y_concat, mode="lines", name=labels_all[j]))
 
-    # 白色虚线分隔（置顶）
+    # 白色虚线分隔（画在曲线之上）
     for i in range(L - 1):
-        sep_x = wl[-1] + offsets[i] + gap / 2.0
+        sep_x = offsets[i] + seg_spans[i] + gap / 2.0
         fig.add_shape(
             type="line",
             x0=sep_x, x1=sep_x,
@@ -302,32 +319,32 @@ if laser_strategy == "Separate":
             layer="above"
         )
 
-    # 段中心 & 小标题（无背景，交错高度 + 轻微水平错位）
-    mids = [(wl[0] + wl[-1]) / 2.0 + off for off in offsets]
+    # 每段的小标题（无背景），放在各段中心；交错高度避免重叠
+    mids = [offsets[i] + seg_spans[i] / 2.0 for i in range(L)]
     for i, midx in enumerate(mids):
         fig.add_annotation(
             x=midx, xref="x",
             y=1.12 if (i % 2 == 0) else 1.06, yref="paper",
-            text=f"{lam_sorted[i]} nm",
+            text=f"{int(lam_sorted[i])} nm",
             showarrow=False,
             font=dict(size=12),
             align="center",
             yanchor="bottom",
-            xshift=(-12 if (i % 2 == 0) else 12)  # 交错一点水平位移，进一步避免重叠
+            xshift=(-12 if (i % 2 == 0) else 12)
         )
 
-    # x 轴刻度：仅每段中点 1 个刻度，显示该段真实波长范围
+    # x 轴刻度：每段仅显示 1 个刻度，文本为“laser–1000 nm”
     tick_positions = mids
-    tick_texts = [f"{int(wl[0])}–{int(wl[-1])} nm" for _ in mids]
+    tick_texts = [f"{int(l)}–1000 nm" for l in lam_sorted]
 
     fig.update_layout(
+        title_text="",  # 避免 'undefined'
         xaxis_title="Wavelength (nm)",
         yaxis_title="Normalized intensity",
         xaxis=dict(
             tickmode="array",
             tickvals=tick_positions,
             ticktext=tick_texts,
-            tickangle=0,
             ticks="outside",
             automargin=True
         ),
@@ -341,20 +358,24 @@ if laser_strategy == "Separate":
     )
 
 else:
-    # Simultaneous：按真实 wl 画
+    # ------- Simultaneous：保持原样 -------
     for j in sel_idx:
         y = E_raw_all[:, j] / (B + 1e-12)
         fig.add_trace(go.Scatter(x=wl, y=y, mode="lines", name=labels_all[j]))
     fig.update_layout(
+        title_text="",
         xaxis_title="Wavelength (nm)",
         yaxis_title="Normalized intensity",
-        yaxis=dict(range=[0, 1.05],
-                   tickmode="array",
-                   tickvals=[0, 0.2, 0.4, 0.6, 0.8, 1.0],
-                   ticktext=["0", "0.2", "0.4", "0.6", "0.8", "1"])
+        yaxis=dict(
+            range=[0, 1.05],
+            tickmode="array",
+            tickvals=[0, 0.2, 0.4, 0.6, 0.8, 1.0],
+            ticktext=["0", "0.2", "0.4", "0.6", "0.8", "1"]
+        )
     )
 
 st.plotly_chart(fig, use_container_width=True)
+
 
 
 
