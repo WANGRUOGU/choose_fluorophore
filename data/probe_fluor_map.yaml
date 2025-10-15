@@ -13,9 +13,6 @@
 - name: CAM1021
   fluors:
   - Bodipy FL
-- name: CAP371
-  fluors:
-  - AF668
 - name: CF319a
   fluors:
   - AF488
@@ -93,7 +90,7 @@
   - AF660
 - name: LEP569
   fluors:
-  - AF661
+  - AF660
 - name: NEI1030
   fluors:
   - TET
