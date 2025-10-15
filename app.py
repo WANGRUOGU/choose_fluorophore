@@ -1,7 +1,6 @@
 # app.py
 import streamlit as st
 import numpy as np
-import pandas as pd
 import plotly.graph_objects as go
 
 from utils import (
@@ -70,34 +69,40 @@ k_show = st.sidebar.slider(
     min_value=5, max_value=50, value=10, step=1,
 )
 
-levels = st.sidebar.selectbox(
-    "Lexicographic levels",
-    options=[1, 2],
-    index=1,
-    help="Number of layers to minimize lexicographically (1=minimax only; 2=also shrink the second-largest)."
-)
+# ---------- Helpers ----------
+def desired_lexi_levels(idx_groups, cap=10):
+    """Use min(10, number of pairwise terms C(G,2))."""
+    G = len(idx_groups)
+    return min(cap, (G * (G - 1)) // 2)
 
-# ---------- Tiny HTML table renderer (no headers, no index) ----------
+def effective_levels(levels_desired):
+    """utils.solve_lexicographic 目前实现到第2层，这里保护一下。"""
+    return min(levels_desired, 2)
+
 def html_two_row_table(row0_label, row1_label, row0_vals, row1_vals,
                        color_second_row=False, color_thresh=0.9,
                        format_second_row=False):
     """
-    Render a 2-row horizontal table with a labeled first column.
-    - No column headers, no index.
-    - First column contains row labels (plain text).
-    - Optional color for second row cells by threshold.
-    - Optional numeric formatting for second row.
+    Render a 2-row horizontal table (no headers/index).
+    Leftmost cell is the label text (not bold).
     """
     def esc(x):
-        # basic escape
         return (str(x)
                 .replace("&", "&amp;")
                 .replace("<", "&lt;")
                 .replace(">", "&gt;"))
 
-    cells0 = "".join(f"<td style='padding:6px 10px;border:1px solid #ddd;'>{esc(v)}</td>" for v in row0_vals)
-    tds0 = f"<td style='padding:6px 10px;border:1px solid #ddd;white-space:nowrap;'>{esc(row0_label)}</td>{cells0}"
+    # Row 0
+    cells0 = "".join(
+        f"<td style='padding:6px 10px;border:1px solid #ddd;'>{esc(v)}</td>"
+        for v in row0_vals
+    )
+    tds0 = (
+        f"<td style='padding:6px 10px;border:1px solid #ddd;white-space:nowrap;'>{esc(row0_label)}</td>"
+        f"{cells0}"
+    )
 
+    # Row 1
     def fmt(v):
         if format_second_row:
             try:
@@ -116,8 +121,10 @@ def html_two_row_table(row0_label, row1_label, row0_vals, row1_vals,
             except Exception:
                 pass
         tds1_list.append(f"<td style='{style}'>{fmt(v)}</td>")
-    tds1 = "<td style='padding:6px 10px;border:1px solid #ddd;white-space:nowrap;'>{}</td>{}".format(
-        esc(row1_label), "".join(tds1_list)
+
+    tds1 = (
+        f"<td style='padding:6px 10px;border:1px solid #ddd;white-space:nowrap;'>{esc(row1_label)}</td>"
+        f"{''.join(tds1_list)}"
     )
 
     html = f"""
@@ -131,6 +138,11 @@ def html_two_row_table(row0_label, row1_label, row0_vals, row1_vals,
     </div>
     """
     st.markdown(html, unsafe_allow_html=True)
+
+def only_fluor_pair(a: str, b: str) -> str:
+    fa = a.split(" – ", 1)[1]
+    fb = b.split(" – ", 1)[1]
+    return f"{fa} vs {fb}"
 
 # ---------- Main ----------
 st.title("Fluorophore Selection for Multiplexed Imaging")
@@ -161,35 +173,35 @@ if mode == "Emission only":
         st.error("No spectra available for optimization.")
         st.stop()
 
+    levels_eff = effective_levels(desired_lexi_levels(idx_groups))
     sel_idx, layer_vals = solve_lexicographic(
-        E_norm, idx_groups, labels_pair, levels=levels, enforce_unique=True
+        E_norm, idx_groups, labels_pair, levels=levels_eff, enforce_unique=True
     )
 
-    # ======== Selected Fluorophores（两行 HTML 表，无列头/索引） ========
+    # Selected Fluorophores
     sel_pairs = [labels_pair[j] for j in sel_idx]  # "Probe – Fluor"
     probes = [s.split(" – ", 1)[0] for s in sel_pairs]
     fluors = [s.split(" – ", 1)[1] for s in sel_pairs]
     st.subheader("Selected Fluorophores")
     html_two_row_table("Probe", "Fluorophore", probes, fluors)
 
-    # ======== Top pairwise similarities（两行 HTML 表，第二行阈值着色；去掉 “(largest first)”） ========
+    # Top pairwise similarities
     S = cosine_similarity_matrix(E_norm[:, sel_idx])
     sub_labels = [labels_pair[j] for j in sel_idx]
     tops = top_k_pairwise(S, sub_labels, k=k_show)
-    pairs = [f"{a.split(' – ',1)[1]} vs {b.split(' – ',1)[1]}" for _, a, b in tops]
+    pairs = [only_fluor_pair(a, b) for _, a, b in tops]
     sims = [val for val, _, _ in tops]
 
     st.subheader("Top pairwise similarities")
     html_two_row_table("Pair", "Similarity", pairs, sims,
                        color_second_row=True, color_thresh=0.9, format_second_row=True)
 
-    # ======== 光谱图：Spectra viewer；每条曲线各自 0–1 归一，显示 0–1 刻度 ========
+    # Spectra viewer (0–1 ticks)
     fig = go.Figure()
     for j in sel_idx:
         y = E_norm[:, j]
-        y = y / (np.max(y) + 1e-12)  # 0–1
-        lbl = labels_pair[j]
-        fig.add_trace(go.Scatter(x=wl, y=y, mode="lines", name=lbl))
+        y = y / (np.max(y) + 1e-12)
+        fig.add_trace(go.Scatter(x=wl, y=y, mode="lines", name=labels_pair[j]))
     fig.update_layout(
         title="Spectra viewer",
         xaxis_title="Wavelength (nm)",
@@ -206,61 +218,61 @@ else:
         st.error("Please specify laser wavelengths.")
         st.stop()
 
-    # 先用 emission-only 做一轮，得到 A（用于功率标定）
+    # First pass (A) on emission-only for power calibration
     E0_norm, labels0, idx0 = build_emission_only_matrix(wl, dye_db, groups)
-    sel0, _ = solve_lexicographic(E0_norm, idx0, labels0, levels=levels, enforce_unique=True)
+    levels_eff0 = effective_levels(desired_lexi_levels(idx0))
+    sel0, _ = solve_lexicographic(E0_norm, idx0, labels0, levels=levels_eff0, enforce_unique=True)
     A_labels = [labels0[j] for j in sel0]
 
-    # 由 A 计算功率（需返回 powers, B）
+    # Powers and B
     if laser_strategy == "Simultaneous":
         powers, B = derive_powers_simultaneous(wl, dye_db, A_labels, laser_list)
     else:
         powers, B = derive_powers_separate(wl, dye_db, A_labels, laser_list)
 
-    # 用功率构建全候选的“有效光谱”（E_raw 展示用；E_norm 用于相似度/优化）
+    # Effective spectra (all candidates)
     E_raw_all, E_norm_all, labels_all, idx_groups_all = build_effective_with_lasers(
         wl, dye_db, groups, laser_list, laser_strategy, powers
     )
 
-    # 基于有效光谱再做层级优化
+    # Optimization on effective spectra
+    levels_eff = effective_levels(desired_lexi_levels(idx_groups_all))
     sel_idx, layer_vals = solve_lexicographic(
-        E_norm_all, idx_groups_all, labels_all, levels=levels, enforce_unique=True
+        E_norm_all, idx_groups_all, labels_all, levels=levels_eff, enforce_unique=True
     )
 
-    # ======== Selected Fluorophores（两行 HTML 表） ========
+    # Selected Fluorophores
     sel_pairs = [labels_all[j] for j in sel_idx]  # "Probe – Fluor"
     probes = [s.split(" – ", 1)[0] for s in sel_pairs]
     fluors = [s.split(" – ", 1)[1] for s in sel_pairs]
     st.subheader("Selected Fluorophores (with lasers)")
     html_two_row_table("Probe", "Fluorophore", probes, fluors)
 
-    # ======== Laser powers（相对值，两行 HTML 表；无表头/索引） ========
+    # Laser powers (relative)
     lam_sorted = list(sorted(laser_list))
     p = np.array(powers, dtype=float)
     maxp = float(np.max(p)) if p.size > 0 else 1.0
     prel = (p / (maxp + 1e-12)).tolist()
-
     st.subheader("Laser powers (relative)")
-    html_two_row_table("Laser (nm)", "Relative power", lam_sorted, [float(f"{v:.6g}") for v in prel],
+    html_two_row_table("Laser (nm)", "Relative power",
+                       lam_sorted, [float(f"{v:.6g}") for v in prel],
                        color_second_row=False, format_second_row=False)
 
-    # ======== 相似度 Top-K（两行 HTML 表；>0.9 红，否则绿） ========
+    # Top pairwise similarities
     S = cosine_similarity_matrix(E_norm_all[:, sel_idx])
     sub_labels = [labels_all[j] for j in sel_idx]
     tops = top_k_pairwise(S, sub_labels, k=k_show)
-    pairs = [f"{a.split(' – ',1)[1]} vs {b.split(' – ',1)[1]}" for _, a, b in tops]
+    pairs = [only_fluor_pair(a, b) for _, a, b in tops]
     sims = [val for val, _, _ in tops]
-
     st.subheader("Top pairwise similarities")
     html_two_row_table("Pair", "Similarity", pairs, sims,
                        color_second_row=True, color_thresh=0.9, format_second_row=True)
 
-    # ======== 光谱图：Spectra viewer；所有谱统一 ÷ B 显示（标题不写 ÷B），y 轴 0–1 刻度 ========
+    # Spectra viewer (all ÷B, but title doesn't show it)
     fig = go.Figure()
     for j in sel_idx:
-        lbl = labels_all[j]
-        y = E_raw_all[:, j] / (B + 1e-12)  # 仍按 B 统一归一（只是标题不显示）
-        fig.add_trace(go.Scatter(x=wl, y=y, mode="lines", name=lbl))
+        y = E_raw_all[:, j] / (B + 1e-12)
+        fig.add_trace(go.Scatter(x=wl, y=y, mode="lines", name=labels_all[j]))
     fig.update_layout(
         title="Spectra viewer",
         xaxis_title="Wavelength (nm)",
