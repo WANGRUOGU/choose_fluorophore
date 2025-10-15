@@ -269,62 +269,54 @@ else:
                        color_second_row=True, color_thresh=0.9, format_second_row=True)
 
         # ======== 光谱图：Spectra viewer ========
-    # ======== 光谱图：Spectra viewer ========
 fig = go.Figure()
 
 if laser_strategy == "Separate":
-    # --- 分段轴 + 虚线 + 每段标题（不重叠） ---
     lam_sorted = list(sorted(laser_list))
     L = len(lam_sorted)
     W = len(wl)
 
-    gap = 12.0  # 段间视觉间隙 (nm)
-    span = (wl[-1] - wl[0])       # 每段真实波长跨度
-    offsets = [i * (span + gap) for i in range(L)]  # 每段起点偏移
+    gap = 12.0  # 视觉间隙
+    span = (wl[-1] - wl[0])
+    offsets = [i * (span + gap) for i in range(L)]
 
-    # 拼接后的 X 轴（把每段 wl 平移）
+    # 拼接后的 x 轴
     x_blocks = [wl + off for off in offsets]
     x_concat = np.concatenate(x_blocks)
 
-    # 画选中曲线（统一 ÷B）
+    # 曲线（统一 ÷B）
     for j in sel_idx:
         y = E_raw_all[:, j] / (B + 1e-12)
         fig.add_trace(go.Scatter(x=x_concat, y=y, mode="lines", name=labels_all[j]))
 
-    # 虚线分隔（放到图层上方）
+    # 白色虚线分隔（置顶）
     for i in range(L - 1):
         sep_x = wl[-1] + offsets[i] + gap / 2.0
         fig.add_shape(
             type="line",
             x0=sep_x, x1=sep_x,
             y0=0, y1=1, yref="paper", xref="x",
-            line=dict(color="rgba(0,0,0,0.45)", width=1, dash="dash"),
-            layer="above"  # 关键：画在曲线之上
+            line=dict(color="white", width=2, dash="dash"),
+            layer="above"
         )
 
-    # 每段中心位置
+    # 段中心 & 小标题（无背景，交错高度 + 轻微水平错位）
     mids = [(wl[0] + wl[-1]) / 2.0 + off for off in offsets]
-
-    # 段标题：交错高度 + 背景框，避免重叠 & 被裁剪
     for i, midx in enumerate(mids):
         fig.add_annotation(
             x=midx, xref="x",
-            y=1.12 if (i % 2 == 0) else 1.06, yref="paper",  # 交错高度
+            y=1.12 if (i % 2 == 0) else 1.06, yref="paper",
             text=f"{lam_sorted[i]} nm",
             showarrow=False,
             font=dict(size=12),
             align="center",
-            bgcolor="rgba(255,255,255,0.85)",  # 背景框提高清晰度
-            bordercolor="rgba(0,0,0,0.2)", borderwidth=1,
-            yanchor="bottom"
+            yanchor="bottom",
+            xshift=(-12 if (i % 2 == 0) else 12)  # 交错一点水平位移，进一步避免重叠
         )
 
-    # 每段自定义刻度：起点/中点/终点（真实 nm）
-    tick_positions = []
-    tick_texts = []
-    for off in offsets:
-        tick_positions += [wl[0] + off, (wl[0] + wl[-1]) / 2.0 + off, wl[-1] + off]
-        tick_texts += [f"{wl[0]:.0f}", f"{((wl[0] + wl[-1]) / 2.0):.0f}", f"{wl[-1]:.0f}"]
+    # x 轴刻度：仅每段中点 1 个刻度，显示该段真实波长范围
+    tick_positions = mids
+    tick_texts = [f"{int(wl[0])}–{int(wl[-1])} nm" for _ in mids]
 
     fig.update_layout(
         title="Spectra viewer",
@@ -334,6 +326,7 @@ if laser_strategy == "Separate":
             tickmode="array",
             tickvals=tick_positions,
             ticktext=tick_texts,
+            tickangle=0,
             ticks="outside",
             automargin=True
         ),
@@ -343,11 +336,11 @@ if laser_strategy == "Separate":
             tickvals=[0, 0.2, 0.4, 0.6, 0.8, 1.0],
             ticktext=["0", "0.2", "0.4", "0.6", "0.8", "1"]
         ),
-        margin=dict(t=90)  # 给段标题留足空间
+        margin=dict(t=90)
     )
 
 else:
-    # ------- Simultaneous：按真实波长画（统一 ÷B） -------
+    # Simultaneous：按真实 wl 画
     for j in sel_idx:
         y = E_raw_all[:, j] / (B + 1e-12)
         fig.add_trace(go.Scatter(x=wl, y=y, mode="lines", name=labels_all[j]))
@@ -362,5 +355,6 @@ else:
     )
 
 st.plotly_chart(fig, use_container_width=True)
+
 
 
