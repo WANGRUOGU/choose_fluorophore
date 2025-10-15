@@ -308,16 +308,18 @@ if laser_strategy == "Separate":
         y_concat = np.concatenate(ys_cat) if ys_cat else np.array([])
         fig.add_trace(go.Scatter(x=x_concat, y=y_concat, mode="lines", name=labels_all[j]))
 
-    # 白色虚线分隔（画在曲线之上）
+    # 白色虚线分隔：画在每段“右边界”处（紧贴下一段的起点）
     for i in range(L - 1):
-        sep_x = offsets[i] + seg_spans[i] + gap / 2.0
+        # 第 i 段的右边界（= 起点偏移 + 该段视觉长度）
+        sep_x = offsets[i] + seg_spans[i]
         fig.add_shape(
             type="line",
             x0=sep_x, x1=sep_x,
             y0=0, y1=1, yref="paper", xref="x",
             line=dict(color="white", width=2, dash="dash"),
-            layer="above"
+            layer="above"  # 画在曲线之上
         )
+
 
     # 每段的小标题（无背景），放在各段中心；交错高度避免重叠
     mids = [offsets[i] + seg_spans[i] / 2.0 for i in range(L)]
