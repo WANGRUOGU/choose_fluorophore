@@ -3,6 +3,7 @@ import yaml
 import numpy as np
 import pulp
 
+# 统一使用 CBC（MIP）
 _SOLVER = pulp.PULP_CBC_CMD(msg=False, mip=True)
 
 def _pick_integral_from_relaxed(x_vars, idx_groups):
@@ -180,9 +181,9 @@ def _segments_from_lasers(wl, lasers_sorted):
 
 def derive_powers_simultaneous(wl, dye_db, selection_labels, laser_wavelengths):
     """
-    Your 'B-leveling' rule when lasers fire simultaneously.
+    'B-leveling' rule when lasers fire simultaneously.
     selection_labels: list like ["Probe – Fluor", ...] for A
-    Return powers aligned to sorted lasers.
+    Return powers aligned to sorted lasers, and B.
     """
     lam = np.array(sorted(laser_wavelengths), dtype=float)
     segs = _segments_from_lasers(wl, lam)
@@ -218,7 +219,7 @@ def derive_powers_simultaneous(wl, dye_db, selection_labels, laser_wavelengths):
         if ok:
             start = s; break
     if start is None:
-        return [1.0] * len(lam)  # degenerate
+        return [1.0] * len(lam), 0.0  # degenerate
 
     P = np.zeros(len(lam))
     P[start] = 1.0
@@ -249,7 +250,7 @@ def derive_powers_simultaneous(wl, dye_db, selection_labels, laser_wavelengths):
 
 def derive_powers_separate(wl, dye_db, selection_labels, laser_wavelengths):
     """
-    Separate 模式（按你的新定义）：
+    Separate 模式（新定义）：
     - 先在 emission-only 选集 A 上标定功率；
     - 令最小波长激光 power=1；
     - 其它激光把“可达峰值”拉到与最小波长相同；
@@ -430,14 +431,13 @@ def build_effective_with_lasers(wl, dye_db, groups, laser_wavelengths, mode, pow
 
 
 
-# =============== Layer-by-layer MILP (with unique-fluor constraint) ===============
+# =============== 优化器（含字典序与 Top-M 目标） ===============
 
 def _unique_dye_constraints(prob, x_vars, labels_pair, groups, fluor_names):
     """
     Add 'each fluor ≤ 1 time globally' constraints.
     fluor_names: list[str] aligned with labels_pair, where labels are "Probe – Fluor".
     """
-    # Map dye -> indices of columns using that dye
     dye_to_cols = {}
     for j, d in enumerate(fluor_names):
         dye_to_cols.setdefault(d, []).append(j)
@@ -481,15 +481,11 @@ def solve_minimax_layer(E_norm, idx_groups, labels_pair, enforce_unique=True):
 
     # 目标
     prob += t
-
-    # 求解（显式 MIP）
     status = prob.solve(_SOLVER)
 
-    # 读取：无论状态如何，都做“组内 argmax”兜底，确保每组唯一
     x_star = _pick_integral_from_relaxed(x, idx_groups)
     t_val = float(t.value() or 0.0)
     return x_star, t_val
-
 
 
 def solve_lexicographic(E_norm, idx_groups, labels_pair, levels=3, enforce_unique=True):
@@ -550,12 +546,73 @@ def solve_lexicographic(E_norm, idx_groups, labels_pair, levels=3, enforce_uniqu
         prob += mu2[k] >= 0
 
     prob += lam2 + (1.0 / max(1, len(z))) * pulp.lpSum(mu2.values())
-
-    # 求解（显式 MIP）
     status = prob.solve(_SOLVER)
 
-    # 读取：组内 argmax 兜底，确保每组唯一
     x_star = _pick_integral_from_relaxed(x, idx_groups)
     lam2_val = float(lam2.value() or 0.0)
     return x_star, [float(t1), lam2_val]
 
+
+def solve_min_top_m(E_norm, idx_groups, labels_pair, top_m: int = 10, enforce_unique: bool = True):
+    """
+    一次性最小化“前 top_m 大”的 pairwise 相似度之和：
+        min  M*t + sum mu_ij
+        s.t. mu_ij >= z_ij - t, mu_ij >= 0
+             z_ij = c_ij * y_ij,  y_ij = AND(x_i, x_j)
+             每组恰选 1，且（可选）同一染料全局唯一
+    返回: (x_star_indices, objective_value)
+    """
+    N = E_norm.shape[1]
+    if N == 0:
+        return [], 0.0
+
+    C = cosine_similarity_matrix(E_norm)
+
+    prob = pulp.LpProblem("min_topM_cosine", pulp.LpMinimize)
+    x = [pulp.LpVariable(f"x_{j}", lowBound=0, upBound=1, cat="Binary") for j in range(N)]
+    y, z, mu = {}, {}, {}
+
+    pairs = []
+    for i in range(N):
+        for j in range(i+1, N):
+            pairs.append((i, j))
+            y[(i, j)] = pulp.LpVariable(f"y_{i}_{j}", lowBound=0, upBound=1, cat="Binary")
+            z[(i, j)] = pulp.LpVariable(f"z_{i}_{j}", lowBound=0)
+            mu[(i, j)] = pulp.LpVariable(f"mu_{i}_{j}", lowBound=0)
+
+    # 一组选一个
+    for g, idxs in enumerate(idx_groups):
+        prob += pulp.lpSum(x[j] for j in idxs) == 1, f"OnePerGroup_{g}"
+
+    # 全局唯一染料（从 "Probe – Fluor" 取 fluor 名）
+    if enforce_unique:
+        fluor_names = [s.split(" – ", 1)[1] for s in labels_pair]
+        _unique_dye_constraints(prob, x, labels_pair, idx_groups, fluor_names)
+
+    # y = AND(x_i, x_j)
+    for (i, j), yij in y.items():
+        prob += yij <= x[i]
+        prob += yij <= x[j]
+        prob += yij >= x[i] + x[j] - 1
+
+    # z = C * y
+    for (i, j), zij in z.items():
+        cij = float(C[i, j])
+        prob += zij <= cij * y[(i, j)]
+        prob += zij >= cij * y[(i, j)]
+
+    # Sum of Top-M：min M*t + sum mu_ij,  mu_ij >= z_ij - t
+    M = int(max(1, top_m))
+    t = pulp.LpVariable("t", lowBound=0)
+    for (i, j), zij in z.items():
+        prob += mu[(i, j)] >= zij - t
+        prob += mu[(i, j)] >= 0
+
+    prob += M * t + pulp.lpSum(mu.values())
+
+    status = prob.solve(_SOLVER)
+
+    # 读取：即便有分数解，也用组内 argmax 取可用解
+    x_star = _pick_integral_from_relaxed(x, idx_groups)
+    obj_val = float(pulp.value(M * t + pulp.lpSum(mu.values())))
+    return x_star, obj_val
