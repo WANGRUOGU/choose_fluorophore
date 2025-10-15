@@ -77,65 +77,60 @@ levels = st.sidebar.selectbox(
     help="Number of layers to minimize lexicographically (1=minimax only; 2=also shrink the second-largest)."
 )
 
-# ---------- Helpers ----------
-def _blank_cols(df: pd.DataFrame) -> pd.DataFrame:
-    """Make visually blank (but unique) column headers using zero-width spaces."""
-    df2 = df.copy()
-    df2.columns = [("\u200B" * (i + 1)) for i in range(len(df2.columns))]
-    return df2
-
-def _render_two_row_table(row0_label: str, row1_label: str, row0_vals, row1_vals,
-                          color_second_row: bool = False, color_thresh: float = 0.9,
-                          format_second_row: bool = False):
+# ---------- Tiny HTML table renderer (no headers, no index) ----------
+def html_two_row_table(row0_label, row1_label, row0_vals, row1_vals,
+                       color_second_row=False, color_thresh=0.9,
+                       format_second_row=False):
     """
-    Build a 2-row horizontal table with a labeled first column.
-    - First column shows row labels (bold).
-    - Optionally color the second row (values) by threshold.
-    - Optionally format the second row to 3 decimals.
+    Render a 2-row horizontal table with a labeled first column.
+    - No column headers, no index.
+    - First column contains row labels (plain text).
+    - Optional color for second row cells by threshold.
+    - Optional numeric formatting for second row.
     """
-    # Capitalize labels and bold via Styler
-    row0_label = row0_label.capitalize()
-    row1_label = row1_label.capitalize()
+    def esc(x):
+        # basic escape
+        return (str(x)
+                .replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;"))
 
-    # 第一列是行标签，其余列是值
-    data = [
-        [f"**{row0_label}**"] + list(row0_vals),
-        [f"**{row1_label}**"] + list(row1_vals),
-    ]
-    df = pd.DataFrame(data)
+    cells0 = "".join(f"<td style='padding:6px 10px;border:1px solid #ddd;'>{esc(v)}</td>" for v in row0_vals)
+    tds0 = f"<td style='padding:6px 10px;border:1px solid #ddd;white-space:nowrap;'>{esc(row0_label)}</td>{cells0}"
 
-    # 去掉列头数字（但要保持唯一）
-    df = _blank_cols(df)
+    def fmt(v):
+        if format_second_row:
+            try:
+                return f"{float(v):.3f}"
+            except Exception:
+                return esc(v)
+        return esc(v)
 
-    sty = df.style
+    tds1_list = []
+    for v in row1_vals:
+        style = "padding:6px 10px;border:1px solid #ddd;"
+        if color_second_row:
+            try:
+                vv = float(v)
+                style += "color:{};".format("red" if vv > color_thresh else "green")
+            except Exception:
+                pass
+        tds1_list.append(f"<td style='{style}'>{fmt(v)}</td>")
+    tds1 = "<td style='padding:6px 10px;border:1px solid #ddd;white-space:nowrap;'>{}</td>{}".format(
+        esc(row1_label), "".join(tds1_list)
+    )
 
-    from pandas import IndexSlice as idx
-
-    # 只对第二行的“非首列”做数值格式化/着色
-    cols_nonfirst = df.columns[1:]
-
-    if format_second_row:
-        sty = sty.format("{:.3f}", subset=idx[[1], cols_nonfirst])
-
-    if color_second_row:
-        def _color_row(v):
-            # v 是整张表；我们只对第二行非首列着色
-            s = pd.DataFrame("", index=v.index, columns=v.columns)
-            for c in cols_nonfirst:
-                try:
-                    val = float(v.loc[1, c])
-                except Exception:
-                    val = 0.0
-                s.loc[1, c] = "color: red" if val > color_thresh else "color: green"
-            return s
-        sty = sty.apply(_color_row, axis=None)
-
-    return sty
-
-def _pairs_only(a: str, b: str) -> str:
-    fa = a.split(" – ", 1)[1]
-    fb = b.split(" – ", 1)[1]
-    return f"{fa} vs {fb}"
+    html = f"""
+    <div style="overflow-x:auto;">
+      <table style="border-collapse:collapse;width:100%;table-layout:auto;">
+        <tbody>
+          <tr>{tds0}</tr>
+          <tr>{tds1}</tr>
+        </tbody>
+      </table>
+    </div>
+    """
+    st.markdown(html, unsafe_allow_html=True)
 
 # ---------- Main ----------
 st.title("Fluorophore Selection for Multiplexed Imaging")
@@ -170,29 +165,23 @@ if mode == "Emission only":
         E_norm, idx_groups, labels_pair, levels=levels, enforce_unique=True
     )
 
-    # ======== Selected Fluorophores（横向两行，首格粗体标签） ========
+    # ======== Selected Fluorophores（两行 HTML 表，无列头/索引） ========
     sel_pairs = [labels_pair[j] for j in sel_idx]  # "Probe – Fluor"
     probes = [s.split(" – ", 1)[0] for s in sel_pairs]
     fluors = [s.split(" – ", 1)[1] for s in sel_pairs]
     st.subheader("Selected Fluorophores")
-    st.dataframe(
-        _render_two_row_table("Probe", "Fluorophore", probes, fluors),
-        use_container_width=True
-    )
+    html_two_row_table("Probe", "Fluorophore", probes, fluors)
 
-    # ======== Top pairwise similarities（横向两行，>0.9 红，否则绿；去掉 “(largest first)”） ========
+    # ======== Top pairwise similarities（两行 HTML 表，第二行阈值着色；去掉 “(largest first)”） ========
     S = cosine_similarity_matrix(E_norm[:, sel_idx])
     sub_labels = [labels_pair[j] for j in sel_idx]
     tops = top_k_pairwise(S, sub_labels, k=k_show)
-    pairs = [_pairs_only(a, b) for _, a, b in tops]
+    pairs = [f"{a.split(' – ',1)[1]} vs {b.split(' – ',1)[1]}" for _, a, b in tops]
     sims = [val for val, _, _ in tops]
 
     st.subheader("Top pairwise similarities")
-    st.dataframe(
-        _render_two_row_table("Pair", "Similarity", pairs, sims,
-                              color_second_row=True, format_second_row=True),
-        use_container_width=True
-    )
+    html_two_row_table("Pair", "Similarity", pairs, sims,
+                       color_second_row=True, color_thresh=0.9, format_second_row=True)
 
     # ======== 光谱图：Spectra viewer；每条曲线各自 0–1 归一，显示 0–1 刻度 ========
     fig = go.Figure()
@@ -238,47 +227,39 @@ else:
         E_norm_all, idx_groups_all, labels_all, levels=levels, enforce_unique=True
     )
 
-    # ======== Selected Fluorophores（横向两行） ========
+    # ======== Selected Fluorophores（两行 HTML 表） ========
     sel_pairs = [labels_all[j] for j in sel_idx]  # "Probe – Fluor"
     probes = [s.split(" – ", 1)[0] for s in sel_pairs]
     fluors = [s.split(" – ", 1)[1] for s in sel_pairs]
     st.subheader("Selected Fluorophores (with lasers)")
-    st.dataframe(
-        _render_two_row_table("Probe", "Fluorophore", probes, fluors),
-        use_container_width=True
-    )
+    html_two_row_table("Probe", "Fluorophore", probes, fluors)
 
-    # ======== Laser powers（相对值，横向两行；首格标签加粗；去掉表头数字） ========
+    # ======== Laser powers（相对值，两行 HTML 表；无表头/索引） ========
     lam_sorted = list(sorted(laser_list))
     p = np.array(powers, dtype=float)
     maxp = float(np.max(p)) if p.size > 0 else 1.0
     prel = (p / (maxp + 1e-12)).tolist()
 
     st.subheader("Laser powers (relative)")
-    st.dataframe(
-        _render_two_row_table("Laser (nm)", "Relative power", lam_sorted, [float(f"{v:.6g}") for v in prel]),
-        use_container_width=True
-    )
+    html_two_row_table("Laser (nm)", "Relative power", lam_sorted, [float(f"{v:.6g}") for v in prel],
+                       color_second_row=False, format_second_row=False)
 
-    # ======== 相似度 Top-K（横向两行，>0.9 红，否则绿；pair 去掉 probe；去掉 “(largest first)”) ========
+    # ======== 相似度 Top-K（两行 HTML 表；>0.9 红，否则绿） ========
     S = cosine_similarity_matrix(E_norm_all[:, sel_idx])
     sub_labels = [labels_all[j] for j in sel_idx]
     tops = top_k_pairwise(S, sub_labels, k=k_show)
-    pairs = [_pairs_only(a, b) for _, a, b in tops]
+    pairs = [f"{a.split(' – ',1)[1]} vs {b.split(' – ',1)[1]}" for _, a, b in tops]
     sims = [val for val, _, _ in tops]
 
     st.subheader("Top pairwise similarities")
-    st.dataframe(
-        _render_two_row_table("Pair", "Similarity", pairs, sims,
-                              color_second_row=True, format_second_row=True),
-        use_container_width=True
-    )
+    html_two_row_table("Pair", "Similarity", pairs, sims,
+                       color_second_row=True, color_thresh=0.9, format_second_row=True)
 
-    # ======== 光谱图：Spectra viewer；所有谱统一 ÷ B 显示，但 y 轴标题去掉“(÷B)” ========
+    # ======== 光谱图：Spectra viewer；所有谱统一 ÷ B 显示（标题不写 ÷B），y 轴 0–1 刻度 ========
     fig = go.Figure()
     for j in sel_idx:
         lbl = labels_all[j]
-        y = E_raw_all[:, j] / (B + 1e-12)  # 仍按你的 B 做统一归一
+        y = E_raw_all[:, j] / (B + 1e-12)  # 仍按 B 统一归一（只是标题不显示）
         fig.add_trace(go.Scatter(x=wl, y=y, mode="lines", name=lbl))
     fig.update_layout(
         title="Spectra viewer",
