@@ -100,8 +100,7 @@ if not groups:
     st.stop()
 
 # ---------- Helper: 表格着色 ----------
-def style_similarity_table(df_like: pd.DataFrame) -> pd.io.formats.style.Styler:
-    # df_like: 两行（pair/similarity），多列
+def style_similarity_table(df_like: pd.DataFrame):
     def colorizer(data):
         sty = pd.DataFrame("", index=data.index, columns=data.columns)
         for c in data.columns:
@@ -113,6 +112,7 @@ def style_similarity_table(df_like: pd.DataFrame) -> pd.io.formats.style.Styler:
             sty.loc["similarity", c] = "color: red" if v > 0.9 else "color: green"
         return sty
     return df_like.style.apply(colorizer, axis=None).format({c: "{:.3f}" for c in df_like.columns})
+
 
 # ---------- Optimization & Display ----------
 if mode == "Emission only":
