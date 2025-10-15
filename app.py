@@ -10,7 +10,7 @@ from utils import (
     build_effective_with_lasers,
     derive_powers_simultaneous,
     derive_powers_separate,
-    solve_lexicographic,
+    solve_min_top_m,            # <— 关键：前10对相似度目标
     cosine_similarity_matrix,
     top_k_pairwise,
 )
@@ -43,7 +43,7 @@ laser_list = []
 if mode == "Emission + Excitation + Brightness":
     laser_strategy = st.sidebar.radio(
         "Laser usage", options=("Simultaneous", "Separate"),
-        help="Simultaneous: cumulative-by-segment leveling to a common B. Separate: each laser scaled to a common peak."
+        help="Simultaneous: cumulative-by-segment leveling to a common B. Separate: each laser scaled to match the min-wavelength anchor; spectra concatenated by lasers."
     )
     preset = st.sidebar.radio(
         "Lasers", options=("488/561/639 (preset)", "Custom"),
@@ -69,22 +69,16 @@ k_show = st.sidebar.slider(
     min_value=5, max_value=50, value=10, step=1,
 )
 
-# ---------- Helpers ----------
-def desired_lexi_levels(idx_groups, cap=10):
-    """Use min(10, number of pairwise terms C(G,2))."""
-    G = len(idx_groups)
-    return min(cap, (G * (G - 1)) // 2)
-
-def effective_levels(levels_desired):
-    """utils.solve_lexicographic 目前实现到第2层，这里保护一下。"""
-    return min(levels_desired, 2)
-
+# ---------- Tiny HTML table renderer (no headers, no index) ----------
 def html_two_row_table(row0_label, row1_label, row0_vals, row1_vals,
                        color_second_row=False, color_thresh=0.9,
                        format_second_row=False):
     """
-    Render a 2-row horizontal table (no headers/index).
-    Leftmost cell is the label text (not bold).
+    Render a 2-row horizontal table with a labeled first column.
+    - No column headers, no index.
+    - First column contains row labels (plain text).
+    - Optional color for second row cells by threshold.
+    - Optional numeric formatting for second row.
     """
     def esc(x):
         return (str(x)
@@ -166,6 +160,11 @@ if not groups:
     st.error("No valid candidates with spectra in dyes.yaml for the selected probes.")
     st.stop()
 
+# Helper: compute Top-M (=min(10, C(G,2)))
+def topM_from_idx_groups(idx_groups):
+    G = len(idx_groups)
+    return min(10, (G * (G - 1)) // 2)
+
 # ---------- Optimization & Display ----------
 if mode == "Emission only":
     E_norm, labels_pair, idx_groups = build_emission_only_matrix(wl, dye_db, groups)
@@ -173,19 +172,19 @@ if mode == "Emission only":
         st.error("No spectra available for optimization.")
         st.stop()
 
-    levels_eff = effective_levels(desired_lexi_levels(idx_groups))
-    sel_idx, layer_vals = solve_lexicographic(
-        E_norm, idx_groups, labels_pair, levels=levels_eff, enforce_unique=True
+    topM = topM_from_idx_groups(idx_groups)
+    sel_idx, _ = solve_min_top_m(
+        E_norm, idx_groups, labels_pair, top_m=topM, enforce_unique=True
     )
 
-    # Selected Fluorophores
+    # ======== Selected Fluorophores（两行 HTML 表） ========
     sel_pairs = [labels_pair[j] for j in sel_idx]  # "Probe – Fluor"
     probes = [s.split(" – ", 1)[0] for s in sel_pairs]
     fluors = [s.split(" – ", 1)[1] for s in sel_pairs]
     st.subheader("Selected Fluorophores")
     html_two_row_table("Probe", "Fluorophore", probes, fluors)
 
-    # Top pairwise similarities
+    # ======== Top pairwise similarities（两行 HTML 表；阈值着色） ========
     S = cosine_similarity_matrix(E_norm[:, sel_idx])
     sub_labels = [labels_pair[j] for j in sel_idx]
     tops = top_k_pairwise(S, sub_labels, k=k_show)
@@ -196,196 +195,12 @@ if mode == "Emission only":
     html_two_row_table("Pair", "Similarity", pairs, sims,
                        color_second_row=True, color_thresh=0.9, format_second_row=True)
 
+    # ======== Spectra viewer（0–1 ticks；每条曲线各自 0–1 归一） ========
     st.subheader("Spectra viewer")
-    # Spectra viewer (0–1 ticks)
     fig = go.Figure()
     for j in sel_idx:
         y = E_norm[:, j]
         y = y / (np.max(y) + 1e-12)
         fig.add_trace(go.Scatter(x=wl, y=y, mode="lines", name=labels_pair[j]))
     fig.update_layout(
-        title=None,
-        xaxis_title="Wavelength (nm)",
-        yaxis_title="Normalized intensity",
-        yaxis=dict(range=[0, 1.05],
-                   tickmode="array",
-                   tickvals=[0, 0.2, 0.4, 0.6, 0.8, 1.0],
-                   ticktext=["0", "0.2", "0.4", "0.6", "0.8", "1"])
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-else:
-    if not laser_list:
-        st.error("Please specify laser wavelengths.")
-        st.stop()
-
-    # First pass (A) on emission-only for power calibration
-    E0_norm, labels0, idx0 = build_emission_only_matrix(wl, dye_db, groups)
-    levels_eff0 = effective_levels(desired_lexi_levels(idx0))
-    sel0, _ = solve_lexicographic(E0_norm, idx0, labels0, levels=levels_eff0, enforce_unique=True)
-    A_labels = [labels0[j] for j in sel0]
-
-    # Powers and B
-    if laser_strategy == "Simultaneous":
-        powers, B = derive_powers_simultaneous(wl, dye_db, A_labels, laser_list)
-    else:
-        powers, B = derive_powers_separate(wl, dye_db, A_labels, laser_list)
-
-    # Effective spectra (all candidates)
-    E_raw_all, E_norm_all, labels_all, idx_groups_all = build_effective_with_lasers(
-        wl, dye_db, groups, laser_list, laser_strategy, powers
-    )
-
-    # Optimization on effective spectra
-    levels_eff = effective_levels(desired_lexi_levels(idx_groups_all))
-    sel_idx, layer_vals = solve_lexicographic(
-        E_norm_all, idx_groups_all, labels_all, levels=levels_eff, enforce_unique=True
-    )
-
-    # Selected Fluorophores
-    sel_pairs = [labels_all[j] for j in sel_idx]  # "Probe – Fluor"
-    probes = [s.split(" – ", 1)[0] for s in sel_pairs]
-    fluors = [s.split(" – ", 1)[1] for s in sel_pairs]
-    st.subheader("Selected Fluorophores (with lasers)")
-    html_two_row_table("Probe", "Fluorophore", probes, fluors)
-
-    # Laser powers (relative)
-    lam_sorted = list(sorted(laser_list))
-    p = np.array(powers, dtype=float)
-    maxp = float(np.max(p)) if p.size > 0 else 1.0
-    prel = (p / (maxp + 1e-12)).tolist()
-    st.subheader("Laser powers (relative)")
-    html_two_row_table("Laser (nm)", "Relative power",
-                       lam_sorted, [float(f"{v:.6g}") for v in prel],
-                       color_second_row=False, format_second_row=False)
-
-    # Top pairwise similarities
-    S = cosine_similarity_matrix(E_norm_all[:, sel_idx])
-    sub_labels = [labels_all[j] for j in sel_idx]
-    tops = top_k_pairwise(S, sub_labels, k=k_show)
-    pairs = [only_fluor_pair(a, b) for _, a, b in tops]
-    sims = [val for val, _, _ in tops]
-    st.subheader("Top pairwise similarities")
-    html_two_row_table("Pair", "Similarity", pairs, sims,
-                       color_second_row=True, color_thresh=0.9, format_second_row=True)
-
-# ======== Spectra viewer ========
-st.subheader("Spectra viewer")
-fig = go.Figure()
-
-if laser_strategy == "Separate":
-    lam_sorted = list(sorted(laser_list))
-    L = len(lam_sorted)
-    W = len(wl)
-
-    gap = 12.0
-    wl_max_vis = float(min(1000.0, wl[-1]))  # 上限
-
-    # 段宽 = min(1000, wl[-1]) - laser_nm（可能为0）
-    seg_widths = [max(0.0, wl_max_vis - float(l)) for l in lam_sorted]
-
-    # 累计偏移（用于把每段平移到拼接轴）
-    offsets = []
-    acc = 0.0
-    for wseg in seg_widths:
-        offsets.append(acc)
-        acc += wseg + gap
-
-    # 曲线：x = wl_seg + offset（统一 nm 坐标系）
-    for j in sel_idx:
-        xs_cat, ys_cat = [], []
-        for i, l in enumerate(lam_sorted):
-            if seg_widths[i] <= 0:
-                continue
-            off = offsets[i]
-            # 该段可视 wl：laser_nm..wl_max_vis
-            mask = (wl >= l) & (wl <= wl_max_vis)
-            wl_seg = wl[mask]
-            block = E_raw_all[i * W:(i + 1) * W, j] / (B + 1e-12)
-            y_seg = block[mask]
-            xs_cat.append(wl_seg + off)
-            ys_cat.append(y_seg)
-        if xs_cat:
-            fig.add_trace(go.Scatter(
-                x=np.concatenate(xs_cat),
-                y=np.concatenate(ys_cat),
-                mode="lines",
-                name=labels_all[j]
-            ))
-
-    # —— 关键修正：所有定位都用 offset + 真实 nm —— #
-    # 段左/右/中
-    lefts  = [offsets[i] + float(lam_sorted[i]) for i in range(L)]
-    rights = [offsets[i] + wl_max_vis        for i in range(L)]
-    mids   = [offsets[i] + (float(lam_sorted[i]) + wl_max_vis) / 2.0 for i in range(L)]
-
-    # 白色虚线：画在每段“右边界” (offset + wl_max_vis)
-    for i in range(L - 1):
-        if seg_widths[i] <= 0:
-            continue
-        sep_x = rights[i]
-        fig.add_shape(
-            type="line",
-            x0=sep_x, x1=sep_x,
-            y0=0, y1=1, yref="paper", xref="x",
-            line=dict(color="white", width=2, dash="dash"),
-            layer="above"
-        )
-
-    # 段标题：放在每段“中点” (offset + (laser+upper)/2)
-    for i in range(L):
-        if seg_widths[i] <= 0:
-            continue
-        fig.add_annotation(
-            x=mids[i], xref="x",
-            y=1.12 if (i % 2 == 0) else 1.06, yref="paper",
-            text=f"{int(lam_sorted[i])} nm",
-            showarrow=False,
-            font=dict(size=12),
-            align="center",
-            yanchor="bottom",
-            xshift=(-12 if (i % 2 == 0) else 12)
-        )
-
-    # x 轴刻度：每段只放 1 个（中点），文案改为“laser–上限”
-    tick_positions = [mids[i] for i in range(L) if seg_widths[i] > 0]
-    tick_texts     = [f"{int(lam_sorted[i])}–{int(wl_max_vis)} nm" for i in range(L) if seg_widths[i] > 0]
-
-    fig.update_layout(
         title_text="",
-        xaxis_title="Wavelength (nm)",
-        yaxis_title="Normalized intensity",
-        xaxis=dict(
-            tickmode="array",
-            tickvals=tick_positions,
-            ticktext=tick_texts,
-            ticks="outside",
-            automargin=True
-        ),
-        yaxis=dict(
-            range=[0, 1.05],
-            tickmode="array",
-            tickvals=[0, 0.2, 0.4, 0.6, 0.8, 1.0],
-            ticktext=["0", "0.2", "0.4", "0.6", "0.8", "1"]
-        ),
-        margin=dict(t=90)
-    )
-
-else:
-    # Simultaneous 保持不变
-    for j in sel_idx:
-        y = E_raw_all[:, j] / (B + 1e-12)
-        fig.add_trace(go.Scatter(x=wl, y=y, mode="lines", name=labels_all[j]))
-    fig.update_layout(
-        title_text="",
-        xaxis_title="Wavelength (nm)",
-        yaxis_title="Normalized intensity",
-        yaxis=dict(range=[0, 1.05],
-                   tickmode="array",
-                   tickvals=[0, 0.2, 0.4, 0.6, 0.8, 1.0],
-                   ticktext=["0", "0.2", "0.4", "0.6", "0.8", "1"])
-    )
-
-st.plotly_chart(fig, use_container_width=True)
-
-
