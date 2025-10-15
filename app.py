@@ -196,6 +196,7 @@ if mode == "Emission only":
     html_two_row_table("Pair", "Similarity", pairs, sims,
                        color_second_row=True, color_thresh=0.9, format_second_row=True)
 
+    st.subheader("Spectra viewer")
     # Spectra viewer (0–1 ticks)
     fig = go.Figure()
     for j in sel_idx:
@@ -203,7 +204,7 @@ if mode == "Emission only":
         y = y / (np.max(y) + 1e-12)
         fig.add_trace(go.Scatter(x=wl, y=y, mode="lines", name=labels_pair[j]))
     fig.update_layout(
-        title="Spectra viewer",
+        title=None,
         xaxis_title="Wavelength (nm)",
         yaxis_title="Normalized intensity",
         yaxis=dict(range=[0, 1.05],
@@ -269,6 +270,7 @@ else:
                        color_second_row=True, color_thresh=0.9, format_second_row=True)
 
         # ======== 光谱图：Spectra viewer ========
+st.subheader("Spectra viewer")
 fig = go.Figure()
 
 if laser_strategy == "Separate":
@@ -319,7 +321,7 @@ if laser_strategy == "Separate":
     tick_texts = [f"{int(wl[0])}–{int(wl[-1])} nm" for _ in mids]
 
     fig.update_layout(
-        title="Spectra viewer",
+        title=None,
         xaxis_title="Wavelength (nm)",
         yaxis_title="Normalized intensity",
         xaxis=dict(
@@ -345,7 +347,7 @@ else:
         y = E_raw_all[:, j] / (B + 1e-12)
         fig.add_trace(go.Scatter(x=wl, y=y, mode="lines", name=labels_all[j]))
     fig.update_layout(
-        title="Spectra viewer",
+        title=None,
         xaxis_title="Wavelength (nm)",
         yaxis_title="Normalized intensity",
         yaxis=dict(range=[0, 1.05],
