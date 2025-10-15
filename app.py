@@ -101,17 +101,25 @@ if not groups:
 
 # ---------- Helper: 表格着色 ----------
 def style_similarity_table(df_like: pd.DataFrame):
+    from pandas import IndexSlice as idx
+
     def colorizer(data):
         sty = pd.DataFrame("", index=data.index, columns=data.columns)
         for c in data.columns:
-            val = data.loc["similarity", c]
             try:
-                v = float(val)
+                v = float(data.loc["similarity", c])
             except Exception:
                 v = 0.0
             sty.loc["similarity", c] = "color: red" if v > 0.9 else "color: green"
         return sty
-    return df_like.style.apply(colorizer, axis=None).format({c: "{:.3f}" for c in df_like.columns})
+
+    # 只给 similarity 行套 "{:.3f}"，避免对 pair 的字符串应用数值格式
+    return (
+        df_like.style
+        .apply(colorizer, axis=None)
+        .format("{:.3f}", subset=idx[["similarity"], :])
+    )
+
 
 
 # ---------- Optimization & Display ----------
