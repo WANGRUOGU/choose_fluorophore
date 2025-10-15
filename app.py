@@ -321,7 +321,6 @@ if laser_strategy == "Separate":
     tick_texts = [f"{int(wl[0])}–{int(wl[-1])} nm" for _ in mids]
 
     fig.update_layout(
-        title=None,
         xaxis_title="Wavelength (nm)",
         yaxis_title="Normalized intensity",
         xaxis=dict(
@@ -347,7 +346,6 @@ else:
         y = E_raw_all[:, j] / (B + 1e-12)
         fig.add_trace(go.Scatter(x=wl, y=y, mode="lines", name=labels_all[j]))
     fig.update_layout(
-        title=None,
         xaxis_title="Wavelength (nm)",
         yaxis_title="Normalized intensity",
         yaxis=dict(range=[0, 1.05],
