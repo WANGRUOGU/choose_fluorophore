@@ -278,45 +278,52 @@ if laser_strategy == "Separate":
     L = len(lam_sorted)
     W = len(wl)
 
-    gap = 12.0  # 段间视觉间隙（坐标单位）
-    wl_max_vis = float(min(1000.0, wl[-1]))  # 可视范围上限
+    gap = 12.0
+    wl_max_vis = float(min(1000.0, wl[-1]))  # 上限
 
-    # 每段“可视宽度”= min(1000, wl[-1]) - laser_nm（若为负则置 0）
+    # 段宽 = min(1000, wl[-1]) - laser_nm（可能为0）
     seg_widths = [max(0.0, wl_max_vis - float(l)) for l in lam_sorted]
 
-    # offsets：用 seg_widths 累加（与曲线长度完全一致）
+    # 累计偏移（用于把每段平移到拼接轴）
     offsets = []
     acc = 0.0
     for wseg in seg_widths:
         offsets.append(acc)
         acc += wseg + gap
 
-    # 画曲线：逐段切 wl，再做位移；y 用拼接块同样切 mask，二者长度一致
+    # 曲线：x = wl_seg + offset（统一 nm 坐标系）
     for j in sel_idx:
         xs_cat, ys_cat = [], []
         for i, l in enumerate(lam_sorted):
             if seg_widths[i] <= 0:
                 continue
             off = offsets[i]
-            # 该段可视 wl 片段：laser_nm .. min(1000, wl[-1])
+            # 该段可视 wl：laser_nm..wl_max_vis
             mask = (wl >= l) & (wl <= wl_max_vis)
             wl_seg = wl[mask]
-            # 对应的 y 从第 i 个拼接块取再按相同 mask 切
             block = E_raw_all[i * W:(i + 1) * W, j] / (B + 1e-12)
             y_seg = block[mask]
-            # 平移到自定义拼接轴
             xs_cat.append(wl_seg + off)
             ys_cat.append(y_seg)
         if xs_cat:
-            x_concat = np.concatenate(xs_cat)
-            y_concat = np.concatenate(ys_cat)
-            fig.add_trace(go.Scatter(x=x_concat, y=y_concat, mode="lines", name=labels_all[j]))
+            fig.add_trace(go.Scatter(
+                x=np.concatenate(xs_cat),
+                y=np.concatenate(ys_cat),
+                mode="lines",
+                name=labels_all[j]
+            ))
 
-    # 白色虚线分隔：画在每段右边界（= offset + seg_width）
+    # —— 关键修正：所有定位都用 offset + 真实 nm —— #
+    # 段左/右/中
+    lefts  = [offsets[i] + float(lam_sorted[i]) for i in range(L)]
+    rights = [offsets[i] + wl_max_vis        for i in range(L)]
+    mids   = [offsets[i] + (float(lam_sorted[i]) + wl_max_vis) / 2.0 for i in range(L)]
+
+    # 白色虚线：画在每段“右边界” (offset + wl_max_vis)
     for i in range(L - 1):
         if seg_widths[i] <= 0:
             continue
-        sep_x = offsets[i] + seg_widths[i]
+        sep_x = rights[i]
         fig.add_shape(
             type="line",
             x0=sep_x, x1=sep_x,
@@ -325,15 +332,14 @@ if laser_strategy == "Separate":
             layer="above"
         )
 
-    # 段标题：放在段中点；交错高度 + 轻微 xshift，减少重叠
-    for i, l in enumerate(lam_sorted):
+    # 段标题：放在每段“中点” (offset + (laser+upper)/2)
+    for i in range(L):
         if seg_widths[i] <= 0:
             continue
-        midx = offsets[i] + seg_widths[i] / 2.0
         fig.add_annotation(
-            x=midx, xref="x",
+            x=mids[i], xref="x",
             y=1.12 if (i % 2 == 0) else 1.06, yref="paper",
-            text=f"{int(l)} nm",
+            text=f"{int(lam_sorted[i])} nm",
             showarrow=False,
             font=dict(size=12),
             align="center",
@@ -341,12 +347,12 @@ if laser_strategy == "Separate":
             xshift=(-12 if (i % 2 == 0) else 12)
         )
 
-    # x 轴刻度：每段仅 1 个（中点），文本“laser–upper”
-    tick_positions = [offsets[i] + seg_widths[i] / 2.0 for i in range(L) if seg_widths[i] > 0]
-    tick_texts = [f"{int(l)}–{int(wl_max_vis)} nm" for i, l in enumerate(lam_sorted) if seg_widths[i] > 0]
+    # x 轴刻度：每段只放 1 个（中点），文案改为“laser–上限”
+    tick_positions = [mids[i] for i in range(L) if seg_widths[i] > 0]
+    tick_texts     = [f"{int(lam_sorted[i])}–{int(wl_max_vis)} nm" for i in range(L) if seg_widths[i] > 0]
 
     fig.update_layout(
-        title_text="",  # 防止 'undefined'
+        title_text="",
         xaxis_title="Wavelength (nm)",
         yaxis_title="Normalized intensity",
         xaxis=dict(
@@ -366,7 +372,7 @@ if laser_strategy == "Separate":
     )
 
 else:
-    # ------- Simultaneous：保持原样 -------
+    # Simultaneous 保持不变
     for j in sel_idx:
         y = E_raw_all[:, j] / (B + 1e-12)
         fig.add_trace(go.Scatter(x=wl, y=y, mode="lines", name=labels_all[j]))
@@ -374,17 +380,12 @@ else:
         title_text="",
         xaxis_title="Wavelength (nm)",
         yaxis_title="Normalized intensity",
-        yaxis=dict(
-            range=[0, 1.05],
-            tickmode="array",
-            tickvals=[0, 0.2, 0.4, 0.6, 0.8, 1.0],
-            ticktext=["0", "0.2", "0.4", "0.6", "0.8", "1"]
-        )
+        yaxis=dict(range=[0, 1.05],
+                   tickmode="array",
+                   tickvals=[0, 0.2, 0.4, 0.6, 0.8, 1.0],
+                   ticktext=["0", "0.2", "0.4", "0.6", "0.8", "1"])
     )
 
 st.plotly_chart(fig, use_container_width=True)
-
-
-
 
 
