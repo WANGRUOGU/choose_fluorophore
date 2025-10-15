@@ -249,20 +249,34 @@ def derive_powers_simultaneous(wl, dye_db, selection_labels, laser_wavelengths):
 
 def derive_powers_separate(wl, dye_db, selection_labels, laser_wavelengths):
     """
-    Lasers fired separately; each laser power set so its global peak across A equals a common B.
+    Separate 模式（按你的新定义）：
+    - 先在 emission-only 选集 A 上标定功率；
+    - 令最小波长激光 power=1；
+    - 其它激光把“可达峰值”拉到与最小波长相同；
+    - 返回 (powers_sorted_by_wavelength, B) ，其中 B=M_min（仅作标尺，可用于可视化归一）。
     """
     lam = np.array(sorted(laser_wavelengths), dtype=float)
     W = len(wl)
+    # 选中的染料名
     fls = [s.split(" – ", 1)[1] for s in selection_labels]
     recs = [dye_db[f] for f in fls if f in dye_db]
 
+    # 线性插值取 excitation(l)
+    def _interp_at(w, y, x):
+        if x <= w[0]: return float(y[0])
+        if x >= w[-1]: return float(y[-1])
+        i = int(np.searchsorted(w, x)) - 1
+        t = (x - w[i]) / (w[i+1] - w[i])
+        return float(y[i]*(1-t) + y[i+1]*t)
+
     def coef(rec, l):
         ex = rec["excitation"]; qy = rec["quantum_yield"]; ec = rec["extinction_coeff"]
-        if ex is None or len(ex) != W or qy is None or ec is None:
+        if ex is None or len(ex) != W or qy is None:
             return 0.0
-        idx = _nearest_idx_from_grid(wl, l)
-        return float(ex[idx] * qy * (ec if ec is not None else 1.0))
+        ex_l = _interp_at(wl, ex, l)
+        return float(ex_l * qy * (ec if ec is not None else 1.0))
 
+    # 每束激光的“可达峰值” M_l（在选集 A 上）
     M = []
     for l in lam:
         peaks = []
@@ -273,11 +287,20 @@ def derive_powers_separate(wl, dye_db, selection_labels, laser_wavelengths):
             peaks.append(np.max(em) * coef(r, l))
         M.append(max(peaks) if peaks else 0.0)
     M = np.array(M, dtype=float)
-    if np.all(M <= 0):  # degenerate
-        return [1.0] * len(lam)
-    B = float(np.max(M))
-    P = [float(B / v) if v > 0 else 0.0 for v in M]
-    return P, B
+
+    # 锚定最小波长束为 1，其 B=M_min
+    P = np.zeros_like(M)
+    if M.size == 0:
+        return [1.0]*0, 1.0
+    P[0] = 1.0
+    B = float(M[0])
+
+    # 其它束：把各自可达峰值拉到 B
+    for i in range(1, len(M)):
+        P[i] = float(B / M[i]) if M[i] > 0 else 0.0
+
+    return [float(x) for x in P], B
+
 
 def _interp_at(wl, y, lam):
     # 简单线性插值（边界截断）
@@ -294,59 +317,117 @@ def build_effective_with_lasers(wl, dye_db, groups, laser_wavelengths, mode, pow
     mode: "Simultaneous" or "Separate"
     powers: aligned to sorted(laser_wavelengths)
     Return:
-      E_raw: W x N (not normalized,用于展示),
-      E_norm: W x N (列向量 L2 归一化，用于相似度/优化),
+      E_raw:  W x N (Simultaneous)  或  (W*L) x N（Separate，横向拼接）,
+      E_norm: 同形状，列向量 L2 归一（用于相似度/优化）,
       labels_pair, idx_groups
     """
     W = len(wl)
     lam = np.array(sorted(laser_wavelengths), dtype=float)
     pw = np.array(powers, dtype=float)
-    segs = _segments_from_lasers(wl, lam)
+
+    def _nearest_idx_from_grid(wl, lam):
+        idx = int(round(lam - wl[0]))
+        if idx < 0: idx = 0
+        if idx >= len(wl): idx = len(wl) - 1
+        return idx
+
+    def _segments_from_lasers(wl, lasers_sorted):
+        segs = []
+        for i, l in enumerate(lasers_sorted):
+            lo = l
+            hi = lasers_sorted[i+1] if i+1 < len(lasers_sorted) else wl[-1] + 1
+            segs.append((lo, hi))
+        return segs
+
+    # 线性插值取 excitation(l)
+    def _interp_at(w, y, x):
+        if x <= w[0]: return float(y[0])
+        if x >= w[-1]: return float(y[-1])
+        i = int(np.searchsorted(w, x)) - 1
+        t = (x - w[i]) / (w[i+1] - w[i])
+        return float(y[i]*(1-t) + y[i+1]*t)
 
     cols = []
     labels = []
     idx_groups = []
     col_id = 0
 
-    for probe, cand_list in groups.items():
-        idxs = []
-        for fluor in cand_list:
-            rec = dye_db.get(fluor)
-            if rec is None: 
-                continue
-            em = rec["emission"]; ex = rec["excitation"]
-            qy = rec["quantum_yield"]; ec = rec["extinction_coeff"]
-            if em is None or ex is None or len(em) != W or len(ex) != W:
-                continue
+    if mode == "Separate":
+        # ------- 横向拼接：每束激光的整条谱单独算，再 concat -------
+        for probe, cand_list in groups.items():
+            idxs = []
+            for fluor in cand_list:
+                rec = dye_db.get(fluor)
+                if rec is None: 
+                    continue
+                em = rec["emission"]; ex = rec["excitation"]
+                qy = rec["quantum_yield"]; ec = rec["extinction_coeff"]
+                if em is None or ex is None or len(em) != W or len(ex) != W:
+                    continue
 
-            eff = np.zeros(W, dtype=float)
-            if mode == "Separate":
+                # 每束激光的整条谱
+                per_laser_blocks = []
                 for i, l in enumerate(lam):
-                    idx_l = _nearest_idx_from_grid(wl, l)
-                    k = ex[idx_l] * qy * (ec if ec is not None else 1.0) * pw[i]
-                    eff += em * k
-            else:
+                    k = _interp_at(wl, ex, l) * qy * (ec if ec is not None else 1.0) * pw[i]
+                    per_laser_blocks.append(em * k)  # 整条谱，不做分段
+
+                eff_concat = np.concatenate(per_laser_blocks, axis=0)  # (W*L,)
+                cols.append(eff_concat)
+                labels.append(f"{probe} – {fluor}")
+                idxs.append(col_id)
+                col_id += 1
+            if idxs:
+                idx_groups.append(idxs)
+
+        if not cols:
+            return np.zeros((W * max(1, len(lam)), 0)), np.zeros((W * max(1, len(lam)), 0)), [], []
+
+        E_raw = np.stack(cols, axis=1)          # [(W*L) x N]
+        # 列 L2 归一
+        denom = np.linalg.norm(E_raw, axis=0, keepdims=True) + 1e-12
+        E_norm = E_raw / denom
+        return E_raw, E_norm, labels, idx_groups
+
+    else:
+        # ------- Simultaneous：逐段累计叠加 -------
+        segs = _segments_from_lasers(wl, lam)
+        for probe, cand_list in groups.items():
+            idxs = []
+            for fluor in cand_list:
+                rec = dye_db.get(fluor)
+                if rec is None: 
+                    continue
+                em = rec["emission"]; ex = rec["excitation"]
+                qy = rec["quantum_yield"]; ec = rec["extinction_coeff"]
+                if em is None or ex is None or len(em) != W or len(ex) != W:
+                    continue
+
+                eff = np.zeros(W, dtype=float)
                 for i, (lo, hi) in enumerate(segs):
                     loi = _nearest_idx_from_grid(wl, lo)
                     hii = _nearest_idx_from_grid(wl, hi - 1) + 1
+                    # 累计 0..i 束
                     total_k = 0.0
                     for m in range(i + 1):
                         k_m = _interp_at(wl, ex, lam[m]) * qy * (ec if ec is not None else 1.0) * pw[m]
                         total_k += k_m
                     eff[loi:hii] += em[loi:hii] * total_k
 
-            cols.append(eff)
-            labels.append(f"{probe} – {fluor}")
-            idxs.append(col_id)
-            col_id += 1
-        if idxs:
-            idx_groups.append(idxs)
+                cols.append(eff)
+                labels.append(f"{probe} – {fluor}")
+                idxs.append(col_id)
+                col_id += 1
+            if idxs:
+                idx_groups.append(idxs)
 
-    if not cols:
-        return np.zeros((W, 0)), np.zeros((W, 0)), [], []
-    E_raw = np.stack(cols, axis=1)          # for plotting
-    E_norm = _safe_l2norm_cols(E_raw)       # for cosine similarity
-    return E_raw, E_norm, labels, idx_groups
+        if not cols:
+            return np.zeros((W, 0)), np.zeros((W, 0)), [], []
+
+        E_raw = np.stack(cols, axis=1)          # [W x N]
+        denom = np.linalg.norm(E_raw, axis=0, keepdims=True) + 1e-12
+        E_norm = E_raw / denom
+        return E_raw, E_norm, labels, idx_groups
+
 
 
 # =============== Layer-by-layer MILP (with unique-fluor constraint) ===============
