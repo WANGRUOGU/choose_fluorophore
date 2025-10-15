@@ -269,10 +269,15 @@ else:
                        color_second_row=True, color_thresh=0.9, format_second_row=True)
 
     # Spectra viewer (all ÷B, but title doesn't show it)
+    if laser_strategy == "Separate":
+        x = np.arange(E_raw_all.shape[0])  # 0..W*L-1
+    else:
+        x = wl
+
     fig = go.Figure()
     for j in sel_idx:
         y = E_raw_all[:, j] / (B + 1e-12)
-        fig.add_trace(go.Scatter(x=wl, y=y, mode="lines", name=labels_all[j]))
+        fig.add_trace(go.Scatter(x=x, y=y, mode="lines", name=labels_all[j]))
     fig.update_layout(
         title="Spectra viewer",
         xaxis_title="Wavelength (nm)",
