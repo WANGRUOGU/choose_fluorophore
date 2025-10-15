@@ -16,11 +16,6 @@ from utils import (
     top_k_pairwise,
 )
 
-def _blank_cols(df: pd.DataFrame) -> pd.DataFrame:
-    df2 = df.copy()
-    df2.columns = [""] * len(df2.columns)
-    return df2
-
 st.set_page_config(page_title="Choose Fluorophore", layout="wide")
 
 DYES_YAML = "data/dyes.yaml"
@@ -82,6 +77,36 @@ levels = st.sidebar.selectbox(
     help="Number of layers to minimize lexicographically (1=minimax only; 2=also shrink the second-largest)."
 )
 
+# ---------- Helpers ----------
+def _blank_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """Make visually blank (but unique) column headers using zero-width spaces."""
+    df2 = df.copy()
+    df2.columns = [("\u200B" * (i + 1)) for i in range(len(df2.columns))]
+    return df2
+
+def style_similarity_table(df_like: pd.DataFrame):
+    """Color similarity row (>0.9 red else green), and only format similarity as numeric."""
+    from pandas import IndexSlice as idx
+    df_like = df_like.copy()
+    # visually blank but unique column headers
+    df_like.columns = [("\u200B" * (i + 1)) for i in range(len(df_like.columns))]
+
+    def colorizer(data):
+        sty = pd.DataFrame("", index=data.index, columns=data.columns)
+        for c in data.columns:
+            try:
+                v = float(data.loc["similarity", c])
+            except Exception:
+                v = 0.0
+            sty.loc["similarity", c] = "color: red" if v > 0.9 else "color: green"
+        return sty
+
+    return (
+        df_like.style
+        .apply(colorizer, axis=None)
+        .format("{:.3f}", subset=idx[["similarity"], :])
+    )
+
 # ---------- Main ----------
 st.title("Fluorophore Selection for Multiplexed Imaging")
 
@@ -94,7 +119,7 @@ if not picked:
     st.info("Select at least one probe to proceed.")
     st.stop()
 
-# Build groups dict in the chosen order (过滤掉在 dyes.yaml 不存在的候选)
+# Build groups dict in the chosen order (过滤无效候选)
 groups = {}
 for p in picked:
     cands = [f for f in probe_map.get(p, []) if f in dye_db]
@@ -103,29 +128,6 @@ for p in picked:
 if not groups:
     st.error("No valid candidates with spectra in dyes.yaml for the selected probes.")
     st.stop()
-
-# ---------- Helper: 表格着色 ----------
-def style_similarity_table(df_like: pd.DataFrame):
-    from pandas import IndexSlice as idx
-
-    def colorizer(data):
-        sty = pd.DataFrame("", index=data.index, columns=data.columns)
-        for c in data.columns:
-            try:
-                v = float(data.loc["similarity", c])
-            except Exception:
-                v = 0.0
-            sty.loc["similarity", c] = "color: red" if v > 0.9 else "color: green"
-        return sty
-
-    # 只给 similarity 行套 "{:.3f}"，避免对 pair 的字符串应用数值格式
-    return (
-        df_like.style
-        .apply(colorizer, axis=None)
-        .format("{:.3f}", subset=idx[["similarity"], :])
-    )
-
-
 
 # ---------- Optimization & Display ----------
 if mode == "Emission only":
@@ -158,10 +160,9 @@ if mode == "Emission only":
         fb = b.split(" – ", 1)[1]
         pairs.append(f"{fa} vs {fb}")
         sims.append(val)
-    # 构建两行多列的横表
     df_sim = pd.DataFrame([pairs, sims], index=["pair", "similarity"])
     st.subheader("Top pairwise similarities (largest first)")
-    st.dataframe(style_similarity_table(_blank_cols(df_sim)), use_container_width=True)
+    st.dataframe(style_similarity_table(df_sim), use_container_width=True)
 
     # ======== 光谱图：Spectra viewer；每条曲线各自 0–1 归一，显示 0–1 刻度 ========
     fig = go.Figure()
@@ -191,13 +192,13 @@ else:
     sel0, _ = solve_lexicographic(E0_norm, idx0, labels0, levels=levels, enforce_unique=True)
     A_labels = [labels0[j] for j in sel0]
 
-    # 由 A 计算功率（函数需返回 powers, B）
+    # 由 A 计算功率（需返回 powers, B）
     if laser_strategy == "Simultaneous":
         powers, B = derive_powers_simultaneous(wl, dye_db, A_labels, laser_list)
     else:
         powers, B = derive_powers_separate(wl, dye_db, A_labels, laser_list)
 
-    # 用功率构建全候选的“有效光谱”（E_raw 展示用；E_norm 用于优化）
+    # 用功率构建全候选的“有效光谱”（E_raw 展示用；E_norm 用于相似度/优化）
     E_raw_all, E_norm_all, labels_all, idx_groups_all = build_effective_with_lasers(
         wl, dye_db, groups, laser_list, laser_strategy, powers
     )
@@ -213,7 +214,7 @@ else:
     fluors = [s.split(" – ", 1)[1] for s in sel_pairs]
     df_sel = pd.DataFrame([probes, fluors], index=["probe", "fluorophore"])
     st.subheader("Selected Fluorophores (with lasers)")
-    st.dataframe(df_sel, use_container_width=True)
+    st.dataframe(_blank_cols(df_sel), use_container_width=True)
 
     # ======== Laser power（相对值，横向表：第一行 laser nm，第二行 relative power） ========
     lam_sorted = list(sorted(laser_list))
@@ -238,7 +239,7 @@ else:
         sims.append(val)
     df_sim = pd.DataFrame([pairs, sims], index=["pair", "similarity"])
     st.subheader("Top pairwise similarities (largest first)")
-    st.dataframe(style_similarity_table(_blank_cols(df_sim)), use_container_width=True)
+    st.dataframe(style_similarity_table(df_sim), use_container_width=True)
 
     # ======== 光谱图：Spectra viewer；所有谱统一 ÷ B，显示 0–1 刻度 ========
     fig = go.Figure()
