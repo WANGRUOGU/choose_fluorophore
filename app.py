@@ -16,6 +16,11 @@ from utils import (
     top_k_pairwise,
 )
 
+def _blank_cols(df: pd.DataFrame) -> pd.DataFrame:
+    df2 = df.copy()
+    df2.columns = [""] * len(df2.columns)
+    return df2
+
 st.set_page_config(page_title="Choose Fluorophore", layout="wide")
 
 DYES_YAML = "data/dyes.yaml"
@@ -140,7 +145,7 @@ if mode == "Emission only":
     fluors = [s.split(" – ", 1)[1] for s in sel_pairs]
     df_sel = pd.DataFrame([probes, fluors], index=["probe", "fluorophore"])
     st.subheader("Selected Fluorophores")
-    st.dataframe(df_sel, use_container_width=True)
+    st.dataframe(_blank_cols(df_sel), use_container_width=True)
 
     # ======== 相似度 Top-K：横向表（pair 去掉 probe；>0.9 红，否则绿） ========
     S = cosine_similarity_matrix(E_norm[:, sel_idx])
@@ -156,7 +161,7 @@ if mode == "Emission only":
     # 构建两行多列的横表
     df_sim = pd.DataFrame([pairs, sims], index=["pair", "similarity"])
     st.subheader("Top pairwise similarities (largest first)")
-    st.dataframe(style_similarity_table(df_sim), use_container_width=True)
+    st.dataframe(style_similarity_table(_blank_cols(df_sim)), use_container_width=True)
 
     # ======== 光谱图：Spectra viewer；每条曲线各自 0–1 归一，显示 0–1 刻度 ========
     fig = go.Figure()
@@ -218,7 +223,7 @@ else:
     df_pw = pd.DataFrame([lam_sorted, [float(f"{v:.6g}") for v in prel]],
                          index=["laser (nm)", "relative power"])
     st.subheader("Laser powers (relative)")
-    st.dataframe(df_pw, use_container_width=True)
+    st.dataframe(_blank_cols(df_pw), use_container_width=True)
 
     # ======== 相似度 Top-K（横向表，>0.9 红，否则绿；pair 去掉 probe） ========
     S = cosine_similarity_matrix(E_norm_all[:, sel_idx])
@@ -233,7 +238,7 @@ else:
         sims.append(val)
     df_sim = pd.DataFrame([pairs, sims], index=["pair", "similarity"])
     st.subheader("Top pairwise similarities (largest first)")
-    st.dataframe(style_similarity_table(df_sim), use_container_width=True)
+    st.dataframe(style_similarity_table(_blank_cols(df_sim)), use_container_width=True)
 
     # ======== 光谱图：Spectra viewer；所有谱统一 ÷ B，显示 0–1 刻度 ========
     fig = go.Figure()
