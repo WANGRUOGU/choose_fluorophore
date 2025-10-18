@@ -1,0 +1,20 @@
+fluorophores:
+  - AF405
+  - AF488
+  - AF514
+  - AF532
+  - AF555
+  - AF594
+  - AF610
+  - AF633
+  - AF647
+  - AF660
+  - AF750
+  - ATTO514
+  - ATTO542
+  - ATTO620
+  - ATTO655
+  - FITC
+  - PacBlue
+  - RRX
+  - TF4
