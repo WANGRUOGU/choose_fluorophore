@@ -11,7 +11,7 @@ from utils import (
     build_effective_with_lasers,
     derive_powers_simultaneous,
     derive_powers_separate,
-    solve_lexicographic_k,   # ← 关键：导入渐进式字典序优化器
+    solve_lexicographic_k,   # strict lexicographic optimizer
     cosine_similarity_matrix,
     top_k_pairwise,
 )
@@ -20,13 +20,14 @@ st.set_page_config(page_title="Choose Fluorophore", layout="wide")
 
 DYES_YAML = "data/dyes.yaml"
 PROBE_MAP_YAML = "data/probe_fluor_map.yaml"
-READOUT_POOL_YAML = "data/readout_fluorophores.yaml"
+READOUT_POOL_YAML = "data/readout_fluorophores.yaml"  # optional pool file
 
-# ---------- Load data ----------
+# ---------- Data loading ----------
 wl, dye_db = load_dyes_yaml(DYES_YAML)
 probe_map = load_probe_fluor_map(PROBE_MAP_YAML)
 
 def load_readout_pool(path):
+    """Read 'fluorophores: [...]' and keep only those present in dyes.yaml."""
     if not os.path.exists(path):
         return []
     with open(path, "r", encoding="utf-8") as f:
@@ -38,6 +39,7 @@ def load_readout_pool(path):
 
 readout_pool = load_readout_pool(READOUT_POOL_YAML)
 
+
 # ---------- Sidebar ----------
 st.sidebar.header("Configuration")
 
@@ -45,10 +47,9 @@ mode = st.sidebar.radio(
     "Mode",
     options=("Emission only", "Emission + Excitation + Brightness"),
     help=(
-        "Emission only: use emission spectra only (each emission first peak-normalized, "
-        "then optimize by cosine).\n\n"
-        "Emission + Excitation + Brightness: build effective spectra with lasers using "
-        "excitation · QY · EC, and optimize on cosine of those effective spectra."
+        "Emission only: peak-normalized emission, optimize by cosine.\n\n"
+        "Emission + Excitation + Brightness: build effective spectra with lasers "
+        "using excitation · QY · EC, then optimize by cosine on those effective spectra."
     ),
 )
 
@@ -57,7 +58,8 @@ laser_list = []
 if mode == "Emission + Excitation + Brightness":
     laser_strategy = st.sidebar.radio(
         "Laser usage", options=("Simultaneous", "Separate"),
-        help="Simultaneous: cumulative-by-segment leveling to a common B. Separate: per-laser power aligned, spectra concatenated horizontally."
+        help="Simultaneous: cumulative within wavelength segments (B-leveling). "
+             "Separate: per-laser scaled to the same B, spectra concatenated horizontally."
     )
     preset = st.sidebar.radio(
         "Lasers", options=("488/561/639 (preset)", "Custom"),
@@ -83,16 +85,19 @@ k_show = st.sidebar.slider(
     min_value=5, max_value=50, value=10, step=1,
 )
 
+# New: choose selection source
 source_mode = st.sidebar.radio(
     "Selection source",
     options=("By probes", "From readout pool"),
-    help="Choose dyes by probe mapping, or pick the most separable subset directly from the readout pool."
+    help="Pick per-probe, or directly select N fluorophores from the readout pool."
 )
 
-# ---------- Tiny 2-row HTML table ----------
+
+# ---------- Tiny 2-row HTML table (no header/index) ----------
 def html_two_row_table(row0_label, row1_label, row0_vals, row1_vals,
                        color_second_row=False, color_thresh=0.9,
                        format_second_row=False):
+    """Render a compact 2-row table with a label column on the left."""
     def esc(x):
         return (str(x)
                 .replace("&", "&amp;")
@@ -145,9 +150,11 @@ def html_two_row_table(row0_label, row1_label, row0_vals, row1_vals,
     st.markdown(html, unsafe_allow_html=True)
 
 def only_fluor_pair(a: str, b: str) -> str:
+    """Drop probe names in 'Probe – Fluor' labels and keep 'Fluor vs Fluor'."""
     fa = a.split(" – ", 1)[1]
     fb = b.split(" – ", 1)[1]
     return f"{fa} vs {fb}"
+
 
 # ---------- Main ----------
 st.title("Fluorophore Selection for Multiplexed Imaging")
@@ -162,8 +169,8 @@ if use_pool:
         st.stop()
     max_n = len(readout_pool)
     N_pick = st.number_input("How many fluorophores to pick", min_value=1, max_value=max_n, value=min(4, max_n), step=1)
-    for i in range(1, N_pick + 1):
-        groups[f"Slot {i}"] = readout_pool[:]
+    # Pool mode: one group with all candidates; the optimizer will enforce sum(x)=N
+    groups = {"Pool": readout_pool[:]}
 else:
     all_probes = sorted(probe_map.keys())
     st.subheader("Pick probes to optimize")
@@ -179,26 +186,43 @@ else:
         st.error("No valid candidates with spectra in dyes.yaml for the selected probes.")
         st.stop()
 
+
+# ---------- Core run ----------
 def run_selection_and_display(groups, mode, laser_strategy, laser_list):
+    required_count = (N_pick if use_pool else None)
+
     if mode == "Emission only":
+        # Build emission-only matrix
         E_norm, labels_pair, idx_groups = build_emission_only_matrix(wl, dye_db, groups)
         if E_norm.shape[1] == 0:
             st.error("No spectra available for optimization.")
             st.stop()
 
-        # 渐进式字典序（K= min(10, 对数)）
+        # Strict lexicographic optimization (K = min(10, #pairs))
         G = len(idx_groups)
-        K = min(10, (G * (G - 1)) // 2)
-        sel_idx, _ = solve_lexicographic_k(E_norm, idx_groups, labels_pair, levels=K, enforce_unique=True)
+        K = min(10, (G * (G - 1)) // 2) if required_count is None else min(10, E_norm.shape[1] * (E_norm.shape[1] - 1) // 2)
+        sel_idx, _ = solve_lexicographic_k(
+            E_norm, idx_groups, labels_pair,
+            levels=K, enforce_unique=True,
+            required_count=required_count
+        )
 
-        # Selected
-        sel_pairs = [labels_pair[j] for j in sel_idx]
-        first_row = [s.split(" – ", 1)[0] for s in sel_pairs]
-        second_row = [s.split(" – ", 1)[1] for s in sel_pairs]
-        st.subheader("Selected Fluorophores")
-        html_two_row_table("Probe" if not use_pool else "Slot", "Fluorophore", first_row, second_row)
+        # Selected Fluorophores
+        if use_pool:
+            chosen_fluors = [labels_pair[j].split(" – ", 1)[1] for j in sel_idx]
+            chosen_fluors = sorted(chosen_fluors)
+            st.subheader("Selected Fluorophores")
+            html_two_row_table("Slot", "Fluorophore",
+                               [f"Slot {i+1}" for i in range(len(chosen_fluors))],
+                               chosen_fluors)
+        else:
+            sel_pairs = [labels_pair[j] for j in sel_idx]
+            probes = [s.split(" – ", 1)[0] for s in sel_pairs]
+            fluors = [s.split(" – ", 1)[1] for s in sel_pairs]
+            st.subheader("Selected Fluorophores")
+            html_two_row_table("Probe", "Fluorophore", probes, fluors)
 
-        # Top-K similarities
+        # Top pairwise similarities
         S = cosine_similarity_matrix(E_norm[:, sel_idx])
         sub_labels = [labels_pair[j] for j in sel_idx]
         tops = top_k_pairwise(S, sub_labels, k=k_show)
@@ -208,7 +232,7 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
         html_two_row_table("Pair", "Similarity", pairs, sims,
                            color_second_row=True, color_thresh=0.9, format_second_row=True)
 
-        # Spectra viewer
+        # Spectra viewer (normalize to 0–1 per trace)
         st.subheader("Spectra viewer")
         fig = go.Figure()
         for j in sel_idx:
@@ -231,35 +255,51 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
             st.error("Please specify laser wavelengths.")
             st.stop()
 
-        # 第一轮（A 集）用于功率标定
+        # Round A: emission-only optimization (used for power calibration)
         E0_norm, labels0, idx0 = build_emission_only_matrix(wl, dye_db, groups)
         G0 = len(idx0)
-        K0 = min(10, (G0 * (G0 - 1)) // 2)
-        sel0, _ = solve_lexicographic_k(E0_norm, idx0, labels0, levels=K0, enforce_unique=True)
+        K0 = min(10, (G0 * (G0 - 1)) // 2) if required_count is None else min(10, E0_norm.shape[1] * (E0_norm.shape[1] - 1) // 2)
+        sel0, _ = solve_lexicographic_k(
+            E0_norm, idx0, labels0,
+            levels=K0, enforce_unique=True,
+            required_count=required_count
+        )
         A_labels = [labels0[j] for j in sel0]
 
-        # 功率与 B
+        # Calibrate powers and B
         if laser_strategy == "Simultaneous":
             powers, B = derive_powers_simultaneous(wl, dye_db, A_labels, laser_list)
         else:
             powers, B = derive_powers_separate(wl, dye_db, A_labels, laser_list)
 
-        # 有效光谱
+        # Build effective spectra for all candidates
         E_raw_all, E_norm_all, labels_all, idx_groups_all = build_effective_with_lasers(
             wl, dye_db, groups, laser_list, laser_strategy, powers
         )
 
-        # 第二轮：基于有效光谱的字典序
+        # Round B: lexicographic optimization on effective spectra
         Gf = len(idx_groups_all)
-        Kf = min(10, (Gf * (Gf - 1)) // 2)
-        sel_idx, _ = solve_lexicographic_k(E_norm_all, idx_groups_all, labels_all, levels=Kf, enforce_unique=True)
+        Kf = min(10, (Gf * (Gf - 1)) // 2) if required_count is None else min(10, E_norm_all.shape[1] * (E_norm_all.shape[1] - 1) // 2)
+        sel_idx, _ = solve_lexicographic_k(
+            E_norm_all, idx_groups_all, labels_all,
+            levels=Kf, enforce_unique=True,
+            required_count=required_count
+        )
 
-        # Selected
-        sel_pairs = [labels_all[j] for j in sel_idx]
-        first_row = [s.split(" – ", 1)[0] for s in sel_pairs]
-        second_row = [s.split(" – ", 1)[1] for s in sel_pairs]
-        st.subheader("Selected Fluorophores (with lasers)")
-        html_two_row_table("Probe" if not use_pool else "Slot", "Fluorophore", first_row, second_row)
+        # Selected Fluorophores
+        if use_pool:
+            chosen_fluors = [labels_all[j].split(" – ", 1)[1] for j in sel_idx]
+            chosen_fluors = sorted(chosen_fluors)
+            st.subheader("Selected Fluorophores (with lasers)")
+            html_two_row_table("Slot", "Fluorophore",
+                               [f"Slot {i+1}" for i in range(len(chosen_fluors))],
+                               chosen_fluors)
+        else:
+            sel_pairs = [labels_all[j] for j in sel_idx]
+            probes = [s.split(" – ", 1)[0] for s in sel_pairs]
+            fluors = [s.split(" – ", 1)[1] for s in sel_pairs]
+            st.subheader("Selected Fluorophores (with lasers)")
+            html_two_row_table("Probe", "Fluorophore", probes, fluors)
 
         # Laser powers (relative)
         lam_sorted = list(sorted(laser_list))
@@ -271,7 +311,7 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
                            lam_sorted, [float(f"{v:.6g}") for v in prel],
                            color_second_row=False, format_second_row=False)
 
-        # Top-K similarities
+        # Top pairwise similarities
         S = cosine_similarity_matrix(E_norm_all[:, sel_idx])
         sub_labels = [labels_all[j] for j in sel_idx]
         tops = top_k_pairwise(S, sub_labels, k=k_show)
@@ -288,13 +328,14 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
             lam_sorted = list(sorted(laser_list))
             L = len(lam_sorted)
             Wn = len(wl)
-            gap = 12.0
+            gap = 12.0  # visual gap between blocks
             wl_max_vis = float(min(1000.0, wl[-1]))
             seg_widths = [max(0.0, wl_max_vis - float(l)) for l in lam_sorted]
             offsets, acc = [], 0.0
             for wseg in seg_widths:
                 offsets.append(acc); acc += wseg + gap
 
+            # plot each selected dye across concatenated blocks
             for j in sel_idx:
                 xs_cat, ys_cat = [], []
                 for i, l in enumerate(lam_sorted):
@@ -316,6 +357,7 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
             rights = [offsets[i] + wl_max_vis for i in range(L)]
             mids   = [offsets[i] + (float(lam_sorted[i]) + wl_max_vis) / 2.0 for i in range(L)]
 
+            # white dashed separators (between blocks)
             for i in range(L - 1):
                 if seg_widths[i] <= 0: continue
                 sep_x = rights[i]
@@ -326,7 +368,7 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
                     line=dict(color="white", width=2, dash="dash"),
                     layer="above"
                 )
-
+            # per-block titles (laser nm)
             for i in range(L):
                 if seg_widths[i] <= 0: continue
                 fig.add_annotation(
@@ -369,4 +411,6 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
             )
         st.plotly_chart(fig, use_container_width=True)
 
+
+# Execute
 run_selection_and_display(groups, mode, laser_strategy, laser_list)
