@@ -1,15 +1,19 @@
 import yaml
 import numpy as np
+# utils.py 顶部
 import pulp
 
-# CBC 求解器参数：允许很小的 gap/限时，显著提速
-_SOLVER = pulp.PULP_CBC_CMD(
-    msg=False,
-    mip=True,
-    timeLimit=60,     # 你可按需调整
-    fracGap=0.005,    # 0.5% gap
-    # threads=4,      # 如容器是多核，可以打开
-)
+def _make_cbc_exact():
+    # 不设置 time limit / gap，保证返回最优解
+    # 仍然关闭日志，启用 MIP
+    try:
+        return pulp.PULP_CBC_CMD(msg=False, mip=True)
+    except TypeError:
+        # 极老版本兜底
+        return pulp.PULP_CBC_CMD(msg=False)
+
+_SOLVER = _make_cbc_exact()
+
 
 def _pick_integral_from_relaxed(x_vars, idx_groups):
     """
