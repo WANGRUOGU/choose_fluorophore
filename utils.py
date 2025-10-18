@@ -456,7 +456,7 @@ def solve_minimax_layer(E_norm, idx_groups, labels_pair, enforce_unique=True):
     y = {}
     for i in range(N):
         for j in range(i+1, N):
-            y[(i,j)] = pulp.LpVariable(f"y_{i}_{j}", lowBound=0, upBound=1, cat="Binary")
+            y[(i,j)] = pulp.LpVariable(f"y_{i}_{j}", lowBound=0, upBound=1)
     t = pulp.LpVariable("t", lowBound=0)
 
     # 一组选一个
@@ -505,7 +505,7 @@ def solve_lexicographic(E_norm, idx_groups, labels_pair, levels=3, enforce_uniqu
     y = {}
     for i in range(N):
         for j in range(i+1, N):
-            y[(i,j)] = pulp.LpVariable(f"y_{i}_{j}", lowBound=0, upBound=1, cat="Binary")
+            y[(i,j)] = pulp.LpVariable(f"y_{i}_{j}", lowBound=0, upBound=1)
     z = {}
     for i in range(N):
         for j in range(i+1, N):
@@ -656,7 +656,7 @@ def solve_lexicographic_k(E_norm, idx_groups, labels_pair, levels: int = 10, enf
 
         # 变量
         x = [pulp.LpVariable(f"x_{j}", lowBound=0, upBound=1, cat="Binary") for j in range(N)]
-        y = { (i,j): pulp.LpVariable(f"y_{i}_{j}", lowBound=0, upBound=1, cat="Binary") for (i,j) in pairs }
+        y = { (i,j): pulp.LpVariable(f"y_{i}_{j}", lowBound=0, upBound=1) for (i,j) in pairs }
         z = { (i,j): pulp.LpVariable(f"z_{i}_{j}", lowBound=0) for (i,j) in pairs }
 
         # 组约束
