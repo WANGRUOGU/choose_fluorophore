@@ -616,3 +616,113 @@ def solve_min_top_m(E_norm, idx_groups, labels_pair, top_m: int = 10, enforce_un
     x_star = _pick_integral_from_relaxed(x, idx_groups)
     obj_val = float(pulp.value(M * t + pulp.lpSum(mu.values())))
     return x_star, obj_val
+
+def solve_lexicographic_k(E_norm, idx_groups, labels_pair, levels: int = 10, enforce_unique: bool = True):
+    """
+    渐进式字典序最小化（前 K 层）：
+      第1层：最小化 t1 = max z_ij
+      第2层：在 t1 固定为最优的基础上，最小化“第二大”：
+             用标准的 lambda/mu 线性化（mu_ij >= z_ij - lambda），最小化 lambda + 平均超额
+      第k层：在前 (k-1) 层最优值都被“固定”的基础上，最小化第 k 大
+
+    做法：逐层“重建”同一类模型，但在第 k 次求解时，一并引入 lam_1..lam_k、mu^(1..k)，
+         并对 r<k 的 lam_r 加上上次的最优封顶 lam_r <= best[r-1] + eps，保证层层递进。
+         目标函数只用当前层的 lam_k + avg(mu^(k))。
+
+    返回：
+      (x_star_indices, layer_values) 其中 layer_values = [t1*, lam2*, lam3*, ...] 最多 levels 项
+    """
+    N = E_norm.shape[1]
+    if N == 0:
+        return [], []
+    # 常量
+    C = cosine_similarity_matrix(E_norm)
+    pairs = [(i, j) for i in range(N) for j in range(i+1, N)]
+    P = len(pairs)
+    if P == 0:
+        # 只有一个组时，不存在 pair
+        # 仍保证每组选1
+        # 简单选每组第一个
+        sel = [g[0] for g in idx_groups if g]
+        return sel, []
+
+    K = int(max(1, min(levels, P)))  # 最多到对数 P
+    eps = 1e-6
+    best_layers = []   # 记录每层的最优值 [t1*, lam2*, lam3*, ...]
+
+    # 逐层求解（每次重建模型，加入前面层的caps）
+    for k in range(1, K + 1):
+        prob = pulp.LpProblem(f"lexi_k{k}", pulp.LpMinimize)
+
+        # 变量
+        x = [pulp.LpVariable(f"x_{j}", lowBound=0, upBound=1, cat="Binary") for j in range(N)]
+        y = { (i,j): pulp.LpVariable(f"y_{i}_{j}", lowBound=0, upBound=1, cat="Binary") for (i,j) in pairs }
+        z = { (i,j): pulp.LpVariable(f"z_{i}_{j}", lowBound=0) for (i,j) in pairs }
+
+        # 组约束
+        for g, idxs in enumerate(idx_groups):
+            prob += pulp.lpSum(x[j] for j in idxs) == 1, f"OnePerGroup_{g}"
+
+        # 全局唯一（可选）
+        if enforce_unique:
+            fluor_names = [s.split(" – ", 1)[1] for s in labels_pair]
+            _unique_dye_constraints(prob, x, labels_pair, idx_groups, fluor_names)
+
+        # y = AND(x_i, x_j)
+        for (i,j) in pairs:
+            yij = y[(i,j)]
+            prob += yij <= x[i]
+            prob += yij <= x[j]
+            prob += yij >= x[i] + x[j] - 1
+
+        # z = C * y
+        for (i,j) in pairs:
+            cij = float(C[i,j])
+            zij = z[(i,j)]
+            prob += zij <= cij * y[(i,j)]
+            prob += zij >= cij * y[(i,j)]
+
+        # 第1层：t1 = max z_ij
+        t1 = pulp.LpVariable("t1", lowBound=0)
+        for (i,j) in pairs:
+            prob += t1 >= z[(i,j)]
+
+        # 若已有前一层最优，给 t1 加cap（保持前层最优不被破坏）
+        if len(best_layers) >= 1:
+            prob += t1 <= best_layers[0] + eps
+
+        # 为了到第 k 层，需要定义 lam_r/mu_r (r=2..k)，并对 r<k 的 lam_r 施加cap
+        lam = {}
+        mu = {}
+        if k >= 2:
+            for r in range(2, k + 1):
+                lam[r] = pulp.LpVariable(f"lam{r}", lowBound=0)
+                # mu^(r) 为每个 pair 定义
+                mu[r] = { (i,j): pulp.LpVariable(f"mu{r}_{i}_{j}", lowBound=0) for (i,j) in pairs }
+                # 连接 mu^(r) 与 z、lam_r：mu^(r)_ij >= z_ij - lam_r
+                for (i,j) in pairs:
+                    prob += mu[r][(i,j)] >= z[(i,j)] - lam[r]
+                    prob += mu[r][(i,j)] >= 0
+                # 如果 r-1 层已有最优，给 lam_r 加cap
+                if len(best_layers) >= (r - 1):
+                    prob += lam[r] <= best_layers[r - 1] + eps
+
+        # 目标：当前层
+        if k == 1:
+            prob += t1
+        else:
+            # 最小化 lam_k + 平均超额
+            prob += lam[k] + (1.0 / max(1, P)) * pulp.lpSum(mu[k][p] for p in pairs)
+
+        # 求解
+        _ = prob.solve(_SOLVER)
+        # 记录本层最优值
+        if k == 1:
+            best_layers.append(float(t1.value() or 0.0))
+        else:
+            best_layers.append(float(lam[k].value() or 0.0))
+
+        # 最后一次的 x 解用于返回（做一次组内 argmax 兜底）
+        x_star = _pick_integral_from_relaxed(x, idx_groups)
+
+    return x_star, best_layers
