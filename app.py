@@ -209,10 +209,8 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
 
         # —— 最小化“前 M 对”相似度之和（M=10 或 C(G,2)）
         G = len(idx_groups)
-        topM = min(10, (G * (G - 1)) // 2)
-        sel_idx, _ = solve_min_top_m(
-            E_norm, idx_groups, labels_pair, top_m=topM, enforce_unique=True
-        )
+        K = min(10, (G * (G - 1)) // 2)
+        sel_idx, _ = solve_lexicographic_k(E_norm, idx_groups, labels_pair, levels=K, enforce_unique=True)
 
         # ======== Selected ========
         sel_pairs = [labels_pair[j] for j in sel_idx]  # "Probe – Fluor"
@@ -257,8 +255,8 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
         # —— 第一轮（A 集，用于功率标定）：Emission only 上的 Top-M 目标
         E0_norm, labels0, idx0 = build_emission_only_matrix(wl, dye_db, groups)
         G0 = len(idx0)
-        topM0 = min(10, (G0 * (G0 - 1)) // 2)
-        sel0, _ = solve_min_top_m(E0_norm, idx0, labels0, top_m=topM0, enforce_unique=True)
+        K0 = min(10, (G0 * (G0 - 1)) // 2)
+        sel0, _ = solve_lexicographic_k(E0_norm, idx0, labels0, levels=K0, enforce_unique=True)
         A_labels = [labels0[j] for j in sel0]
 
         # —— 由 A 计算功率与 B
@@ -274,10 +272,8 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
 
         # —— 第二轮：基于有效光谱做 Top-M 目标优化
         Gf = len(idx_groups_all)
-        topMf = min(10, (Gf * (Gf - 1)) // 2)
-        sel_idx, _ = solve_min_top_m(
-            E_norm_all, idx_groups_all, labels_all, top_m=topMf, enforce_unique=True
-        )
+        Kf = min(10, (Gf * (Gf - 1)) // 2)
+        sel_idx, _ = solve_lexicographic_k(E_norm_all, idx_groups_all, labels_all, levels=Kf, enforce_unique=True)
 
         # ======== Selected ========
         sel_pairs = [labels_all[j] for j in sel_idx]  # "Probe – Fluor"
