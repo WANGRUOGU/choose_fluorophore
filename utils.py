@@ -510,8 +510,8 @@ def solve_lexicographic_k(E_norm, idx_groups, labels_pair, levels: int = 10, enf
                 for (i,j) in pairs:
                     prob += mu[r][(i,j)] >= z[(i,j)] - lam[r]
                     prob += mu[r][(i,j)] >= 0
-                if len(best_layers) >= (r - 1):
-                    prob += lam[r] <= best_layers[r - 1] + eps
+                if (r - 1) < len(best_layers):
+                    prob += lam[r] <= float(best_layers[r - 1]) + eps
 
         # warm start（上一层的 x 或贪心）
         if x_star_last is not None:
