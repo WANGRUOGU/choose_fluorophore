@@ -62,7 +62,7 @@ if mode == "Emission + Excitation + Brightness":
              "Separate: per-laser scaled to the same B, spectra concatenated horizontally."
     )
     preset = st.sidebar.radio(
-        "Lasers", options=("405/448/561/639 (preset)", "Custom"),
+        "Lasers", options=("405/448/561/639", "Custom"),
         help="Use preset or define your wavelengths."
     )
     if preset == "405/448/561/639 (preset)":
