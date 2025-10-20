@@ -256,26 +256,26 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
             st.stop()
 
         # --- Round A: emission-only for a provisional selection (used just to get an initial power guess) ---
-    E0_norm, labels0, idx0 = build_emission_only_matrix(wl, dye_db, groups)
-    G0 = len(idx0)
-    K0 = min(10, (G0 * (G0 - 1)) // 2) if required_count is None else min(10, E0_norm.shape[1] * (E0_norm.shape[1] - 1) // 2)
-    sel0, _ = solve_lexicographic_k(
-        E0_norm, idx0, labels0,
-        levels=K0, enforce_unique=True,
-        required_count=required_count
-    )
-    A_labels = [labels0[j] for j in sel0]
-    
-    # --- (1) Calibrate powers on A (as before) ---
-    if laser_strategy == "Simultaneous":
-        powers_A, B_A = derive_powers_simultaneous(wl, dye_db, A_labels, laser_list)
-    else:
-        powers_A, B_A = derive_powers_separate(wl, dye_db, A_labels, laser_list)
-    
-    # --- Build effective spectra for ALL candidates with powers_A, then select ---
-    E_raw_all, E_norm_all, labels_all, idx_groups_all = build_effective_with_lasers(
-        wl, dye_db, groups, laser_list, laser_strategy, powers_A
-    )
+        E0_norm, labels0, idx0 = build_emission_only_matrix(wl, dye_db, groups)
+        G0 = len(idx0)
+        K0 = min(10, (G0 * (G0 - 1)) // 2) if required_count is None else min(10, E0_norm.shape[1] * (E0_norm.shape[1] - 1) // 2)
+        sel0, _ = solve_lexicographic_k(
+            E0_norm, idx0, labels0,
+            levels=K0, enforce_unique=True,
+            required_count=required_count
+        )
+        A_labels = [labels0[j] for j in sel0]
+        
+        # --- (1) Calibrate powers on A (as before) ---
+        if laser_strategy == "Simultaneous":
+            powers_A, B_A = derive_powers_simultaneous(wl, dye_db, A_labels, laser_list)
+        else:
+            powers_A, B_A = derive_powers_separate(wl, dye_db, A_labels, laser_list)
+        
+        # --- Build effective spectra for ALL candidates with powers_A, then select ---
+        E_raw_all, E_norm_all, labels_all, idx_groups_all = build_effective_with_lasers(
+            wl, dye_db, groups, laser_list, laser_strategy, powers_A
+        )
     
     Gf = len(idx_groups_all)
     Kf = min(10, (Gf * (Gf - 1)) // 2) if required_count is None else min(10, E_norm_all.shape[1] * (E_norm_all.shape[1] - 1) // 2)
