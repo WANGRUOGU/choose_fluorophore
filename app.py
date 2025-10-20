@@ -20,7 +20,7 @@ st.set_page_config(page_title="Choose Fluorophore", layout="wide")
 
 # --- Logo (optional) ---
 LOGO_PATH = "assets/lab logo.jpg"
-st.sidebar.image(LOGO_PATH, use_container_width=True)
+st.sidebar.image(LOGO_PATH, use_container_width=180)
 
 DYES_YAML = "data/dyes.yaml"
 PROBE_MAP_YAML = "data/probe_fluor_map.yaml"
