@@ -179,20 +179,25 @@ def _interp_at(w, y, x):
 
 def derive_powers_simultaneous(wl, dye_db, selection_labels, laser_wavelengths):
     """
-    Your B-leveling rule for simultaneous firing:
-    - Find first informative segment (with any emission).
-    - Set its power to 1 and define B as max(ex(l)*QY*EC * peak_in_segment) across selected dyes.
-    - For later segments, choose minimal nonnegative power so segment peaks do not exceed B
-      when summed with contributions from earlier lasers (cumulative within segment).
-    Returns (powers_sorted, B).
+    Simultaneous firing with 'useful-segment gating':
+      - A segment [lam[i], lam[i+1]) is 'useful' iff at least one selected dye has its
+        global emission peak located inside that segment. Otherwise set P[i]=0 and skip it.
+      - Among useful segments, find the first one in wavelength order; set its power=1 and
+        define B = max_i( seg_peak_i * coef_i(lam[start]) ).
+      - For each subsequent useful segment s, choose the smallest nonnegative P[s] so that
+        the segment's peak does not exceed B when adding cumulative contributions from all
+        lasers with indices <= s (inside that segment we sum coefficients of all m<=s).
+    Returns (powers_sorted_by_wavelength, B).
     """
     lam = np.array(sorted(laser_wavelengths), dtype=float)
     segs = _segments_from_lasers(wl, lam)
     W = len(wl)
 
+    # Selected dye records
     fls = [s.split(" – ", 1)[1] for s in selection_labels]
     recs = [dye_db[f] for f in fls if f in dye_db]
 
+    # Helper: excitation*QY*EC at laser l (nearest-grid)
     def coef(rec, l):
         ex = rec["excitation"]; qy = rec["quantum_yield"]; ec = rec["extinction_coeff"]
         if ex is None or len(ex) != W or qy is None or ec is None:
@@ -200,52 +205,78 @@ def derive_powers_simultaneous(wl, dye_db, selection_labels, laser_wavelengths):
         idx = _nearest_idx_from_grid(wl, l)
         return float(ex[idx] * qy * (ec if ec is not None else 1.0))
 
+    # Helper: peak emission inside [lo,hi)
     def seg_peak(rec, lo, hi):
         em = rec["emission"]
         if em is None or len(em) != W:
             return 0.0
         loi = _nearest_idx_from_grid(wl, lo)
-        hii = _nearest_idx_from_grid(wl, hi-1) + 1
+        hii = _nearest_idx_from_grid(wl, hi - 1) + 1
         if loi >= hii:
             return 0.0
         return float(np.max(em[loi:hii]))
 
-    # find first informative segment
+    # ---- decide which segments are 'useful' by global emission peak location ----
+    useful = [False] * len(segs)
+    # precompute each dye's global-peak wavelength
+    for rec in recs:
+        em = rec.get("emission", None)
+        if em is None or len(em) != W:
+            continue
+        jmax = int(np.argmax(em))  # if ties, first max is fine
+        lam_peak = wl[jmax]
+        # mark the segment containing lam_peak
+        for s, (lo, hi) in enumerate(segs):
+            if lo <= lam_peak < hi:
+                useful[s] = True
+                break
+
+    # if none useful, trivial
+    if not any(useful):
+        return [0.0] * len(lam), 0.0
+
+    # ---- find first useful segment and initialize B ----
     start = None
-    for s, (lo, hi) in enumerate(segs):
-        ok = any(seg_peak(r, lo, hi) > 0 for r in recs)
-        if ok:
+    for s, u in enumerate(useful):
+        if u:
             start = s
             break
-    if start is None:
-        return [1.0] * len(lam), 0.0
 
-    P = np.zeros(len(lam))
+    P = np.zeros(len(lam), dtype=float)
     P[start] = 1.0
 
-    lo, hi = segs[start]
-    M = np.array([seg_peak(r, lo, hi) for r in recs])
-    a = np.array([coef(r, lam[start]) for r in recs])
-    B = float(np.max(a * M)) if np.any(M > 0) else 0.0
+    lo0, hi0 = segs[start]
+    M0 = np.array([seg_peak(r, lo0, hi0) for r in recs])
+    a0 = np.array([coef(r, lam[start]) for r in recs])
+    B = float(np.max(a0 * M0)) if np.any(M0 > 0) else 0.0
 
-    # forward segments: cumulative effect inside each segment
-    for s in range(start+1, len(lam)):
+    # ---- march forward over later segments ----
+    for s in range(start + 1, len(lam)):
+        if not useful[s]:
+            P[s] = 0.0
+            continue
         lo, hi = segs[s]
         M = np.array([seg_peak(r, lo, hi) for r in recs])
         c_s = np.array([coef(r, lam[s]) for r in recs])
-        # contribution from earlier lasers
+
+        # cumulative contribution from earlier lasers (only those we kept)
         pre = np.zeros(len(recs))
         for m in range(start, s):
+            if P[m] <= 0.0:
+                continue
             c_m = np.array([coef(r, lam[m]) for r in recs])
             pre += c_m * P[m]
+
         feasible = (M > 0) & (c_s > 0)
         if not np.any(feasible):
             P[s] = 0.0
         else:
+            # ensure: (pre + c_s*P[s]) * M <= B  =>  P[s] <= B/(M*c_s) - pre/c_s
             bounds = (B / (M[feasible] * c_s[feasible])) - (pre[feasible] / c_s[feasible])
             P[s] = max(0.0, float(np.min(bounds)))
 
     return [float(x) for x in P], float(B)
+
 
 
 def derive_powers_separate(wl, dye_db, selection_labels, laser_wavelengths):
