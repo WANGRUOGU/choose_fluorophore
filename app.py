@@ -62,16 +62,16 @@ if mode == "Emission + Excitation + Brightness":
              "Separate: per-laser scaled to the same B, spectra concatenated horizontally."
     )
     preset = st.sidebar.radio(
-        "Lasers", options=("405/448/561/639", "Custom"),
+        "Lasers", options=("405/488/561/639", "Custom"),
         help="Use preset or define your wavelengths."
     )
-    if preset == "405/448/561/639":
-        laser_list = [405, 448, 561, 639]
-        st.sidebar.caption("Using lasers: 405, 448, 561, 639 nm")
+    if preset == "405/488/561/639":
+        laser_list = [405, 488, 561, 639]
+        st.sidebar.caption("Using lasers: 405, 488, 561, 639 nm")
     else:
         n = st.sidebar.number_input("Number of lasers", 1, 8, 4, 1)
         cols = st.sidebar.columns(2)
-        default_seeds = [405, 448, 561, 639]
+        default_seeds = [405, 488, 561, 639]
         lasers = []
         for i in range(n):
             lam = cols[i % 2].number_input(
