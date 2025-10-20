@@ -65,17 +65,18 @@ if mode == "Emission + Excitation + Brightness":
         "Lasers", options=("405/448/561/639", "Custom"),
         help="Use preset or define your wavelengths."
     )
-    if preset == "405/448/561/639 (preset)":
+    if preset == "405/448/561/639":
         laser_list = [405, 448, 561, 639]
         st.sidebar.caption("Using lasers: 405, 448, 561, 639 nm")
     else:
-        n = st.sidebar.number_input("Number of lasers", 1, 8, 3, 1)
+        n = st.sidebar.number_input("Number of lasers", 1, 8, 4, 1)
         cols = st.sidebar.columns(2)
+        default_seeds = [405, 448, 561, 639]
         lasers = []
         for i in range(n):
             lam = cols[i % 2].number_input(
                 f"Laser {i+1} (nm)", int(wl.min()), int(wl.max()),
-                [488, 561, 639][i] if i < 3 else int(wl.min()), 1
+                default_seeds[i] if i < len(default_seeds) else int(wl.min()), 1
             )
             lasers.append(int(lam))
         laser_list = lasers
@@ -85,7 +86,7 @@ k_show = st.sidebar.slider(
     min_value=5, max_value=50, value=10, step=1,
 )
 
-# New: choose selection source
+# Choose selection source
 source_mode = st.sidebar.radio(
     "Selection source",
     options=("By probes", "From readout pool"),
@@ -199,8 +200,13 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
             st.stop()
 
         # Strict lexicographic optimization (K = min(10, #pairs))
-        G = len(idx_groups)
-        K = min(10, (G * (G - 1)) // 2) if required_count is None else min(10, E_norm.shape[1] * (E_norm.shape[1] - 1) // 2)
+        if required_count is None:
+            G = len(idx_groups)
+            K = min(10, (G * (G - 1)) // 2)
+        else:
+            N = E_norm.shape[1]
+            K = min(10, N * (N - 1) // 2)
+
         sel_idx, _ = solve_lexicographic_k(
             E_norm, idx_groups, labels_pair,
             levels=K, enforce_unique=True,
@@ -255,60 +261,58 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
             st.error("Please specify laser wavelengths.")
             st.stop()
 
-        # --- Round A: emission-only for a provisional selection (used just to get an initial power guess) ---
+        # --- Round A: emission-only for a provisional selection (initial power guess) ---
         E0_norm, labels0, idx0 = build_emission_only_matrix(wl, dye_db, groups)
-        G0 = len(idx0)
-        K0 = min(10, (G0 * (G0 - 1)) // 2) if required_count is None else min(10, E0_norm.shape[1] * (E0_norm.shape[1] - 1) // 2)
+        if required_count is None:
+            G0 = len(idx0)
+            K0 = min(10, (G0 * (G0 - 1)) // 2)
+        else:
+            N0 = E0_norm.shape[1]
+            K0 = min(10, N0 * (N0 - 1) // 2)
+
         sel0, _ = solve_lexicographic_k(
             E0_norm, idx0, labels0,
             levels=K0, enforce_unique=True,
             required_count=required_count
         )
         A_labels = [labels0[j] for j in sel0]
-        
-        # --- (1) Calibrate powers on A (as before) ---
+
+        # (1) Calibrate powers on A
         if laser_strategy == "Simultaneous":
             powers_A, B_A = derive_powers_simultaneous(wl, dye_db, A_labels, laser_list)
         else:
             powers_A, B_A = derive_powers_separate(wl, dye_db, A_labels, laser_list)
-        
-        # --- Build effective spectra for ALL candidates with powers_A, then select ---
+
+        # Build effective spectra with powers_A, then select
         E_raw_all, E_norm_all, labels_all, idx_groups_all = build_effective_with_lasers(
             wl, dye_db, groups, laser_list, laser_strategy, powers_A
         )
-        
-        Gf = len(idx_groups_all)
-    Kf = min(10, (Gf * (Gf - 1)) // 2) if required_count is None else min(10, E_norm_all.shape[1] * (E_norm_all.shape[1] - 1) // 2)
-    sel_idx, _ = solve_lexicographic_k(
-        E_norm_all, idx_groups_all, labels_all,
-        levels=Kf, enforce_unique=True,
-        required_count=required_count
-    )
-    
-    # --- (2) Recalibrate powers on the FINAL selection (THIS fixes your case) ---
-    final_labels = [labels_all[j] for j in sel_idx]
-    if laser_strategy == "Simultaneous":
-        powers, B = derive_powers_simultaneous(wl, dye_db, final_labels, laser_list)
-    else:
-        powers, B = derive_powers_separate(wl, dye_db, final_labels, laser_list)
-    
-    # --- Rebuild effective spectra with FINAL powers for display/metrics ---
-    E_raw_all, E_norm_all, labels_all, idx_groups_all = build_effective_with_lasers(
-        wl, dye_db, groups, laser_list, laser_strategy, powers
-    )
-    
-    # 下面的“Selected Fluorophores / Laser powers / Top pairwise / Spectra viewer”
-    # 全部继续用 E_norm_all、E_raw_all、powers、B 即可（不需要再改其它逻辑）
+        if required_count is None:
+            Gf = len(idx_groups_all)
+            Kf = min(10, (Gf * (Gf - 1)) // 2)
+        else:
+            Nf = E_norm_all.shape[1]
+            Kf = min(10, Nf * (Nf - 1) // 2)
 
-        # Round B: lexicographic optimization on effective spectra
-        Gf = len(idx_groups_all)
-        Kf = min(10, (Gf * (Gf - 1)) // 2) if required_count is None else min(10, E_norm_all.shape[1] * (E_norm_all.shape[1] - 1) // 2)
         sel_idx, _ = solve_lexicographic_k(
             E_norm_all, idx_groups_all, labels_all,
             levels=Kf, enforce_unique=True,
             required_count=required_count
         )
 
+        # (2) Recalibrate powers on the FINAL selection (fixes the 561/639 case)
+        final_labels = [labels_all[j] for j in sel_idx]
+        if laser_strategy == "Simultaneous":
+            powers, B = derive_powers_simultaneous(wl, dye_db, final_labels, laser_list)
+        else:
+            powers, B = derive_powers_separate(wl, dye_db, final_labels, laser_list)
+
+        # Rebuild effective spectra with FINAL powers for display/metrics
+        E_raw_all, E_norm_all, labels_all, idx_groups_all = build_effective_with_lasers(
+            wl, dye_db, groups, laser_list, laser_strategy, powers
+        )
+
+        # ----- Display -----
         # Selected Fluorophores
         if use_pool:
             chosen_fluors = [labels_all[j].split(" – ", 1)[1] for j in sel_idx]
@@ -331,8 +335,7 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
         prel = (p / (maxp + 1e-12)).tolist()
         st.subheader("Laser powers (relative)")
         html_two_row_table("Laser (nm)", "Relative power",
-                           lam_sorted, [float(f"{v:.6g}") for v in prel],
-                           color_second_row=False, format_second_row=False)
+                           lam_sorted, [float(f"{v:.6g}") for v in prel])
 
         # Top pairwise similarities
         S = cosine_similarity_matrix(E_norm_all[:, sel_idx])
