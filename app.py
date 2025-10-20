@@ -20,15 +20,7 @@ st.set_page_config(page_title="Choose Fluorophore", layout="wide")
 
 # --- Logo (optional) ---
 LOGO_PATH = "assets/lab logo.jpg"
-if os.path.exists(LOGO_PATH):
-    # 顶部居中显示
-    _c1, _c2, _c3 = st.columns([1, 2, 1])
-    with _c2:
-        st.image(LOGO_PATH, use_column_width=True)
-    # 侧边栏也放一份（自适应宽度）
-    st.sidebar.image(LOGO_PATH, use_column_width=True)
-else:
-    st.sidebar.info("Logo file not found: assets/lab logo.jpg")
+st.sidebar.image(LOGO_PATH, use_column_width=True)
 
 DYES_YAML = "data/dyes.yaml"
 PROBE_MAP_YAML = "data/probe_fluor_map.yaml"
