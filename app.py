@@ -45,17 +45,17 @@ st.sidebar.header("Configuration")
 
 mode = st.sidebar.radio(
     "Mode",
-    options=("Emission only", "Emission + Excitation + Brightness"),
+    options=("Emission spectra", "Predicted spectra"),
     help=(
-        "Emission only: peak-normalized emission, optimize by cosine.\n\n"
-        "Emission + Excitation + Brightness: build effective spectra with lasers "
+        "Emission spectra: peak-normalized emission, optimize by cosine.\n\n"
+        "Predicted spectra: build effective spectra with lasers "
         "using excitation · QY · EC, then optimize by cosine on those effective spectra."
     ),
 )
 
 laser_strategy = None
 laser_list = []
-if mode == "Emission + Excitation + Brightness":
+if mode == "Predicted spectra":
     laser_strategy = st.sidebar.radio(
         "Laser usage", options=("Simultaneous", "Separate"),
         help="Simultaneous: cumulative within wavelength segments (B-leveling). "
@@ -192,7 +192,7 @@ else:
 def run_selection_and_display(groups, mode, laser_strategy, laser_list):
     required_count = (N_pick if use_pool else None)
 
-    if mode == "Emission only":
+    if mode == "Emission spectra":
         # Build emission-only matrix
         E_norm, labels_pair, idx_groups = build_emission_only_matrix(wl, dye_db, groups)
         if E_norm.shape[1] == 0:
