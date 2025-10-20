@@ -276,8 +276,8 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
         E_raw_all, E_norm_all, labels_all, idx_groups_all = build_effective_with_lasers(
             wl, dye_db, groups, laser_list, laser_strategy, powers_A
         )
-    
-    Gf = len(idx_groups_all)
+        
+        Gf = len(idx_groups_all)
     Kf = min(10, (Gf * (Gf - 1)) // 2) if required_count is None else min(10, E_norm_all.shape[1] * (E_norm_all.shape[1] - 1) // 2)
     sel_idx, _ = solve_lexicographic_k(
         E_norm_all, idx_groups_all, labels_all,
