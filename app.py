@@ -706,7 +706,7 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
             )
         st.plotly_chart(fig, use_container_width=True)
 
-        # --- Rod simulation & unmix (Poisson) ---
+                # --- Rod simulation & unmix (Poisson) ---
         C = 23
         start_nm = 494.0
         step_nm = 8.9
@@ -721,28 +721,28 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
         R = E.shape[1]
         colors = _ensure_colors(R)
 
+        # 取当前选择顺序对应的 fluor 名字（不要排序）
+        fluor_names = [labels_all[j].split(" – ", 1)[1] for j in sel_idx]
+
+        # 1（真值合成）+ R（每个 fluor 的 NLS 彩色图），标题用真实名字
         imgs = []
         true_rgb = colorize_composite(Atrue, colors)
         imgs.append(("True (composite)", (true_rgb * 255).astype(np.uint8)))
-        for r in range(R):
+        for r, name in enumerate(fluor_names):
             rgb_r = colorize_single_channel(Ahat[:, :, r], colors[r])
-            imgs.append((f"NLS (Fluor #{r+1})", (rgb_r * 255).astype(np.uint8)))
+            imgs.append((f"NLS ({name})", (rgb_r * 255).astype(np.uint8)))
 
         cols = st.columns(len(imgs))
         for i, (title, im) in enumerate(imgs):
             with cols[i]:
                 st.image(im, use_container_width=True)
                 st.caption(title)
-        # legend: fluor name -> color
-        if use_pool:
-            fluor_names = sorted([labels_pair[j].split(" – ", 1)[1] for j in sel_idx]) if (mode=="Emission spectra") else \
-                          sorted([labels_all[j].split(" – ", 1)[1] for j in sel_idx])
-        else:
-            fluor_names = [s.split(" – ", 1)[1] for s in ( [labels_pair[j] for j in sel_idx] if mode=="Emission spectra" else [labels_all[j] for j in sel_idx] )]
-        
+
+        # 图例（名字 ↔ 颜色）
         render_color_legend(fluor_names, colors)
 
         st.caption(f"Overall RMSE (Ahat vs Atrue): {rmse_all:.4f}")
+
 
 # Execute
 run_selection_and_display(groups, mode, laser_strategy, laser_list)
