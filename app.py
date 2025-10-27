@@ -358,9 +358,14 @@ def generate_synthetic_images(E, cells_ds, n_images=3, rng=None, noise_db=None):
                 res = sample_noise_per_channel(T[:, :, c], edges, qs, Q[:, c, :], rng)
                 T[:, :, c] = T[:, :, c] + res
 
+                # clamp -> contrast stretch to [0,1] per image
         T = np.maximum(T, 0.0)
-        T_list.append(T)
-        A_list.append(A)
+        T = T - T.min()
+        T = T / (T.max() + 1e-12)
+
+        T_list.append(T.astype(float))
+        A_list.append(A.astype(float))
+
     return T_list, A_list
 
 def nls_unmix(T, E, iters=400, tol=1e-8, verbose=False):
@@ -549,6 +554,7 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
                 A_hat = nls_unmix(T, E, iters=400, tol=1e-8, verbose=False)
                 rmse = compute_rmse(A_hat, A_true)
                 rgb = colorize_dominant(A_hat, COLORS)
+                rgb = rgb / (rgb.max() + 1e-12)
                 for c in range(R):
                     with cols[c]:
                         st.image((rgb*255).astype(np.uint8), caption=f"RMSE={rmse:.4f}", use_container_width=True)
@@ -762,6 +768,7 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
                 A_hat = nls_unmix(T, E, iters=400, tol=1e-8, verbose=False)
                 rmse = compute_rmse(A_hat, A_true)
                 rgb = colorize_dominant(A_hat, COLORS)
+                rgb = rgb / (rgb.max() + 1e-12)
                 for c in range(R):
                     with cols[c]:
                         st.image((rgb*255).astype(np.uint8), caption=f"RMSE={rmse:.4f}", use_container_width=True)
