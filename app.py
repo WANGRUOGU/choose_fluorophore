@@ -228,8 +228,8 @@ def _place_rods_scene(H, W, R, rods_per=3, max_tries=200, rng=None):
     occ = np.zeros((H, W), dtype=bool)
 
     # sizes (square frame; lengths/widths kept reasonable)
-    L_min, L_max = 40, 80
-    W_min, W_max = 10, 18
+    L_min, L_max = 28, 56   # shorter rods
+    W_min, W_max = 9, 15
 
     for r in range(R):
         placed, tries = 0, 0
@@ -258,6 +258,37 @@ def _place_rods_scene(H, W, R, rods_per=3, max_tries=200, rng=None):
     # small softening to avoid “hard edge”
     Atrue = np.clip(Atrue, 0.0, 1.0)
     return Atrue
+def colorize_composite(A, colors, pctl=99.5, gamma=0.8):
+    """
+    A: (H,W,R) abundance ground-truth 或估计
+    colors: (R,3) in [0,1]
+    Return: (H,W,3) 彩色合成图（各通道按颜色叠加）
+    """
+    H, W, R = A.shape
+    rgb = np.zeros((H, W, 3), dtype=float)
+    for r in range(R):
+        ar = np.clip(A[:, :, r], 0.0, 1.0)
+        rgb += ar[:, :, None] * colors[r][None, None, :]
+    # 简单 tone-map
+    p = float(np.percentile(rgb, pctl))
+    if p > 1e-8:
+        rgb = np.clip(rgb / p, 0.0, 1.0)
+    rgb = np.power(rgb, gamma)
+    return rgb
+
+def colorize_single_channel(A_r, color, pctl=99.5, gamma=0.8):
+    """
+    A_r: (H,W) 单一 fluor 的丰度图
+    color: (3,) in [0,1]
+    Return: (H,W,3) 用同一颜色着色的伪彩图
+    """
+    z = np.clip(A_r, 0.0, 1.0)
+    p = float(np.percentile(z, pctl))
+    if p > 1e-8:
+        z = np.clip(z / p, 0.0, 1.0)
+    z = np.power(z, gamma)
+    rgb = z[:, :, None] * np.asarray(color)[None, None, :]
+    return rgb
 
 def add_poisson_noise_per_channel(Tclean, peak=255, rng=None):
     """
@@ -445,16 +476,31 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
         E = interpolate_E_on_channels(wl, E_sel, chan_centers)  # (C, R)
 
         st.subheader("Rod-shaped cells: ground-truth vs. NLS unmixing (Poisson noise)")
-        Atrue, Ahat, rmse_all = simulate_rods_and_unmix(
+                Atrue, Ahat, rmse_all = simulate_rods_and_unmix(
             E=E, H=256, W=256, rods_per=3, rng=np.random.default_rng(2025)
         )
         R = E.shape[1]
+        colors = _ensure_colors(R)
+
+        # 生成 1（真值合成）+ R（每个 fluor 的 NLS 彩色图）共 R+1 张图
+        imgs = []
+        # #1: 真实合成图（四种颜色叠加，12 个细胞）
+        true_rgb = colorize_composite(Atrue, colors)
+        imgs.append(("True (composite)", (true_rgb * 255).astype(np.uint8)))
+
+        # #2..R+1: 每个 fluor 的 NLS 丰度，保持与真值一致的颜色
         for r in range(R):
-            colT, colH = st.columns(2)
-            with colT:
-                st.image(_to_uint8_gray(Atrue[:, :, r]), caption=f"True abundance (Fluor #{r+1})", use_container_width=True)
-            with colH:
-                st.image(_to_uint8_gray(Ahat[:, :, r]), caption=f"NLS abundance (Fluor #{r+1})", use_container_width=True)
+            rgb_r = colorize_single_channel(Ahat[:, :, r], colors[r])
+            imgs.append((f"NLS (Fluor #{r+1})", (rgb_r * 255).astype(np.uint8)))
+
+        # 横向排布（第一张是真值合成，之后依次是每个 fluor）
+        cols = st.columns(len(imgs))
+        for i, (title, im) in enumerate(imgs):
+            with cols[i]:
+                st.image(im, use_container_width=True)
+                st.caption(title)
+
+        # 单次全图 RMSE（Ahat vs Atrue）
         st.caption(f"Overall RMSE (Ahat vs Atrue): {rmse_all:.4f}")
 
     else:
@@ -622,17 +668,33 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
         E = interpolate_E_on_channels(wl, E_sel, chan_centers)  # (C, R)
 
         st.subheader("Rod-shaped cells: ground-truth vs. NLS unmixing (Poisson noise)")
-        Atrue, Ahat, rmse_all = simulate_rods_and_unmix(
+                Atrue, Ahat, rmse_all = simulate_rods_and_unmix(
             E=E, H=256, W=256, rods_per=3, rng=np.random.default_rng(2025)
         )
         R = E.shape[1]
+        colors = _ensure_colors(R)
+
+        # 生成 1（真值合成）+ R（每个 fluor 的 NLS 彩色图）共 R+1 张图
+        imgs = []
+        # #1: 真实合成图（四种颜色叠加，12 个细胞）
+        true_rgb = colorize_composite(Atrue, colors)
+        imgs.append(("True (composite)", (true_rgb * 255).astype(np.uint8)))
+
+        # #2..R+1: 每个 fluor 的 NLS 丰度，保持与真值一致的颜色
         for r in range(R):
-            colT, colH = st.columns(2)
-            with colT:
-                st.image(_to_uint8_gray(Atrue[:, :, r]), caption=f"True abundance (Fluor #{r+1})", use_container_width=True)
-            with colH:
-                st.image(_to_uint8_gray(Ahat[:, :, r]), caption=f"NLS abundance (Fluor #{r+1})", use_container_width=True)
+            rgb_r = colorize_single_channel(Ahat[:, :, r], colors[r])
+            imgs.append((f"NLS (Fluor #{r+1})", (rgb_r * 255).astype(np.uint8)))
+
+        # 横向排布（第一张是真值合成，之后依次是每个 fluor）
+        cols = st.columns(len(imgs))
+        for i, (title, im) in enumerate(imgs):
+            with cols[i]:
+                st.image(im, use_container_width=True)
+                st.caption(title)
+
+        # 单次全图 RMSE（Ahat vs Atrue）
         st.caption(f"Overall RMSE (Ahat vs Atrue): {rmse_all:.4f}")
+
 
 # Execute
 run_selection_and_display(groups, mode, laser_strategy, laser_list)
