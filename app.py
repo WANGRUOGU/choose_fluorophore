@@ -477,8 +477,8 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
 
         st.subheader("Rod-shaped cells: ground-truth vs. NLS unmixing (Poisson noise)")
                 Atrue, Ahat, rmse_all = simulate_rods_and_unmix(
-            E=E, H=256, W=256, rods_per=3, rng=np.random.default_rng(2025)
-        )
+                    E=E, H=256, W=256, rods_per=3, rng=np.random.default_rng(2025)
+                )
         R = E.shape[1]
         colors = _ensure_colors(R)
 
@@ -669,8 +669,8 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
 
         st.subheader("Rod-shaped cells: ground-truth vs. NLS unmixing (Poisson noise)")
                 Atrue, Ahat, rmse_all = simulate_rods_and_unmix(
-            E=E, H=256, W=256, rods_per=3, rng=np.random.default_rng(2025)
-        )
+                    E=E, H=256, W=256, rods_per=3, rng=np.random.default_rng(2025)
+                )
         R = E.shape[1]
         colors = _ensure_colors(R)
 
