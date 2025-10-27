@@ -356,27 +356,27 @@ def _to_uint8_gray(img2d):
     z = np.power(z, 0.8)
     return (z * 255.0).astype(np.uint8)
 
-def colorize_composite(A, colors, pctl=99.5, gamma=0.8):
-    """Composite RGB from abundance stack A(H,W,R) and colors(R,3)."""
+def colorize_composite(A, colors):
+    """线性渲染：每张图按自身最大值缩放到 [0,1]，无分位数 / 无 gamma。"""
     H, W, R = A.shape
     rgb = np.zeros((H, W, 3), dtype=float)
     for r in range(R):
         ar = np.clip(A[:, :, r], 0.0, 1.0)
         rgb += ar[:, :, None] * colors[r][None, None, :]
-    p = float(np.percentile(rgb, pctl))
-    if p > 1e-8:
-        rgb = np.clip(rgb / p, 0.0, 1.0)
-    rgb = np.power(rgb, gamma)
+    m = float(rgb.max())
+    if m > 0:
+        rgb = rgb / m
     return rgb
 
-def colorize_single_channel(A_r, color, pctl=99.0, gamma=0.9):
+def colorize_single_channel(A_r, color):
+    """线性渲染：通道按自身最大值缩放到 [0,1]，无分位数 / 无 gamma。"""
     z = np.clip(A_r, 0.0, 1.0)
-    p = float(np.percentile(z, pctl))
-    if p > 1e-8:
-        z = np.clip(z / p, 0.0, 1.0)
-    z = np.power(z, gamma)
+    m = float(z.max())
+    if m > 0:
+        z = z / m
     rgb = z[:, :, None] * np.asarray(color)[None, None, :]
     return rgb
+
 
 def render_color_legend(names, colors):
     cells = []
