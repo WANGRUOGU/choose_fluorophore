@@ -284,24 +284,39 @@ def _place_rods_scene(H, W, R, rods_per=3, max_tries=200, rng=None):
 def add_poisson_noise_per_channel(Tclean, peak=255, rng=None):
     """
     For each channel:
-      - scale so max -> peak
-      - sample Y ~ Poisson(X_scaled)
+      - clamp Tclean >= 0  (eliminate tiny negatives)
+      - scale so per-channel max -> peak
+      - sanitize lambda: remove NaN/Inf, clip to a safe upper bound
+      - sample Y ~ Poisson(lambda)
       - scale back by /peak
     """
     rng = np.random.default_rng() if rng is None else rng
     H, W, C = Tclean.shape
     Tnoisy = np.empty_like(Tclean, dtype=float)
+
+    # 全局先防御性截断一次，避免极小负值
+    Tclean = np.clip(Tclean, 0.0, None)
+
     for c in range(C):
         img = Tclean[:, :, c]
         m = float(np.max(img))
-        if m <= 0:
+        if not np.isfinite(m) or m <= 0.0:
+            # 该通道全零或非有限，直接置零
             Tnoisy[:, :, c] = 0.0
             continue
+
         scale = peak / m
-        lam = img * scale
+        lam = img * scale  # 保证理论上 <= peak
+
+        # 修复 NaN/Inf 与极小负值
+        lam = np.nan_to_num(lam, nan=0.0, posinf=float(peak), neginf=0.0)
+        lam = np.clip(lam, 0.0, 1e6)  # 上界安全阈值，防意外放大
+
         counts = rng.poisson(lam).astype(float)
         Tnoisy[:, :, c] = counts / peak
+
     return Tnoisy
+
 
 def nls_unmix(Timg, E, iters=10_000, tol=1e-8, verbose=False):
     """
