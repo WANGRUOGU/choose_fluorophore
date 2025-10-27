@@ -611,6 +611,31 @@ def generate_synthetic_images(E, cells_ds, n_images, rng, noise_db):
         T_list.append(T.astype(float))
         A_list.append(A_true.astype(float))
     return T_list, A_list
+def _ensure_colors(R):
+    """Return an (R,3) color table in [0,1]. Extend DEFAULT_COLORS if needed."""
+    base = DEFAULT_COLORS
+    if R <= base.shape[0]:
+        return base[:R]
+    # extend by HSV evenly
+    extra = R - base.shape[0]
+    hs = np.linspace(0, 1, extra, endpoint=False)
+    ext = np.stack([np.abs(np.sin(2*np.pi*hs))*0.7+0.3,
+                    np.abs(np.sin(2*np.pi*(hs+0.33)))*0.7+0.3,
+                    np.abs(np.sin(2*np.pi*(hs+0.66)))*0.7+0.3], axis=1)
+    out = np.vstack([base, ext])
+    return out[:R]
+
+def _pad_to_square(img_hw3, value=0.0):
+    """Pad an HxWx3 image to square (largest side) without distorting content."""
+    H, W, _ = img_hw3.shape
+    S = max(H, W)
+    pad_top = (S - H) // 2
+    pad_bottom = S - H - pad_top
+    pad_left = (S - W) // 2
+    pad_right = S - W - pad_left
+    return np.pad(img_hw3,
+                  ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)),
+                  mode="constant", constant_values=value)
 
 def simulate_and_unmix_block(
     wl, sel_idx, labels, E_source, spectra_mode, B=None,
@@ -648,12 +673,30 @@ def simulate_and_unmix_block(
         A_hat = nls_unmix(T, E, iters=400, tol=1e-8, verbose=False)
         rmse = compute_rmse(A_hat, A_true)
 
+        # 颜色：严格按 R 个来（你选了 4 个就用 4 种）
+        COLORS = _ensure_colors(R)
+        
         rgb = colorize_dominant(A_hat, COLORS).reshape(T.shape[0], T.shape[1], 3)
-        # ensure visible
-        rgb = rgb / (rgb.max() + 1e-12)
+        
+        # ---- 可视化增强：更激进的亮度提升 ----
+        # 1) 高分位拉伸（99%）
+        p = float(np.percentile(rgb, 99.0))
+        if p > 1e-8:
+            rgb = np.clip(rgb / p, 0.0, 1.0)
+        
+        # 2) 伽马校正（更亮一点）
+        gamma = 0.7
+        rgb = np.power(np.clip(rgb, 0.0, 1.0), gamma)
+        
+        # 3) 微弱抬底，避免纯黑背景吞细节
+        rgb = np.clip(rgb + 0.03, 0.0, 1.0)
+        
+        # 4) 显示前“填充为正方形”
+        rgb_sq = _pad_to_square(rgb, value=0.0)
+        
+        st.image((rgb_sq * 255).astype(np.uint8), use_container_width=True)
+        st.caption(f"RMSE = {rmse:.4f} | R = {R}")
 
-        st.image((rgb * 255).astype(np.uint8), use_container_width=True)
-        st.caption(f"RMSE = {rmse:.4f}")
 
 # ==============================
 # Core run
