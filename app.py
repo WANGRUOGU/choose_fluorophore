@@ -229,7 +229,7 @@ def _place_rods_scene(H,W,R,rods_per=3,rng=None):
     occ = np.zeros((H,W), dtype=bool)
     # smaller rods → faster & clearer
     Lmin,Lmax = 18, 36
-    Wmin,Wmax = 6, 10
+    Wmin,Wmax = 12, 20
     for r in range(R):
         placed = 0; tries = 0
         while placed < rods_per and tries < 200:
