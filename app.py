@@ -137,29 +137,44 @@ def cached_interpolate_E_on_channels(wl,spectra_cols,chan_centers_nm):
     return np.nan_to_num(E, nan=0.0, posinf=0.0, neginf=0.0)
 
 # -------------------- NLS + color --------------------
-def nls_unmix(Timg,E,iters=2000,tol=1e-6):
+def nls_unmix(Timg, E, iters=2000, tol=1e-6):
     """Fast NMF-like MU with pixelwise normalization; expects Timg(H,W,C), E(C,R)."""
-    H,W,C = Timg.shape
+    H, W, C = Timg.shape
     E = np.asarray(E, dtype=np.float32)
     if E.ndim != 2 or E.shape[0] != C:
         raise ValueError(f"E shape {E.shape} mismatch with Timg channels {C}")
+
     M = Timg.reshape(-1, C).astype(np.float32, copy=False)
-    scale = np.sqrt(np.mean(M**2, axis=1, keepdims=True)); scale[scale<=0]=1.0
-    Mn = M/scale
+
+    # 像素归一
+    scale = np.sqrt(np.mean(M**2, axis=1, keepdims=True))
+    scale[scale <= 0] = 1.0
+    Mn = M / scale
+
+    # 预计算
     EtE = E.T @ E
-    A = Mn @ np.linalg.pinv(EtE) @ E.T
-    A[A<0]=0
+
+    # ✅ 正确的最小二乘初始化：A0 = Mn @ E @ (EᵀE)⁻¹
+    A = Mn @ E @ np.linalg.pinv(EtE)
+    A[A < 0] = 0
+
+    # 乘法更新
     for _ in range(iters):
         numer = Mn @ E
         denom = (A @ EtE) + 1e-12
         A *= numer / denom
-        # 早停：相对改进很小则退出（简单近似）
-        if np.max(numer/ (denom+1e-12)) < 1 + tol:
+        # 简单早停
+        if np.max(numer / (denom + 1e-12)) < 1 + tol:
             break
+
+    # 复原并归一
     A *= scale
     mA = float(np.max(A))
-    if mA>0: A /= mA
-    return A.reshape(H,W,E.shape[1])
+    if mA > 0:
+        A /= mA
+
+    return A.reshape(H, W, E.shape[1])
+
 
 def colorize_single(A_r,color):
     z=np.clip(A_r,0,1); m=float(z.max())
