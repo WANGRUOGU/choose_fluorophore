@@ -5,3 +5,4 @@ plotly
 ortools
 pyyaml
 pulp
+h5py
