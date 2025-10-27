@@ -143,13 +143,22 @@ def cached_build_effective_with_lasers(wl, dye_db, groups, laser_list, laser_str
     return build_effective_with_lasers(wl, dye_db, groups, laser_list, laser_strategy, powers)
 
 @st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False)
 def cached_interpolate_E_on_channels(wl, spectra_cols, chan_centers_nm):
+    # 强制把输入转成 float 的 2D 数组（防止 object/ragged）
+    spectra_cols = np.asarray(spectra_cols, dtype=float)
+    if spectra_cols.ndim == 1:
+        spectra_cols = spectra_cols[:, None]  # (W,) -> (W,1)
     W, N = spectra_cols.shape
     E = np.zeros((len(chan_centers_nm), N), dtype=float)
     for j in range(N):
         y = spectra_cols[:, j]
-        E[:, j] = np.interp(chan_centers_nm, wl, y, left=y[0], right=y[-1])
+        E[:, j] = np.interp(chan_centers_nm, wl, y, left=float(y[0]), right=float(y[-1]))
+    # 去 NaN/Inf
+    if not np.isfinite(E).all():
+        E = np.nan_to_num(E, nan=0.0, posinf=0.0, neginf=0.0)
     return E
+
 
 # -------------------- Imaging & NLS --------------------
 def add_poisson_noise(Tclean, peak=255, mode="per_channel", rng=None):
@@ -177,7 +186,17 @@ def add_poisson_noise(Tclean, peak=255, mode="per_channel", rng=None):
     return out
 
 def nls_unmix(Timg, E, EtE=None, iters=3000, tol=1e-6, verbose=False, dtype=np.float32):
-    # reshape
+    # --- sanitize E ---
+    if E is None:
+        raise ValueError("nls_unmix: E is None.")
+    E = np.array(E, dtype=dtype, copy=False)  # 强制成致密 float 数组
+    if E.ndim != 2 or E.size == 0:
+        raise ValueError(f"nls_unmix: E must be 2D non-empty, got shape {getattr(E,'shape',None)}.")
+    # 处理 NaN/Inf
+    if not np.isfinite(E).all():
+        E = np.nan_to_num(E, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # --- reshape M ---
     if Timg.ndim == 3:
         H, W, C = Timg.shape
         M = Timg.reshape(-1, C).astype(dtype, copy=False)
@@ -185,18 +204,25 @@ def nls_unmix(Timg, E, EtE=None, iters=3000, tol=1e-6, verbose=False, dtype=np.f
     else:
         M = np.asarray(Timg, dtype=dtype, copy=False)
         back = None
-    E = np.asarray(E, dtype=dtype, copy=False)
-    if EtE is None:
-        EtE = (E.T @ E).astype(dtype, copy=False)
+    if M.ndim != 2 or M.shape[1] != E.shape[0]:
+        raise ValueError(f"nls_unmix: M has shape {M.shape}, E has shape {E.shape}; "
+                         f"expected M[:,C] with C == E.shape[0].")
 
     # pixel-wise normalize
     scale = np.sqrt(np.mean(M**2, axis=1, keepdims=True))
     scale[scale <= 0] = 1.0
     Mn = M / scale
 
+    # EtE
+    if EtE is None:
+        EtE = (E.T @ E).astype(dtype, copy=False)
+    else:
+        EtE = np.asarray(EtE, dtype=dtype, copy=False)
+
     # pinv init
-    pinv = np.linalg.pinv(EtE).astype(dtype, copy=False) @ E.T
-    A = (Mn @ pinv.T)
+    # 用稳定的伪逆：pinv_E = (E^T E)^+ E^T
+    pinv_EtE = np.linalg.pinv(EtE).astype(dtype, copy=False)
+    A = (Mn @ (pinv_EtE @ E.T).T)
     A[A < 0] = 0
 
     # MU updates
@@ -213,10 +239,14 @@ def nls_unmix(Timg, E, EtE=None, iters=3000, tol=1e-6, verbose=False, dtype=np.f
     # rescale & normalize
     A *= scale
     mA = float(np.max(A))
-    if mA > 0: A /= mA
+    if mA > 0:
+        A /= mA
+
     if back is not None:
-        H, W = back; return A.reshape(H, W, E.shape[1])
+        H, W = back
+        return A.reshape(H, W, E.shape[1])
     return A
+
 
 def simulate_rods_and_unmix(E, H=192, W=192, rods_per=3, rng=None, noise_mode="per_channel"):
     rng = np.random.default_rng() if rng is None else rng
