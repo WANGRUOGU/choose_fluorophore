@@ -3,6 +3,7 @@ import numpy as np
 import plotly.graph_objects as go
 import yaml
 import os
+import h5py  # NEW: for H5 datasets (cells & noise)
 
 from utils import (
     load_dyes_yaml,
@@ -20,11 +21,38 @@ st.set_page_config(page_title="Choose Fluorophore", layout="wide")
 
 # --- Logo (optional) ---
 LOGO_PATH = "assets/lab logo.jpg"
-st.sidebar.image(LOGO_PATH, use_container_width=1)
+if os.path.exists(LOGO_PATH):
+    st.sidebar.image(LOGO_PATH, use_container_width=True)
 
 DYES_YAML = "data/dyes.yaml"
 PROBE_MAP_YAML = "data/probe_fluor_map.yaml"
 READOUT_POOL_YAML = "data/readout_fluorophores.yaml"  # optional pool file
+
+# ===== Channel wavelengths (23 bands, ~8.9 nm step) =====
+CHANNEL_WL = np.array([
+    494, 503, 512, 521, 530, 539, 548, 557, 566, 575, 583, 592,
+    601, 610, 619, 628, 637, 646, 655, 664, 673, 681, 690
+], dtype=float)
+
+# ===== H5 datasets for synthetic generation =====
+CELL_H5_PATH  = "assets/cell_abundance_singleF.h5"   # /cells: (N,Ht,Wt), /labels: (N,)
+NOISE_H5_PATH = "assets/noise_quantiles.h5"          # /edges:(B+1,), /qs:(nq,), /Q:(B,C,nq)
+
+@st.cache_resource(show_spinner=False)
+def load_cell_db(path=CELL_H5_PATH):
+    f = h5py.File(path, "r")
+    cells  = f["/cells"]            # H5 dataset view (lazy)
+    labels = f["/labels"][:].astype(str)
+    meta   = {k: f["/meta/"+k][()] for k in f["/meta"].keys()}
+    return f, cells, labels, meta
+
+@st.cache_resource(show_spinner=False)
+def load_noise_db(path=NOISE_H5_PATH):
+    f = h5py.File(path, "r")
+    edges = f["/edges"][:]
+    qs    = f["/qs"][:]
+    Q     = f["/Q"][:]             # (B, C, nq)
+    return f, edges, qs, Q
 
 # ---------- Data loading ----------
 wl, dye_db = load_dyes_yaml(DYES_YAML)
@@ -42,7 +70,6 @@ def load_readout_pool(path):
     return pool
 
 readout_pool = load_readout_pool(READOUT_POOL_YAML)
-
 
 # ---------- Sidebar ----------
 st.sidebar.header("Configuration")
@@ -96,7 +123,6 @@ source_mode = st.sidebar.radio(
     options=("By probes", "From readout pool"),
     help="Pick per-probe, or directly select N fluorophores from the readout pool."
 )
-
 
 # ---------- Tiny 2-row HTML table (no header/index) ----------
 def html_two_row_table(row0_label, row1_label, row0_vals, row1_vals,
@@ -160,6 +186,137 @@ def only_fluor_pair(a: str, b: str) -> str:
     fb = b.split(" – ", 1)[1]
     return f"{fa} vs {fb}"
 
+# ---------- Simulation helpers (NEW) ----------
+def resample_spectrum_to_channels(wl_grid, y, channel_wl=CHANNEL_WL):
+    """Linear interpolate y(wl_grid) to channel centers."""
+    y = np.asarray(y, dtype=float)
+    wl = np.asarray(wl_grid, dtype=float)
+    return np.interp(channel_wl, wl, y, left=y[0], right=y[-1])
+
+def build_E_matrix_from_selected(wl, labels_all, sel_idx, E_source, mode, B=None):
+    """
+    Build CxR mixing matrix by sampling per-dye curves to 23 channels.
+    E_source: emission (Emission spectra) or effective spectra (Predicted) columns.
+    """
+    R = len(sel_idx)
+    C = len(CHANNEL_WL)
+    E = np.zeros((C, R), dtype=float)
+    for k, j in enumerate(sel_idx):
+        y = E_source[:, j]
+        if mode == "Emission spectra":
+            y = y / (np.max(y) + 1e-12)
+        else:
+            y = (y / (float(B) + 1e-12)) if (B is not None) else (y / (np.max(y)+1e-12))
+        E[:, k] = resample_spectrum_to_channels(wl, y, CHANNEL_WL)
+        m = np.max(E[:, k])
+        if m > 0:
+            E[:, k] /= m
+    return E  # C x R
+
+def sample_noise_per_channel(Tc, edges, qs, Qc, rng):
+    """Inverse-CDF sample residuals for one channel given mean image Tc."""
+    H, W = Tc.shape
+    mu = Tc.ravel()
+    Bm1 = len(edges) - 1
+    bins = np.clip(np.digitize(mu, edges[1:-1], right=False), 0, Bm1-1)
+    u = rng.random(mu.shape)
+    noise = np.zeros_like(mu)
+    for b in np.unique(bins):
+        sel = (bins == b)
+        if not np.any(sel): continue
+        qvals = Qc[b, :]  # (nq,)
+        noise[sel] = np.interp(u[sel], qs, qvals, left=qvals[0], right=qvals[-1])
+    return noise.reshape(H, W)
+
+def generate_synthetic_images(E, cells_ds, n_images=3, rng=None, noise_db=None):
+    """
+    E: CxR, cells_ds: (N,Ht,Wt)
+    Return: lists of length n_images: T_list (HxWxC), Atrue_list (HxWxR)
+    """
+    if rng is None:
+        rng = np.random.default_rng(123)
+    N, Ht, Wt = cells_ds.shape
+    C, R = E.shape
+
+    T_list, A_list = [], []
+    for _ in range(n_images):
+        idx = rng.integers(0, N, size=R)
+        A = np.stack([cells_ds[i, :, :] for i in idx], axis=-1)  # HxWxR
+        A = np.maximum(A, 0.0)
+
+        T = np.zeros((Ht, Wt, C), dtype=float)
+        for c in range(C):
+            T[:, :, c] = (A * E[c, :]).sum(axis=-1)
+
+        if noise_db is not None:
+            edges, qs, Q = noise_db
+            for c in range(C):
+                res = sample_noise_per_channel(T[:, :, c], edges, qs, Q[:, c, :], rng)
+                T[:, :, c] = T[:, :, c] + res
+
+        T = np.maximum(T, 0.0)
+        T_list.append(T)
+        A_list.append(A)
+    return T_list, A_list
+
+def nls_unmix(T, E, iters=400, tol=1e-8, verbose=False):
+    """Pixelwise NLS like your MATLAB code (init by normal eq., mult. updates, re-scale, global max-norm)."""
+    H, W, C = T.shape
+    C2, R = E.shape
+    assert C2 == C
+    M = T.reshape(-1, C).astype(float)
+    N = M.shape[0]
+
+    scale = np.sqrt(np.mean(M**2, axis=1, keepdims=True)) + 1e-12
+    M_n = M / scale
+
+    EtE = E.T @ E + 1e-12*np.eye(R)
+    A = (np.linalg.solve(EtE, E.T @ M_n.T)).T
+    A[A < 0] = 0
+
+    num = M_n @ E
+    G = E.T @ E
+    for _ in range(iters):
+        den = (A @ G) + 1e-12
+        A_new = A * (num / den)
+        if np.linalg.norm(A_new - A) / (np.linalg.norm(A) + 1e-12) < tol:
+            A = A_new; break
+        A = A_new
+
+    A = A * scale
+    m = np.max(A) + 1e-12
+    A = A / m
+    return A.reshape(H, W, R)
+
+def colorize_dominant(A, colors):
+    """Colorize by dominant fluor (argmax over R), brightness = max abundance per pixel."""
+    H, W, R = A.shape
+    idx = np.argmax(A, axis=-1)
+    val = np.max(A, axis=-1)
+    rgb = np.zeros((H, W, 3), dtype=float)
+    for r in range(R):
+        mask = (idx == r)
+        if not np.any(mask): continue
+        rgb[mask, 0] = colors[r][0] * val[mask]
+        rgb[mask, 1] = colors[r][1] * val[mask]
+        rgb[mask, 2] = colors[r][2] * val[mask]
+    return np.clip(rgb, 0, 1)
+
+def compute_rmse(A_hat, A_true):
+    return float(np.sqrt(np.mean((A_hat - A_true)**2)))
+
+DEFAULT_COLORS = [
+    (0.121, 0.466, 0.705),
+    (1.000, 0.498, 0.054),
+    (0.172, 0.627, 0.172),
+    (0.839, 0.152, 0.156),
+    (0.580, 0.404, 0.741),
+    (0.549, 0.337, 0.294),
+    (0.890, 0.467, 0.761),
+    (0.498, 0.498, 0.498),
+    (0.737, 0.741, 0.133),
+    (0.090, 0.745, 0.811),
+]
 
 # ---------- Main ----------
 st.title("Fluorophore Selection for Multiplexed Imaging")
@@ -174,7 +331,6 @@ if use_pool:
         st.stop()
     max_n = len(readout_pool)
     N_pick = st.number_input("How many fluorophores to pick", min_value=1, max_value=max_n, value=min(4, max_n), step=1)
-    # Pool mode: one group with all candidates; the optimizer will enforce sum(x)=N
     groups = {"Pool": readout_pool[:]}
 else:
     all_probes = sorted(probe_map.keys())
@@ -190,7 +346,6 @@ else:
     if not groups:
         st.error("No valid candidates with spectra in dyes.yaml for the selected probes.")
         st.stop()
-
 
 # ---------- Core run ----------
 def run_selection_and_display(groups, mode, laser_strategy, laser_list):
@@ -260,6 +415,40 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
         )
         st.plotly_chart(fig, use_container_width=True)
 
+        # ===== Simulate & Unmix (8.9 nm channels) =====
+        st.subheader("Simulate & unmix (8.9 nm channels)")
+        try:
+            f_cells, cells_ds, cells_labels, cell_meta = load_cell_db()
+            f_noise, edges, qs, Q = load_noise_db()
+            have_data = True
+        except Exception as e:
+            have_data = False
+            st.info(f"Cell/noise DB not available: {e}")
+
+        if have_data:
+            # Build E (C×R) from emission curves used above
+            E = build_E_matrix_from_selected(wl, labels_pair, sel_idx, E_source=E_norm, mode="Emission spectra", B=None)
+
+            # Generate three images and unmix
+            T_list, Atrue_list = generate_synthetic_images(
+                E=E, cells_ds=cells_ds, n_images=3,
+                rng=np.random.default_rng(123), noise_db=(edges, qs, Q)
+            )
+
+            R = len(sel_idx)
+            COLORS = DEFAULT_COLORS[:R]
+            cols = st.columns(R)
+
+            for row in range(3):
+                T = T_list[row]
+                A_true = Atrue_list[row]
+                A_hat = nls_unmix(T, E, iters=400, tol=1e-8, verbose=False)
+                rmse = compute_rmse(A_hat, A_true)
+                rgb = colorize_dominant(A_hat, COLORS)
+                for c in range(R):
+                    with cols[c]:
+                        st.image((rgb*255).astype(np.uint8), caption=f"RMSE={rmse:.4f}", use_container_width=True)
+
     else:
         if not laser_list:
             st.error("Please specify laser wavelengths.")
@@ -304,7 +493,7 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
             required_count=required_count
         )
 
-        # (2) Recalibrate powers on the FINAL selection (fixes the 561/639 case)
+        # (2) Recalibrate powers on the FINAL selection
         final_labels = [labels_all[j] for j in sel_idx]
         if laser_strategy == "Simultaneous":
             powers, B = derive_powers_simultaneous(wl, dye_db, final_labels, laser_list)
@@ -358,14 +547,13 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
             lam_sorted = list(sorted(laser_list))
             L = len(lam_sorted)
             Wn = len(wl)
-            gap = 12.0  # visual gap between blocks
+            gap = 12.0
             wl_max_vis = float(min(1000.0, wl[-1]))
             seg_widths = [max(0.0, wl_max_vis - float(l)) for l in lam_sorted]
             offsets, acc = [], 0.0
             for wseg in seg_widths:
                 offsets.append(acc); acc += wseg + gap
 
-            # plot each selected dye across concatenated blocks
             for j in sel_idx:
                 xs_cat, ys_cat = [], []
                 for i, l in enumerate(lam_sorted):
@@ -387,7 +575,6 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
             rights = [offsets[i] + wl_max_vis for i in range(L)]
             mids   = [offsets[i] + (float(lam_sorted[i]) + wl_max_vis) / 2.0 for i in range(L)]
 
-            # white dashed separators (between blocks)
             for i in range(L - 1):
                 if seg_widths[i] <= 0: continue
                 sep_x = rights[i]
@@ -398,7 +585,6 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
                     line=dict(color="white", width=2, dash="dash"),
                     layer="above"
                 )
-            # per-block titles (laser nm)
             for i in range(L):
                 if seg_widths[i] <= 0: continue
                 fig.add_annotation(
@@ -423,7 +609,7 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
                 yaxis=dict(range=[0, 1.05],
                            tickmode="array",
                            tickvals=[0, 0.2, 0.4, 0.6, 0.8, 1.0],
-                           ticktext=["0", "0.2", "0.4", "0.6", "0.8", "1"]),
+                           ticktext=["0", "0.2", "0.4", "0.6", "1"]),
                 margin=dict(t=90)
             )
         else:
@@ -441,6 +627,40 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
             )
         st.plotly_chart(fig, use_container_width=True)
 
+        # ===== Simulate & Unmix (8.9 nm channels) =====
+        st.subheader("Simulate & unmix (8.9 nm channels)")
+        try:
+            f_cells, cells_ds, cells_labels, cell_meta = load_cell_db()
+            f_noise, edges, qs, Q = load_noise_db()
+            have_data = True
+        except Exception as e:
+            have_data = False
+            st.info(f"Cell/noise DB not available: {e}")
+
+        if have_data:
+            # Build E (C×R) from final effective spectra displayed above
+            E = build_E_matrix_from_selected(
+                wl, labels_all, sel_idx, E_source=E_raw_all, mode="Predicted spectra", B=B
+            )
+
+            T_list, Atrue_list = generate_synthetic_images(
+                E=E, cells_ds=cells_ds, n_images=3,
+                rng=np.random.default_rng(123), noise_db=(edges, qs, Q)
+            )
+
+            R = len(sel_idx)
+            COLORS = DEFAULT_COLORS[:R]
+            cols = st.columns(R)
+
+            for row in range(3):
+                T = T_list[row]
+                A_true = Atrue_list[row]
+                A_hat = nls_unmix(T, E, iters=400, tol=1e-8, verbose=False)
+                rmse = compute_rmse(A_hat, A_true)
+                rgb = colorize_dominant(A_hat, COLORS)
+                for c in range(R):
+                    with cols[c]:
+                        st.image((rgb*255).astype(np.uint8), caption=f"RMSE={rmse:.4f}", use_container_width=True)
 
 # Execute
 run_selection_and_display(groups, mode, laser_strategy, laser_list)
