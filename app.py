@@ -251,19 +251,91 @@ def build_E_matrix_from_selected(wl, labels_all, sel_idx, E_source, mode, B=None
     return E  # C x R
 
 def sample_noise_per_channel(Tc, edges, qs, Qc, rng):
-    """Inverse-CDF sample residuals for one channel given mean image Tc."""
+    """
+    Tc: (H,W) target mean image of one channel
+    edges: (B+1,) bin edges (should be ascending)
+    qs: (nq,) quantile levels in [0,1]
+    Qc: (B, nq) quantile table for this channel
+    rng: numpy Generator
+    """
     H, W = Tc.shape
-    mu = Tc.ravel()
-    Bm1 = len(edges) - 1
-    bins = np.clip(np.digitize(mu, edges[1:-1], right=False), 0, Bm1-1)
+    mu = np.asarray(Tc, dtype=float).ravel()
+
+    # ---- sanitize edges ----
+    e = np.asarray(edges, dtype=float).ravel()
+    e = e[np.isfinite(e)]
+    # need at least 2 edges (>= 1 bin)
+    if e.size < 2:
+        # fallback: single bin [0, +inf)
+        e = np.array([0.0, np.inf], dtype=float)
+
+    # enforce ascending & unique
+    e = np.unique(e)
+    if e.size < 2:
+        e = np.array([0.0, np.inf], dtype=float)
+
+    # ---- sanitize qs & align with Qc ----
+    q = np.asarray(qs, dtype=float).ravel()
+    q = q[np.isfinite(q)]
+    # clamp to [0,1]
+    q = np.clip(q, 0.0, 1.0)
+    if q.size < 2:
+        # minimal sane grid
+        q = np.linspace(0, 1, 51, dtype=float)
+
+    Qc = np.asarray(Qc, dtype=float)
+    Bm1 = e.size - 1  # number of bins
+
+    # if Qc shape mismatches bins or nq, try to coerce
+    if Qc.ndim != 2:
+        # fallback: 1 bin, zero noise
+        Qc = np.zeros((Bm1, q.size), dtype=float)
+    else:
+        B_qc, nq_qc = Qc.shape
+        # fix nq mismatch by 1D resampling along quantile axis
+        if nq_qc != q.size:
+            # build a simple linear grid 0..1 for old Qc and interp to new q
+            old_q = np.linspace(0, 1, max(2, nq_qc))
+            Qc = np.interp(q[None, :], old_q[None, :], Qc, left=Qc[:, :1], right=Qc[:, -1])
+
+        # fix bin count mismatch by nearest pad/trim
+        if B_qc != Bm1:
+            if Bm1 < B_qc:
+                Qc = Qc[:Bm1, :]
+            else:
+                pad = np.zeros((Bm1 - B_qc, Qc.shape[1]), dtype=float)
+                # pad with last row
+                if B_qc > 0:
+                    pad[:] = Qc[-1, :]
+                Qc = np.vstack([Qc, pad])
+
+    # ---- digitize ----
+    # Note: np.digitize expects bin edges (strictly monotonic). We pass interior edges only.
+    if e.size <= 2:
+        # only one bin → everything goes to bin 0
+        bins = np.zeros_like(mu, dtype=int)
+    else:
+        bins = np.digitize(mu, e[1:-1], right=False)
+        bins = np.clip(bins, 0, Bm1 - 1)
+
+    # ---- inverse-CDF sampling per bin ----
+    # ensure qs ascending for interp
+    sort_q_idx = np.argsort(q)
+    q_sorted = q[sort_q_idx]
+
     u = rng.random(mu.shape)
     noise = np.zeros_like(mu)
+    # vectorized by unique bins
     for b in np.unique(bins):
         sel = (bins == b)
-        if not np.any(sel): continue
-        qvals = Qc[b, :]  # (nq,)
-        noise[sel] = np.interp(u[sel], qs, qvals, left=qvals[0], right=qvals[-1])
+        if not np.any(sel):
+            continue
+        # reorder row to ascending q
+        qvals = Qc[b, :][sort_q_idx]
+        noise[sel] = np.interp(u[sel], q_sorted, qvals, left=qvals[0], right=qvals[-1])
+
     return noise.reshape(H, W)
+
 
 def generate_synthetic_images(E, cells_ds, n_images=3, rng=None, noise_db=None):
     """
