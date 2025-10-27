@@ -280,6 +280,44 @@ def _place_rods_scene(H, W, R, rods_per=3, max_tries=200, rng=None):
             placed += 1
 
     return np.clip(Atrue, 0.0, 1.0)
+    
+def add_poisson_noise(Tclean, peak=255, mode="per_channel", rng=None):
+    """
+    Tclean: (H,W,C) 非负“绝对”强度张量
+    mode:
+      - "per_channel": 每个通道独立缩放到 peak（原行为）
+      - "global":      全局最大值缩放到 peak（保留染料亮度差异）
+    """
+    rng = np.random.default_rng() if rng is None else rng
+    H, W, C = Tclean.shape
+    Tclean = np.clip(Tclean, 0.0, None)
+    Tnoisy = np.empty_like(Tclean, dtype=float)
+
+    if mode == "global":
+        m = float(np.max(Tclean))
+        if not np.isfinite(m) or m <= 0.0:
+            return np.zeros_like(Tclean, dtype=float)
+        scale_all = peak / m
+        lam = Tclean * scale_all
+        lam = np.nan_to_num(lam, nan=0.0, posinf=float(peak), neginf=0.0)
+        lam = np.clip(lam, 0.0, 1e6)
+        counts = rng.poisson(lam).astype(float)
+        return counts / peak
+
+    # ---- per_channel (保持你原来的行为) ----
+    for c in range(C):
+        img = Tclean[:, :, c]
+        m = float(np.max(img))
+        if not np.isfinite(m) or m <= 0.0:
+            Tnoisy[:, :, c] = 0.0
+            continue
+        scale = peak / m
+        lam = img * scale
+        lam = np.nan_to_num(lam, nan=0.0, posinf=float(peak), neginf=0.0)
+        lam = np.clip(lam, 0.0, 1e6)
+        counts = rng.poisson(lam).astype(float)
+        Tnoisy[:, :, c] = counts / peak
+    return Tnoisy
 
 def add_poisson_noise_per_channel(Tclean, peak=255, rng=None):
     """
@@ -424,35 +462,30 @@ def render_color_legend(names, colors):
     html = "<div style='display:flex;flex-wrap:wrap;align-items:center;'>" + "".join(cells) + "</div>"
     st.markdown(html, unsafe_allow_html=True)
 
-def simulate_rods_and_unmix(E, H=256, W=256, rods_per=3, rng=None):
+def simulate_rods_and_unmix(E, H=256, W=256, rods_per=3, rng=None, noise_mode="per_channel"):
     """
-    Build one mixed image with R*rods_per rods (non-overlapping),
-    add Poisson noise, run NLS, and return maps & overall RMSE.
-    E: (C,R) spectra on 8.9nm grid
-    Returns:
-      Atrue (H,W,R), Ahat (H,W,R), rmse_all (float)
+    E: (C,R) 端元（可以是未归一化的“绝对”有效光谱）
+    noise_mode: "per_channel" 或 "global"（见 add_poisson_noise）
     """
     rng = np.random.default_rng() if rng is None else rng
     C, R = E.shape[0], E.shape[1]
 
-    # 1) rods scene
+    # 1) 生成 rods 真值
     Atrue = _place_rods_scene(H, W, R, rods_per=rods_per, rng=rng)
 
-    # 2) forward render (C channels)
+    # 2) 正向成像（不做列归一化，保持 E 的“绝对”幅度）
     Tclean = np.zeros((H, W, C), dtype=float)
     for c in range(C):
         Tclean[:, :, c] = np.tensordot(Atrue, E[c, :], axes=([2], [0]))
 
-    # 3) Poisson noise per channel
-    Tnoisy = add_poisson_noise_per_channel(Tclean, peak=255, rng=rng)
+    # 3) 加泊松噪声（可全局缩放）
+    Tnoisy = add_poisson_noise(Tclean, peak=255, mode=noise_mode, rng=rng)
 
-    # 4) NLS unmix
-    M = Tnoisy.reshape(-1, C)
-    Ahat = nls_unmix(Tnoisy, E, iters=10000, tol=1e-8)  # 直接传 (H,W,C)
+    # 4) NLS 反演
+    Ahat = nls_unmix(Tnoisy, E, iters=10000, tol=1e-8)
 
-    # 5) overall RMSE
+    # 5) RMSE
     rmse_all = float(np.sqrt(np.mean((Ahat - Atrue) ** 2)))
-
     return Atrue, Ahat, rmse_all
 
 # ---------- Main ----------
@@ -748,12 +781,14 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
         start_nm = 494.0
         step_nm = 8.9
         chan_centers = start_nm + step_nm * np.arange(C)
-        E_sel = E_norm_all[:, sel_idx]
-        E = interpolate_E_on_channels(wl, E_sel, chan_centers)  # (C, R)
+        E_abs = (E_raw_all[:, sel_idx] / (B + 1e-12))   # (Wlen or concat, R)
+        E = interpolate_E_on_channels(wl, E_abs, chan_centers)  # (C, R)
 
         st.subheader("Rod-shaped cells: ground-truth vs. NLS unmixing (Poisson noise)")
         Atrue, Ahat, rmse_all = simulate_rods_and_unmix(
-            E=E, H=256, W=256, rods_per=3, rng=np.random.default_rng(2025)
+            E=E, H=256, W=256, rods_per=3,
+            rng=np.random.default_rng(2025),
+            noise_mode="global"
         )
         R = E.shape[1]
         colors = _ensure_colors(R)
