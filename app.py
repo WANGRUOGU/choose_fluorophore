@@ -184,19 +184,57 @@ def add_poisson_noise(Tclean, peak=255, mode="per_channel", rng=None):
         lam = np.clip(lam, 0.0, 1e6)
         out[:,:,c] = rng.poisson(lam).astype(float) / peak
     return out
+def _ensure_2d_float_matrix(E, target_cols=None, dtype=np.float32):
+    """
+    将任意 E 转成规则 2D 浮点矩阵，去除 NaN/Inf，并在必要时尝试转置以匹配列数=target_cols。
+    参数
+      E: 任意可能是 list/tuple/ndarray（甚至 ragged）的对象
+      target_cols: 目标列数（通常=像素向量的通道数 C = M.shape[1]）
+    返回
+      E2: np.ndarray, dtype=dtype, shape=(*, *)
+    """
+    # 先尝试直接转成 float 数组
+    try:
+        A = np.asarray(E, dtype=dtype)
+    except Exception:
+        # 如果失败，先以 object 读入，再逐列堆叠
+        obj = np.asarray(E, dtype=object)
+        # 处理 1 维 ragged （每个元素是一个列向量）
+        if obj.ndim == 1 and obj.size > 0:
+            cols = [np.asarray(v, dtype=dtype).ravel() for v in obj]
+            # 对齐长度（截短到最短）
+            minlen = min(len(c) for c in cols)
+            if minlen == 0:
+                raise ValueError("Empty columns in E.")
+            A = np.stack([c[:minlen] for c in cols], axis=1)  # (W, N)
+        else:
+            # 尝试逐行堆叠
+            rows = []
+            for v in obj.reshape(-1):
+                vv = np.asarray(v, dtype=dtype).ravel()
+                if vv.size == 0:
+                    continue
+                rows.append(vv)
+            if not rows:
+                raise ValueError("E cannot be coerced to non-empty 2D matrix.")
+            minlen = min(len(r) for r in rows)
+            A = np.stack([r[:minlen] for r in rows], axis=0)
+
+    if A.ndim == 1:
+        A = A[:, None]
+
+    # 去 NaN/Inf
+    if not np.isfinite(A).all():
+        A = np.nan_to_num(A, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # 如果目标列数提供了，但不匹配，尝试一次转置修正
+    if target_cols is not None:
+        if A.shape[1] != target_cols and A.shape[0] == target_cols:
+            A = A.T  # 只转置一次
+    return A.astype(dtype, copy=False)
 
 def nls_unmix(Timg, E, EtE=None, iters=3000, tol=1e-6, verbose=False, dtype=np.float32):
-    # --- sanitize E ---
-    if E is None:
-        raise ValueError("nls_unmix: E is None.")
-    E = np.array(E, dtype=dtype, copy=False)  # 强制成致密 float 数组
-    if E.ndim != 2 or E.size == 0:
-        raise ValueError(f"nls_unmix: E must be 2D non-empty, got shape {getattr(E,'shape',None)}.")
-    # 处理 NaN/Inf
-    if not np.isfinite(E).all():
-        E = np.nan_to_num(E, nan=0.0, posinf=0.0, neginf=0.0)
-
-    # --- reshape M ---
+    # 统一处理 Timg -> M
     if Timg.ndim == 3:
         H, W, C = Timg.shape
         M = Timg.reshape(-1, C).astype(dtype, copy=False)
@@ -204,30 +242,35 @@ def nls_unmix(Timg, E, EtE=None, iters=3000, tol=1e-6, verbose=False, dtype=np.f
     else:
         M = np.asarray(Timg, dtype=dtype, copy=False)
         back = None
-    if M.ndim != 2 or M.shape[1] != E.shape[0]:
-        raise ValueError(f"nls_unmix: M has shape {M.shape}, E has shape {E.shape}; "
-                         f"expected M[:,C] with C == E.shape[0].")
+        if M.ndim != 2:
+            raise ValueError(f"nls_unmix: Timg must be (H,W,C) or (Npix,C), got {M.shape}")
 
-    # pixel-wise normalize
+    C = M.shape[1]  # 通道数
+
+    # 强力整形 E，确保是 (C, R)
+    E = _ensure_2d_float_matrix(E, target_cols=C, dtype=dtype)
+    if E.ndim != 2 or E.shape[0] != C:
+        raise ValueError(f"nls_unmix: E bad shape {E.shape}; expected (C={C}, R).")
+
+    # 像素归一
     scale = np.sqrt(np.mean(M**2, axis=1, keepdims=True))
     scale[scale <= 0] = 1.0
     Mn = M / scale
 
-    # EtE
+    # 预备 (E^T E)
     if EtE is None:
         EtE = (E.T @ E).astype(dtype, copy=False)
     else:
         EtE = np.asarray(EtE, dtype=dtype, copy=False)
 
-    # pinv init
-    # 用稳定的伪逆：pinv_E = (E^T E)^+ E^T
+    # 伪逆初始化 A0 = Mn pinv(E)
     pinv_EtE = np.linalg.pinv(EtE).astype(dtype, copy=False)
     A = (Mn @ (pinv_EtE @ E.T).T)
     A[A < 0] = 0
 
-    # MU updates
+    # 乘法更新
     fit = np.linalg.norm(Mn - A @ E.T, 'fro')
-    for i in range(iters):
+    for _ in range(iters):
         fit_old = fit
         numer = Mn @ E
         denom = (A @ EtE) + 1e-12
@@ -236,7 +279,7 @@ def nls_unmix(Timg, E, EtE=None, iters=3000, tol=1e-6, verbose=False, dtype=np.f
         if abs(fit_old - fit) / (fit_old + 1e-12) < tol or np.isnan(fit):
             break
 
-    # rescale & normalize
+    # 复原 & 全局标准化到 [0,1]
     A *= scale
     mA = float(np.max(A))
     if mA > 0:
@@ -248,9 +291,16 @@ def nls_unmix(Timg, E, EtE=None, iters=3000, tol=1e-6, verbose=False, dtype=np.f
     return A
 
 
+
 def simulate_rods_and_unmix(E, H=192, W=192, rods_per=3, rng=None, noise_mode="per_channel"):
     rng = np.random.default_rng() if rng is None else rng
+
+    # 兜底：把 E 强制成 2D float；若列数=R，后续按 (C,R) 使用
+    E = _ensure_2d_float_matrix(E, dtype=np.float32)
+    if E.ndim != 2:
+        raise ValueError(f"simulate_rods_and_unmix: E must be 2D, got {E.shape}")
     C, R = E.shape
+
 
     # rods GT (简单快速：随机不重叠小圆片 + 线性渐变核)
     Atrue = np.zeros((H, W, R), dtype=np.float32)
