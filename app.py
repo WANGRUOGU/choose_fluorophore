@@ -19,7 +19,7 @@ from utils import (
 
 st.set_page_config(page_title="Choose Fluorophore", layout="wide")
 
-# --- Optional logo ---
+# --- Optional logo in sidebar ---
 LOGO_PATH = "assets/lab logo.jpg"
 if os.path.exists(LOGO_PATH):
     st.sidebar.image(LOGO_PATH, use_container_width=True)
@@ -29,7 +29,7 @@ DYES_YAML = "data/dyes.yaml"
 PROBE_MAP_YAML = "data/probe_fluor_map.yaml"
 READOUT_POOL_YAML = "data/readout_fluorophores.yaml"
 
-# ---------- Load core data ----------
+# ---------- Load data ----------
 wl, dye_db = load_dyes_yaml(DYES_YAML)
 probe_map = load_probe_fluor_map(PROBE_MAP_YAML)
 
@@ -90,7 +90,7 @@ source_mode = st.sidebar.radio(
     help="Pick per-probe, or directly select N fluorophores from the readout pool."
 )
 
-# ---------- Tiny 2-row HTML table ----------
+# ---------- Small HTML 2-row table ----------
 def html_two_row_table(row0_label, row1_label, row0_vals, row1_vals,
                        color_second_row=False, color_thresh=0.9,
                        format_second_row=False):
@@ -152,12 +152,12 @@ def only_fluor_pair(a: str, b: str) -> str:
     fb = b.split(" – ", 1)[1]
     return f"{fa} vs {fb}"
 
-# ---------- Spectra -> channelized E (8.9 nm) ----------
+# ---------- Spectra -> 8.9nm channel grid ----------
 def interpolate_E_on_channels(wl, spectra_cols, chan_centers_nm):
     """
-    wl: (W,) nm grid of dyes.yaml
-    spectra_cols: (W,N) columns of spectra (emission-normalized or effective)
-    chan_centers_nm: (C,) channel center wavelengths (nm)
+    wl: (W,) nm grid
+    spectra_cols: (W,N)
+    chan_centers_nm: (C,)
     Return E: (C,N)
     """
     W, N = spectra_cols.shape
@@ -167,7 +167,7 @@ def interpolate_E_on_channels(wl, spectra_cols, chan_centers_nm):
         E[:, j] = np.interp(chan_centers_nm, wl, y, left=y[0], right=y[-1])
     return E
 
-# ---------- Rod synthesis & Poisson noise ----------
+# ---------- Rod synthesis + Poisson noise + NLS ----------
 DEFAULT_COLORS = np.array([
     [0.95, 0.25, 0.25],
     [0.25, 0.65, 0.95],
@@ -191,8 +191,8 @@ def _ensure_colors(R):
 def _capsule_profile(H, W, cx, cy, length, width, theta_rad):
     """
     Capsule (rounded rectangle) with intensity decaying from centerline to boundary:
-      - rect segment: val = 1 - |yp|/r
-      - endcaps:      val = 1 - rho/r
+      - rectangle: 1 - |yp|/r
+      - endcaps:   1 - rho/r
     """
     yy, xx = np.mgrid[0:H, 0:W].astype(float)
     X = xx - cx
@@ -204,11 +204,9 @@ def _capsule_profile(H, W, cx, cy, length, width, theta_rad):
     half_L = 0.5 * length
     r = 0.5 * width
 
-    # rectangular mid segment
     rect_mask = (np.abs(xp) <= half_L) & (np.abs(yp) <= r)
     rect_val = np.clip(1.0 - np.abs(yp) / (r + 1e-12), 0.0, 1.0)
 
-    # endcaps (left/right)
     rhoL = np.sqrt((xp + half_L) ** 2 + yp ** 2)
     rhoR = np.sqrt((xp - half_L) ** 2 + yp ** 2)
     capL_mask = rhoL <= r
@@ -223,12 +221,15 @@ def _capsule_profile(H, W, cx, cy, length, width, theta_rad):
     return val, (rect_mask | capL_mask | capR_mask)
 
 def _place_rods_scene(H, W, R, rods_per=3, max_tries=200, rng=None):
+    """
+    Place non-overlapping rods (shorter, E. coli-like), each per class.
+    """
     rng = np.random.default_rng() if rng is None else rng
     Atrue = np.zeros((H, W, R), dtype=float)
     occ = np.zeros((H, W), dtype=bool)
 
-    # sizes (square frame; lengths/widths kept reasonable)
-    L_min, L_max = 28, 56   # shorter rods
+    # shorter rods (more E. coli-like)
+    L_min, L_max = 28, 56
     W_min, W_max = 9, 15
 
     for r in range(R):
@@ -245,57 +246,25 @@ def _place_rods_scene(H, W, R, rods_per=3, max_tries=200, rng=None):
             cy = int(rng.integers(margin, H - margin))
 
             prof, mask = _capsule_profile(H, W, cx, cy, length, width, theta)
-            if not np.any(mask):      continue
-            if np.any(occ & mask):    continue
+            if not np.any(mask):
+                continue
+            if np.any(occ & mask):
+                continue
 
-            # normalize per-rod to [0,1], then add
             if prof.max() > 0:
                 prof = prof / prof.max()
-            Atrue[:, :, r] = np.maximum(Atrue[:, :, r], prof)  # no overlap inside same fluor
+            Atrue[:, :, r] = np.maximum(Atrue[:, :, r], prof)
             occ |= mask
             placed += 1
 
-    # small softening to avoid “hard edge”
-    Atrue = np.clip(Atrue, 0.0, 1.0)
-    return Atrue
-def colorize_composite(A, colors, pctl=99.5, gamma=0.8):
-    """
-    A: (H,W,R) abundance ground-truth 或估计
-    colors: (R,3) in [0,1]
-    Return: (H,W,3) 彩色合成图（各通道按颜色叠加）
-    """
-    H, W, R = A.shape
-    rgb = np.zeros((H, W, 3), dtype=float)
-    for r in range(R):
-        ar = np.clip(A[:, :, r], 0.0, 1.0)
-        rgb += ar[:, :, None] * colors[r][None, None, :]
-    # 简单 tone-map
-    p = float(np.percentile(rgb, pctl))
-    if p > 1e-8:
-        rgb = np.clip(rgb / p, 0.0, 1.0)
-    rgb = np.power(rgb, gamma)
-    return rgb
-
-def colorize_single_channel(A_r, color, pctl=99.5, gamma=0.8):
-    """
-    A_r: (H,W) 单一 fluor 的丰度图
-    color: (3,) in [0,1]
-    Return: (H,W,3) 用同一颜色着色的伪彩图
-    """
-    z = np.clip(A_r, 0.0, 1.0)
-    p = float(np.percentile(z, pctl))
-    if p > 1e-8:
-        z = np.clip(z / p, 0.0, 1.0)
-    z = np.power(z, gamma)
-    rgb = z[:, :, None] * np.asarray(color)[None, None, :]
-    return rgb
+    return np.clip(Atrue, 0.0, 1.0)
 
 def add_poisson_noise_per_channel(Tclean, peak=255, rng=None):
     """
     For each channel:
-      - scale so its max -> peak (e.g., 255)
-      - sample Y ~ Poisson(X_scaled) per pixel
-      - scale back to [0,1] by /peak
+      - scale so max -> peak
+      - sample Y ~ Poisson(X_scaled)
+      - scale back by /peak
     """
     rng = np.random.default_rng() if rng is None else rng
     H, W, C = Tclean.shape
@@ -314,7 +283,7 @@ def add_poisson_noise_per_channel(Tclean, peak=255, rng=None):
 
 def nls_unmix(T, E, iters=2000, tol=1e-7):
     """
-    Nonnegative least squares via multiplicative updates.
+    Nonnegative LS via multiplicative updates.
     T: (Npix,C), E: (C,R)
     """
     M = T
@@ -340,8 +309,31 @@ def _to_uint8_gray(img2d):
     if p <= 1e-8:
         return np.zeros_like(img2d, dtype=np.uint8)
     z = np.clip(img2d / p, 0.0, 1.0)
-    z = np.power(z, 0.8)  # slight gamma
+    z = np.power(z, 0.8)
     return (z * 255.0).astype(np.uint8)
+
+def colorize_composite(A, colors, pctl=99.5, gamma=0.8):
+    """Composite RGB from abundance stack A(H,W,R) and colors(R,3)."""
+    H, W, R = A.shape
+    rgb = np.zeros((H, W, 3), dtype=float)
+    for r in range(R):
+        ar = np.clip(A[:, :, r], 0.0, 1.0)
+        rgb += ar[:, :, None] * colors[r][None, None, :]
+    p = float(np.percentile(rgb, pctl))
+    if p > 1e-8:
+        rgb = np.clip(rgb / p, 0.0, 1.0)
+    rgb = np.power(rgb, gamma)
+    return rgb
+
+def colorize_single_channel(A_r, color, pctl=99.5, gamma=0.8):
+    """Pseudo-color a single abundance map A_r(H,W) with a given color(3,)."""
+    z = np.clip(A_r, 0.0, 1.0)
+    p = float(np.percentile(z, pctl))
+    if p > 1e-8:
+        z = np.clip(z / p, 0.0, 1.0)
+    z = np.power(z, gamma)
+    rgb = z[:, :, None] * np.asarray(color)[None, None, :]
+    return rgb
 
 def simulate_rods_and_unmix(E, H=256, W=256, rods_per=3, rng=None):
     """
@@ -354,22 +346,22 @@ def simulate_rods_and_unmix(E, H=256, W=256, rods_per=3, rng=None):
     rng = np.random.default_rng() if rng is None else rng
     C, R = E.shape[0], E.shape[1]
 
-    # 1) rods scene (square)
+    # 1) rods scene
     Atrue = _place_rods_scene(H, W, R, rods_per=rods_per, rng=rng)
 
-    # 2) forward (C channels)
+    # 2) forward render (C channels)
     Tclean = np.zeros((H, W, C), dtype=float)
     for c in range(C):
         Tclean[:, :, c] = np.tensordot(Atrue, E[c, :], axes=([2], [0]))
 
-    # 3) Poisson noise (per-channel peak=255)
+    # 3) Poisson noise per channel
     Tnoisy = add_poisson_noise_per_channel(Tclean, peak=255, rng=rng)
 
-    # 4) NLS unmix on the single mixed image
+    # 4) NLS unmix
     M = Tnoisy.reshape(-1, C)
     Ahat = nls_unmix(M, E).reshape(H, W, R)
 
-    # 5) Overall RMSE across all entries
+    # 5) overall RMSE
     rmse_all = float(np.sqrt(np.mean((Ahat - Atrue) ** 2)))
 
     return Atrue, Ahat, rmse_all
@@ -408,12 +400,13 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
     required_count = (N_pick if use_pool else None)
 
     if mode == "Emission spectra":
+        # Build emission-only matrix
         E_norm, labels_pair, idx_groups = build_emission_only_matrix(wl, dye_db, groups)
         if E_norm.shape[1] == 0:
             st.error("No spectra available for optimization.")
             st.stop()
 
-        # Strict lexicographic: K = min(10, #pairs)
+        # Strict lexicographic (K=min(10,#pairs))
         if required_count is None:
             G = len(idx_groups); K = min(10, (G * (G - 1)) // 2)
         else:
@@ -439,7 +432,7 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
             st.subheader("Selected Fluorophores")
             html_two_row_table("Probe", "Fluorophore", probes, fluors)
 
-        # Similarities
+        # Pairwise similarities
         S = cosine_similarity_matrix(E_norm[:, sel_idx])
         sub_labels = [labels_pair[j] for j in sel_idx]
         tops = top_k_pairwise(S, sub_labels, k=k_show)
@@ -449,7 +442,7 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
         html_two_row_table("Pair", "Similarity", pairs, sims,
                            color_second_row=True, color_thresh=0.9, format_second_row=True)
 
-        # Spectra viewer (normalized 0–1)
+        # Spectra viewer (normalize traces to 0–1)
         st.subheader("Spectra viewer")
         fig = go.Figure()
         for j in sel_idx:
@@ -476,31 +469,26 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
         E = interpolate_E_on_channels(wl, E_sel, chan_centers)  # (C, R)
 
         st.subheader("Rod-shaped cells: ground-truth vs. NLS unmixing (Poisson noise)")
-                Atrue, Ahat, rmse_all = simulate_rods_and_unmix(
-                    E=E, H=256, W=256, rods_per=3, rng=np.random.default_rng(2025)
-                )
+        Atrue, Ahat, rmse_all = simulate_rods_and_unmix(
+            E=E, H=256, W=256, rods_per=3, rng=np.random.default_rng(2025)
+        )
         R = E.shape[1]
         colors = _ensure_colors(R)
 
-        # 生成 1（真值合成）+ R（每个 fluor 的 NLS 彩色图）共 R+1 张图
+        # 1 (true composite) + R (per-fluor NLS)
         imgs = []
-        # #1: 真实合成图（四种颜色叠加，12 个细胞）
         true_rgb = colorize_composite(Atrue, colors)
         imgs.append(("True (composite)", (true_rgb * 255).astype(np.uint8)))
-
-        # #2..R+1: 每个 fluor 的 NLS 丰度，保持与真值一致的颜色
         for r in range(R):
             rgb_r = colorize_single_channel(Ahat[:, :, r], colors[r])
             imgs.append((f"NLS (Fluor #{r+1})", (rgb_r * 255).astype(np.uint8)))
 
-        # 横向排布（第一张是真值合成，之后依次是每个 fluor）
         cols = st.columns(len(imgs))
         for i, (title, im) in enumerate(imgs):
             with cols[i]:
                 st.image(im, use_container_width=True)
                 st.caption(title)
 
-        # 单次全图 RMSE（Ahat vs Atrue）
         st.caption(f"Overall RMSE (Ahat vs Atrue): {rmse_all:.4f}")
 
     else:
@@ -576,7 +564,7 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
         html_two_row_table("Laser (nm)", "Relative power",
                            lam_sorted, [float(f"{v:.6g}") for v in prel])
 
-        # Similarities
+        # Pairwise similarities
         S = cosine_similarity_matrix(E_norm_all[:, sel_idx])
         sub_labels = [labels_all[j] for j in sel_idx]
         tops = top_k_pairwise(S, sub_labels, k=k_show)
@@ -668,33 +656,26 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
         E = interpolate_E_on_channels(wl, E_sel, chan_centers)  # (C, R)
 
         st.subheader("Rod-shaped cells: ground-truth vs. NLS unmixing (Poisson noise)")
-                Atrue, Ahat, rmse_all = simulate_rods_and_unmix(
-                    E=E, H=256, W=256, rods_per=3, rng=np.random.default_rng(2025)
-                )
+        Atrue, Ahat, rmse_all = simulate_rods_and_unmix(
+            E=E, H=256, W=256, rods_per=3, rng=np.random.default_rng(2025)
+        )
         R = E.shape[1]
         colors = _ensure_colors(R)
 
-        # 生成 1（真值合成）+ R（每个 fluor 的 NLS 彩色图）共 R+1 张图
         imgs = []
-        # #1: 真实合成图（四种颜色叠加，12 个细胞）
         true_rgb = colorize_composite(Atrue, colors)
         imgs.append(("True (composite)", (true_rgb * 255).astype(np.uint8)))
-
-        # #2..R+1: 每个 fluor 的 NLS 丰度，保持与真值一致的颜色
         for r in range(R):
             rgb_r = colorize_single_channel(Ahat[:, :, r], colors[r])
             imgs.append((f"NLS (Fluor #{r+1})", (rgb_r * 255).astype(np.uint8)))
 
-        # 横向排布（第一张是真值合成，之后依次是每个 fluor）
         cols = st.columns(len(imgs))
         for i, (title, im) in enumerate(imgs):
             with cols[i]:
                 st.image(im, use_container_width=True)
                 st.caption(title)
 
-        # 单次全图 RMSE（Ahat vs Atrue）
         st.caption(f"Overall RMSE (Ahat vs Atrue): {rmse_all:.4f}")
-
 
 # Execute
 run_selection_and_display(groups, mode, laser_strategy, laser_list)
