@@ -39,10 +39,7 @@ def try_show_sidebar_logo(paths):
                 st.sidebar.image(img, use_container_width=True)
                 return
             except UnidentifiedImageError:
-                # file exists but not a valid image — try next candidate
                 continue
-    # If none worked, just skip (no error)
-    # st.sidebar.caption(" ")  # (optional) keep some spacing
 
 try_show_sidebar_logo(LOGO_CANDIDATES)
 
@@ -210,6 +207,10 @@ def _ensure_colors(R):
                       np.abs(np.sin(2*np.pi*(hs+0.66)))*0.7+0.3], axis=1)
     return extra[:R]
 
+def _rgb01_to_plotly(col):
+    r, g, b = (int(255*col[0]), int(255*col[1]), int(255*col[2]))
+    return f"rgb({r},{g},{b})"
+
 def _capsule_profile(H, W, cx, cy, length, width, theta_rad):
     """
     Capsule (rounded rectangle) with intensity decaying from centerline to boundary:
@@ -250,7 +251,7 @@ def _place_rods_scene(H, W, R, rods_per=3, max_tries=200, rng=None):
     Atrue = np.zeros((H, W, R), dtype=float)
     occ = np.zeros((H, W), dtype=bool)
 
-    # shorter rods (more E. coli-like)
+    # shorter rods
     L_min, L_max = 28, 56
     W_min, W_max = 9, 15
 
@@ -280,31 +281,13 @@ def _place_rods_scene(H, W, R, rods_per=3, max_tries=200, rng=None):
             placed += 1
 
     return np.clip(Atrue, 0.0, 1.0)
-    
-def add_poisson_noise(Tclean, peak=255, mode="per_channel", rng=None):
-    """
-    Tclean: (H,W,C) 非负“绝对”强度张量
-    mode:
-      - "per_channel": 每个通道独立缩放到 peak（原行为）
-      - "global":      全局最大值缩放到 peak（保留染料亮度差异）
-    """
+
+# ---- 原有逐通道噪声（保留以备需要） ----
+def add_poisson_noise_per_channel(Tclean, peak=255, rng=None):
     rng = np.random.default_rng() if rng is None else rng
     H, W, C = Tclean.shape
-    Tclean = np.clip(Tclean, 0.0, None)
     Tnoisy = np.empty_like(Tclean, dtype=float)
-
-    if mode == "global":
-        m = float(np.max(Tclean))
-        if not np.isfinite(m) or m <= 0.0:
-            return np.zeros_like(Tclean, dtype=float)
-        scale_all = peak / m
-        lam = Tclean * scale_all
-        lam = np.nan_to_num(lam, nan=0.0, posinf=float(peak), neginf=0.0)
-        lam = np.clip(lam, 0.0, 1e6)
-        counts = rng.poisson(lam).astype(float)
-        return counts / peak
-
-    # ---- per_channel (保持你原来的行为) ----
+    Tclean = np.clip(Tclean, 0.0, None)
     for c in range(C):
         img = Tclean[:, :, c]
         m = float(np.max(img))
@@ -319,59 +302,35 @@ def add_poisson_noise(Tclean, peak=255, mode="per_channel", rng=None):
         Tnoisy[:, :, c] = counts / peak
     return Tnoisy
 
-def add_poisson_noise_per_channel(Tclean, peak=255, rng=None):
+# ---- 新：支持“global / per_channel”两种缩放模式 ----
+def add_poisson_noise(Tclean, peak=255, mode="per_channel", rng=None):
     """
-    For each channel:
-      - clamp Tclean >= 0  (eliminate tiny negatives)
-      - scale so per-channel max -> peak
-      - sanitize lambda: remove NaN/Inf, clip to a safe upper bound
-      - sample Y ~ Poisson(lambda)
-      - scale back by /peak
+    Tclean: (H,W,C) 非负“绝对”强度
+    mode:
+      - "per_channel": 每通道独立缩放到 peak
+      - "global":      全局最大值缩放到 peak（保留染料间亮度差）
     """
     rng = np.random.default_rng() if rng is None else rng
-    H, W, C = Tclean.shape
-    Tnoisy = np.empty_like(Tclean, dtype=float)
-
-    # 全局先防御性截断一次，避免极小负值
     Tclean = np.clip(Tclean, 0.0, None)
 
-    for c in range(C):
-        img = Tclean[:, :, c]
-        m = float(np.max(img))
+    if mode == "global":
+        m = float(np.max(Tclean))
         if not np.isfinite(m) or m <= 0.0:
-            # 该通道全零或非有限，直接置零
-            Tnoisy[:, :, c] = 0.0
-            continue
-
-        scale = peak / m
-        lam = img * scale  # 保证理论上 <= peak
-
-        # 修复 NaN/Inf 与极小负值
+            return np.zeros_like(Tclean, dtype=float)
+        scale_all = peak / m
+        lam = Tclean * scale_all
         lam = np.nan_to_num(lam, nan=0.0, posinf=float(peak), neginf=0.0)
-        lam = np.clip(lam, 0.0, 1e6)  # 上界安全阈值，防意外放大
-
+        lam = np.clip(lam, 0.0, 1e6)
         counts = rng.poisson(lam).astype(float)
-        Tnoisy[:, :, c] = counts / peak
+        return counts / peak
 
-    return Tnoisy
-
+    # fallback: per_channel（与旧函数一致）
+    return add_poisson_noise_per_channel(Tclean, peak=peak, rng=rng)
 
 def nls_unmix(Timg, E, iters=10_000, tol=1e-8, verbose=False):
     """
-    MATLAB NLS (your code) faithful port:
-      - if T is 3D, reshape to (Npix, C)
-      - pixel-wise normalization by scale = sqrt(mean(M.^2, 2))
-      - A = pinv(E)*M, A<0 -> 0
-      - multiplicative updates: A = A .* (M*E) ./ (A*(E.'*E))
-      - stop if relative fit change < tol
-      - rescale A by 'scale' and then max-normalize to [0,1]
-    Inputs:
-      Timg: (H,W,C) or (Npix,C)
-      E:    (C,R)
-    Returns:
-      Aout: (H,W,R) or (Npix,R) matching input shape
+    Faithful port of MATLAB NLS you provided.
     """
-    # reshape
     if Timg.ndim == 3:
         H, W, C = Timg.shape
         M = Timg.reshape(-1, C).astype(np.float64, copy=False)
@@ -383,26 +342,21 @@ def nls_unmix(Timg, E, iters=10_000, tol=1e-8, verbose=False):
     Npix, C = M.shape
     R = E.shape[1]
 
-    # pixel-wise scale
     scale = np.sqrt(np.mean(M**2, axis=1, keepdims=True))
     scale[scale <= 0] = 1.0
     Mn = M / scale
 
-    # init A using pseudoinverse
     EtE = E.T @ E
     pinv = np.linalg.pinv(EtE) @ E.T
-    A = (Mn @ pinv.T)  # (Npix,R)
+    A = (Mn @ pinv.T)
     A[A < 0] = 0.0
 
-    # iterative multiplicative updates
     fit = np.linalg.norm(Mn - A @ E.T, 'fro')
     for i in range(iters):
         fit_old = fit
-        # A = A .* (M*E) ./ (A*(E.'*E))
         numer = Mn @ E
         denom = (A @ (E.T @ E)) + 1e-12
         A *= numer / denom
-        # evaluate fit
         fit = np.linalg.norm(Mn - A @ E.T, 'fro')
         rel = abs(fit_old - fit) / (fit_old + 1e-12)
         if verbose and (i % 200 == 0 or i < 5):
@@ -410,8 +364,7 @@ def nls_unmix(Timg, E, iters=10_000, tol=1e-8, verbose=False):
         if (rel < tol) or np.isnan(fit):
             break
 
-    # rescale back & normalize
-    A *= scale  # undo pixel-wise normalization
+    A *= scale
     maxA = np.max(A)
     if maxA > 0:
         A = A / maxA
@@ -422,7 +375,6 @@ def nls_unmix(Timg, E, iters=10_000, tol=1e-8, verbose=False):
     else:
         return A.astype(np.float32)
 
-
 def _to_uint8_gray(img2d):
     p = float(np.percentile(img2d, 99.5))
     if p <= 1e-8:
@@ -432,11 +384,14 @@ def _to_uint8_gray(img2d):
     return (z * 255.0).astype(np.uint8)
 
 def colorize_composite(A, colors):
-    """线性渲染：每张图按自身最大值缩放到 [0,1]，无分位数 / 无 gamma。"""
+    """线性渲染：每张图按自身最大值缩放到 [0,1]。"""
     H, W, R = A.shape
     rgb = np.zeros((H, W, 3), dtype=float)
     for r in range(R):
         ar = np.clip(A[:, :, r], 0.0, 1.0)
+        m = float(ar.max())
+        if m > 0:
+            ar = ar / m
         rgb += ar[:, :, None] * colors[r][None, None, :]
     m = float(rgb.max())
     if m > 0:
@@ -444,14 +399,12 @@ def colorize_composite(A, colors):
     return rgb
 
 def colorize_single_channel(A_r, color):
-    """线性渲染：通道按自身最大值缩放到 [0,1]，无分位数 / 无 gamma。"""
     z = np.clip(A_r, 0.0, 1.0)
     m = float(z.max())
     if m > 0:
         z = z / m
     rgb = z[:, :, None] * np.asarray(color)[None, None, :]
     return rgb
-
 
 def render_color_legend(names, colors):
     cells = []
@@ -464,27 +417,28 @@ def render_color_legend(names, colors):
 
 def simulate_rods_and_unmix(E, H=256, W=256, rods_per=3, rng=None, noise_mode="per_channel"):
     """
-    E: (C,R) 端元（可以是未归一化的“绝对”有效光谱）
-    noise_mode: "per_channel" 或 "global"（见 add_poisson_noise）
+    Build one mixed image with R*rods_per rods, add Poisson noise, run NLS, return maps & RMSE.
+    E: (C,R) 可为未归一化“绝对”有效光谱
+    noise_mode: "per_channel" or "global"
     """
     rng = np.random.default_rng() if rng is None else rng
     C, R = E.shape[0], E.shape[1]
 
-    # 1) 生成 rods 真值
+    # 1) rods scene
     Atrue = _place_rods_scene(H, W, R, rods_per=rods_per, rng=rng)
 
-    # 2) 正向成像（不做列归一化，保持 E 的“绝对”幅度）
+    # 2) forward render
     Tclean = np.zeros((H, W, C), dtype=float)
     for c in range(C):
         Tclean[:, :, c] = np.tensordot(Atrue, E[c, :], axes=([2], [0]))
 
-    # 3) 加泊松噪声（可全局缩放）
+    # 3) noise
     Tnoisy = add_poisson_noise(Tclean, peak=255, mode=noise_mode, rng=rng)
 
-    # 4) NLS 反演
+    # 4) unmix
     Ahat = nls_unmix(Tnoisy, E, iters=10000, tol=1e-8)
 
-    # 5) RMSE
+    # 5) rmse
     rmse_all = float(np.sqrt(np.mean((Ahat - Atrue) ** 2)))
     return Atrue, Ahat, rmse_all
 
@@ -564,13 +518,19 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
         html_two_row_table("Pair", "Similarity", pairs, sims,
                            color_second_row=True, color_thresh=0.9, format_second_row=True)
 
-        # Spectra viewer (normalize traces to 0–1)
+        # --- Spectra viewer（颜色与图像一致） ---
         st.subheader("Spectra viewer")
+        R_sel = len(sel_idx)
+        colors_sel = _ensure_colors(R_sel)
+
         fig = go.Figure()
-        for j in sel_idx:
+        for t, j in enumerate(sel_idx):
             y = E_norm[:, j]
-            y = y / (np.max(y) + 1e-12)
-            fig.add_trace(go.Scatter(x=wl, y=y, mode="lines", name=labels_pair[j]))
+            y = y / (np.max(y) + 1e-12)   # 仍按需求标准化到 0–1
+            fig.add_trace(go.Scatter(
+                x=wl, y=y, mode="lines", name=labels_pair[j],
+                line=dict(color=_rgb01_to_plotly(colors_sel[t]), width=2)
+            ))
         fig.update_layout(
             title_text="",
             xaxis_title="Wavelength (nm)",
@@ -582,7 +542,7 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
         )
         st.plotly_chart(fig, use_container_width=True)
 
-                # --- Rod simulation & unmix with Poisson noise ---
+        # --- Rod simulation & unmix with Poisson noise ---
         C = 23
         start_nm = 494.0
         step_nm = 8.9
@@ -592,15 +552,15 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
 
         st.subheader("Rod-shaped cells: ground-truth vs. NLS unmixing (Poisson noise)")
         Atrue, Ahat, rmse_all = simulate_rods_and_unmix(
-            E=E, H=256, W=256, rods_per=3, rng=np.random.default_rng(2025)
+            E=E, H=256, W=256, rods_per=3, rng=np.random.default_rng(2025),
+            noise_mode="per_channel"  # Emission 模式保持原逻辑
         )
         R = E.shape[1]
-        colors = _ensure_colors(R)
+        colors = colors_sel  # 与 viewer 保持同一套颜色
 
-        # 取当前选择顺序对应的 fluor 名字（不要排序，以免与颜色/索引错位）
+        # 取当前选择顺序对应的 fluor 名字
         fluor_names = [labels_pair[j].split(" – ", 1)[1] for j in sel_idx]
 
-        # 1（真值合成）+ R（每个 fluor 的 NLS 彩色图），标题用真实名字
         imgs = []
         true_rgb = colorize_composite(Atrue, colors)
         imgs.append(("True (composite)", (true_rgb * 255).astype(np.uint8)))
@@ -614,11 +574,8 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
                 st.image(im, use_container_width=True)
                 st.caption(title)
 
-        # 图例（名字 ↔ 颜色）
         render_color_legend(fluor_names, colors)
-
         st.caption(f"Overall RMSE (Ahat vs Atrue): {rmse_all:.4f}")
-
 
     else:
         if not laser_list:
@@ -630,7 +587,7 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
         if required_count is None:
             G0 = len(idx0); K0 = min(10, (G0 * (G0 - 1)) // 2)
         else:
-            N0 = E0_norm.shape[1]; K0 = min(10, N0 * (N0 - 1) // 2)
+            N0 = E0_norm.shape[1]; K0 = min(10, N0 * (N0 - 1)) // 2
         sel0, _ = solve_lexicographic_k(
             E0_norm, idx0, labels0,
             levels=K0, enforce_unique=True,
@@ -651,7 +608,7 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
         if required_count is None:
             Gf = len(idx_groups_all); Kf = min(10, (Gf * (Gf - 1)) // 2)
         else:
-            Nf = E_norm_all.shape[1]; Kf = min(10, Nf * (Nf - 1) // 2)
+            Nf = E_norm_all.shape[1]; Kf = min(10, Nf * (Nf - 1)) // 2
         sel_idx, _ = solve_lexicographic_k(
             E_norm_all, idx_groups_all, labels_all,
             levels=Kf, enforce_unique=True,
@@ -703,8 +660,11 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
         html_two_row_table("Pair", "Similarity", pairs, sims,
                            color_second_row=True, color_thresh=0.9, format_second_row=True)
 
-        # Spectra viewer
+        # --- Spectra viewer（颜色与图像一致） ---
         st.subheader("Spectra viewer")
+        R_sel = len(sel_idx)
+        colors_sel = _ensure_colors(R_sel)
+
         fig = go.Figure()
         if laser_strategy == "Separate":
             lam_sorted = list(sorted(laser_list))
@@ -716,22 +676,25 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
             offsets, acc = [], 0.0
             for wseg in seg_widths:
                 offsets.append(acc); acc += wseg + gap
-            for j in sel_idx:
+            for t, j in enumerate(sel_idx):
                 xs_cat, ys_cat = [], []
                 for i, l in enumerate(lam_sorted):
-                    if seg_widths[i] <= 0: continue
+                    if seg_widths[i] <= 0:
+                        continue
                     off = offsets[i]
                     mask = (wl >= l) & (wl <= wl_max_vis)
                     wl_seg = wl[mask]
                     block = E_raw_all[i * Wn:(i + 1) * Wn, j] / (B + 1e-12)
                     y_seg = block[mask]
-                    xs_cat.append(wl_seg + off); ys_cat.append(y_seg)
+                    xs_cat.append(wl_seg + off)
+                    ys_cat.append(y_seg)
                 if xs_cat:
                     fig.add_trace(go.Scatter(
                         x=np.concatenate(xs_cat),
                         y=np.concatenate(ys_cat),
                         mode="lines",
-                        name=labels_all[j]
+                        name=labels_all[j],
+                        line=dict(color=_rgb01_to_plotly(colors_sel[t]), width=2)
                     ))
             rights = [offsets[i] + wl_max_vis for i in range(L)]
             mids   = [offsets[i] + (float(lam_sorted[i]) + wl_max_vis) / 2.0 for i in range(L)]
@@ -762,9 +725,12 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
                 margin=dict(t=80)
             )
         else:
-            for j in sel_idx:
+            for t, j in enumerate(sel_idx):
                 y = E_raw_all[:, j] / (B + 1e-12)
-                fig.add_trace(go.Scatter(x=wl, y=y, mode="lines", name=labels_all[j]))
+                fig.add_trace(go.Scatter(
+                    x=wl, y=y, mode="lines", name=labels_all[j],
+                    line=dict(color=_rgb01_to_plotly(colors_sel[t]), width=2)
+                ))
             fig.update_layout(
                 title_text="",
                 xaxis_title="Wavelength (nm)",
@@ -776,27 +742,27 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
             )
         st.plotly_chart(fig, use_container_width=True)
 
-                # --- Rod simulation & unmix (Poisson) ---
+        # --- Rod simulation & unmix (Poisson) ---
         C = 23
         start_nm = 494.0
         step_nm = 8.9
         chan_centers = start_nm + step_nm * np.arange(C)
+
+        # 使用“绝对”有效光谱（包含 QY·EC·功率等），不要用 E_norm_all
         E_abs = (E_raw_all[:, sel_idx] / (B + 1e-12))   # (Wlen or concat, R)
         E = interpolate_E_on_channels(wl, E_abs, chan_centers)  # (C, R)
 
         st.subheader("Rod-shaped cells: ground-truth vs. NLS unmixing (Poisson noise)")
         Atrue, Ahat, rmse_all = simulate_rods_and_unmix(
-            E=E, H=256, W=256, rods_per=3,
-            rng=np.random.default_rng(2025),
-            noise_mode="global"
+            E=E, H=256, W=256, rods_per=3, rng=np.random.default_rng(2025),
+            noise_mode="global"  # 保留染料间亮度差
         )
         R = E.shape[1]
-        colors = _ensure_colors(R)
+        colors = colors_sel  # 与 viewer 保持同一套颜色
 
-        # 取当前选择顺序对应的 fluor 名字（不要排序）
+        # 名字顺序 = sel_idx
         fluor_names = [labels_all[j].split(" – ", 1)[1] for j in sel_idx]
 
-        # 1（真值合成）+ R（每个 fluor 的 NLS 彩色图），标题用真实名字
         imgs = []
         true_rgb = colorize_composite(Atrue, colors)
         imgs.append(("True (composite)", (true_rgb * 255).astype(np.uint8)))
@@ -810,11 +776,8 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
                 st.image(im, use_container_width=True)
                 st.caption(title)
 
-        # 图例（名字 ↔ 颜色）
         render_color_legend(fluor_names, colors)
-
         st.caption(f"Overall RMSE (Ahat vs Atrue): {rmse_all:.4f}")
-
 
 # Execute
 run_selection_and_display(groups, mode, laser_strategy, laser_list)
