@@ -281,28 +281,72 @@ def add_poisson_noise_per_channel(Tclean, peak=255, rng=None):
         Tnoisy[:, :, c] = counts / peak
     return Tnoisy
 
-def nls_unmix(T, E, iters=2000, tol=1e-7):
+def nls_unmix(Timg, E, iters=10_000, tol=1e-8, verbose=False):
     """
-    Nonnegative LS via multiplicative updates.
-    T: (Npix,C), E: (C,R)
+    MATLAB NLS (your code) faithful port:
+      - if T is 3D, reshape to (Npix, C)
+      - pixel-wise normalization by scale = sqrt(mean(M.^2, 2))
+      - A = pinv(E)*M, A<0 -> 0
+      - multiplicative updates: A = A .* (M*E) ./ (A*(E.'*E))
+      - stop if relative fit change < tol
+      - rescale A by 'scale' and then max-normalize to [0,1]
+    Inputs:
+      Timg: (H,W,C) or (Npix,C)
+      E:    (C,R)
+    Returns:
+      Aout: (H,W,R) or (Npix,R) matching input shape
     """
-    M = T
+    # reshape
+    if Timg.ndim == 3:
+        H, W, C = Timg.shape
+        M = Timg.reshape(-1, C).astype(np.float64, copy=False)
+        reshape_back = (H, W)
+    else:
+        M = np.array(Timg, dtype=np.float64, copy=False)
+        reshape_back = None
+        H = W = None
     Npix, C = M.shape
     R = E.shape[1]
+
+    # pixel-wise scale
+    scale = np.sqrt(np.mean(M**2, axis=1, keepdims=True))
+    scale[scale <= 0] = 1.0
+    Mn = M / scale
+
+    # init A using pseudoinverse
     EtE = E.T @ E
     pinv = np.linalg.pinv(EtE) @ E.T
-    A = (pinv @ M.T).T
-    A[A < 0] = 0
-    fit = np.linalg.norm(M - A @ E.T, 'fro')
-    for _ in range(iters):
+    A = (Mn @ pinv.T)  # (Npix,R)
+    A[A < 0] = 0.0
+
+    # iterative multiplicative updates
+    fit = np.linalg.norm(Mn - A @ E.T, 'fro')
+    for i in range(iters):
         fit_old = fit
+        # A = A .* (M*E) ./ (A*(E.'*E))
+        numer = Mn @ E
         denom = (A @ (E.T @ E)) + 1e-12
-        numer = M @ E
         A *= numer / denom
-        fit = np.linalg.norm(M - A @ E.T, 'fro')
-        if abs(fit - fit_old) / (fit_old + 1e-12) < tol:
+        # evaluate fit
+        fit = np.linalg.norm(Mn - A @ E.T, 'fro')
+        rel = abs(fit_old - fit) / (fit_old + 1e-12)
+        if verbose and (i % 200 == 0 or i < 5):
+            print(f"Iter {i:4d} fit={fit:.6e} Δrel={rel:.3e}")
+        if (rel < tol) or np.isnan(fit):
             break
-    return A
+
+    # rescale back & normalize
+    A *= scale  # undo pixel-wise normalization
+    maxA = np.max(A)
+    if maxA > 0:
+        A = A / maxA
+
+    if reshape_back is not None:
+        H, W = reshape_back
+        return A.reshape(H, W, R).astype(np.float32)
+    else:
+        return A.astype(np.float32)
+
 
 def _to_uint8_gray(img2d):
     p = float(np.percentile(img2d, 99.5))
@@ -325,8 +369,7 @@ def colorize_composite(A, colors, pctl=99.5, gamma=0.8):
     rgb = np.power(rgb, gamma)
     return rgb
 
-def colorize_single_channel(A_r, color, pctl=99.5, gamma=0.8):
-    """Pseudo-color a single abundance map A_r(H,W) with a given color(3,)."""
+def colorize_single_channel(A_r, color, pctl=99.0, gamma=0.9):
     z = np.clip(A_r, 0.0, 1.0)
     p = float(np.percentile(z, pctl))
     if p > 1e-8:
@@ -334,6 +377,15 @@ def colorize_single_channel(A_r, color, pctl=99.5, gamma=0.8):
     z = np.power(z, gamma)
     rgb = z[:, :, None] * np.asarray(color)[None, None, :]
     return rgb
+
+def render_color_legend(names, colors):
+    cells = []
+    for name, col in zip(names, colors):
+        r, g, b = (int(255*x) for x in col)
+        dot = f"<span style='display:inline-block;width:12px;height:12px;background:rgb({r},{g},{b});border-radius:3px;margin-right:8px;'></span>"
+        cells.append(f"<div style='margin:4px 12px 4px 0;white-space:nowrap;'>{dot}{name}</div>")
+    html = "<div style='display:flex;flex-wrap:wrap;align-items:center;'>" + "".join(cells) + "</div>"
+    st.markdown(html, unsafe_allow_html=True)
 
 def simulate_rods_and_unmix(E, H=256, W=256, rods_per=3, rng=None):
     """
@@ -359,7 +411,7 @@ def simulate_rods_and_unmix(E, H=256, W=256, rods_per=3, rng=None):
 
     # 4) NLS unmix
     M = Tnoisy.reshape(-1, C)
-    Ahat = nls_unmix(M, E).reshape(H, W, R)
+    Ahat = nls_unmix(Tnoisy, E, iters=10000, tol=1e-8)  # 直接传 (H,W,C)
 
     # 5) overall RMSE
     rmse_all = float(np.sqrt(np.mean((Ahat - Atrue) ** 2)))
@@ -488,6 +540,14 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
             with cols[i]:
                 st.image(im, use_container_width=True)
                 st.caption(title)
+        # legend: fluor name -> color
+        if use_pool:
+            fluor_names = sorted([labels_pair[j].split(" – ", 1)[1] for j in sel_idx]) if (mode=="Emission spectra") else \
+                          sorted([labels_all[j].split(" – ", 1)[1] for j in sel_idx])
+        else:
+            fluor_names = [s.split(" – ", 1)[1] for s in ( [labels_pair[j] for j in sel_idx] if mode=="Emission spectra" else [labels_all[j] for j in sel_idx] )]
+        
+        render_color_legend(fluor_names, colors)
 
         st.caption(f"Overall RMSE (Ahat vs Atrue): {rmse_all:.4f}")
 
@@ -674,6 +734,14 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
             with cols[i]:
                 st.image(im, use_container_width=True)
                 st.caption(title)
+        # legend: fluor name -> color
+        if use_pool:
+            fluor_names = sorted([labels_pair[j].split(" – ", 1)[1] for j in sel_idx]) if (mode=="Emission spectra") else \
+                          sorted([labels_all[j].split(" – ", 1)[1] for j in sel_idx])
+        else:
+            fluor_names = [s.split(" – ", 1)[1] for s in ( [labels_pair[j] for j in sel_idx] if mode=="Emission spectra" else [labels_all[j] for j in sel_idx] )]
+        
+        render_color_legend(fluor_names, colors)
 
         st.caption(f"Overall RMSE (Ahat vs Atrue): {rmse_all:.4f}")
 
