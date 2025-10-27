@@ -356,48 +356,50 @@ def run(groups, mode, laser_strategy, laser_list):
         st.plotly_chart(fig, use_container_width=True)
 
         # Optional simulation (emission-only -> per-channel max scaling并不体现亮度差，这里仅用于结构观感)
+        # --- Emission branch: rod simulation + NLS (heavier) ---
         if st.checkbox("Run rod simulation + NLS (heavier)", value=False):
-            # 1) 用【未除以 B】的绝对有效谱做仿真，才能保留真正亮度差
+            # 1) 用 emission 的（已峰值归一的）发射谱做 8.9 nm 通道采样
             C = 23
-            chan = 494.0 + 8.9 * np.arange(C)
+            chan = 494.0 + 8.9 * np.arange(C)                # 8.9nm channel centers
+            E_em = cached_interpolate_E_on_channels(
+                wl, E_norm[:, sel_idx], chan                 # shape -> (C, R)
+            )
         
-            # 仿真用：绝对谱（未除以 B）
-            E_abs_for_sim = E_raw_sel                      # ← 不要 / (B+1e-12)
-            E_sim = cached_interpolate_E_on_channels(wl, E_abs_for_sim, chan)  # (C, R)
+            # 2) 前向：全局缩放到 255 + Poisson；反演：NLS（函数内部不做全局max归一）
+            Atrue, Ahat, rmse = simulate_rods_and_unmix(E_em, H=160, W=160, rods_per=3)
         
-            # 2) 前向：全局255 + Poisson；反演：NLS（内部不再做全局max归一）
-            Atrue, Ahat, rmse = simulate_rods_and_unmix(E_sim, H=160, W=160, rods_per=3)
-        
-            # 3) 全局归一显示（所有通道共享同一个 Amax）
-            colors = _ensure_colors(E_sim.shape[1])
-        
-            def prettify_name(s):
-                name = s.split(" – ", 1)[1] if " – " in s else s
-                if name.upper().startswith("AF") and len(name) > 2 and name[2:].isdigit():
-                    return f"AF {name[2:]}"
-                return name
-        
-            fluor_names = [prettify_name(s) for s in labels_sel]
-        
-            # 全局幅度（真值与估计各用自身的全局最大，保持内部相对差异）
+            # 3) 用“同一个 Amax”对所有通道做全局归一来显示（保持通道间强弱）
+            colors = _ensure_colors(E_em.shape[1])
             Amax_true = float(np.max(Atrue))
             Amax_hat  = float(np.max(Ahat))
         
-            # True（合成观感）
-            true_rgb = colorize_composite_global(Atrue, colors, Amax_true)
-            tiles = [("True", (true_rgb * 255).astype(np.uint8))]
+            def prettify_name(lbl: str) -> str:
+                name = lbl.split(" – ", 1)[1] if " – " in lbl else lbl
+                # AF405 -> AF 405
+                if name.upper().startswith("AF") and name[2:].isdigit():
+                    return f"AF {name[2:]}"
+                return name
         
-            # 每个染料的 Ahat（全局归一，不单通道各自归一）
+            fluor_names = [prettify_name(labels[j]) for j in sel_idx]
+        
+            tiles = []
+            # True（全局合成）
+            true_rgb = colorize_composite_global(Atrue, colors, Amax_true)
+            tiles.append(("True", (true_rgb * 255).astype(np.uint8)))
+        
+            # 各通道（Ahat，全局归一）
             for r, name in enumerate(fluor_names):
                 rgb_r = colorize_single_global(Ahat[:, :, r], colors[r], Amax_hat)
                 tiles.append((name, (rgb_r * 255).astype(np.uint8)))
         
+            # 4) 展示
             cols = st.columns(len(tiles))
             for c, (title, im) in zip(cols, tiles):
                 c.image(im, use_container_width=True)
                 c.caption(title)
         
             st.caption(f"RMSE: {rmse:.4f}")
+
 
     else:
         if not laser_list:
