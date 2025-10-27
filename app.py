@@ -19,10 +19,32 @@ from utils import (
 
 st.set_page_config(page_title="Choose Fluorophore", layout="wide")
 
-# --- Optional logo in sidebar ---
-LOGO_PATH = "assets/lab logo.jpg"
-if os.path.exists(LOGO_PATH):
-    st.sidebar.image(LOGO_PATH, use_container_width=True)
+# --- Optional logo in sidebar (robust) ---
+from pathlib import Path
+from PIL import Image, UnidentifiedImageError
+
+APP_DIR = Path(__file__).parent
+LOGO_CANDIDATES = [
+    APP_DIR / "assets" / "lab logo.jpg",
+    APP_DIR / "assets" / "lab_logo.jpg",
+    APP_DIR / "assets" / "lab_logo.png",
+    APP_DIR / "assets" / "logo.png",
+]
+
+def try_show_sidebar_logo(paths):
+    for p in paths:
+        if p.exists() and p.is_file():
+            try:
+                img = Image.open(p)
+                st.sidebar.image(img, use_container_width=True)
+                return
+            except UnidentifiedImageError:
+                # file exists but not a valid image — try next candidate
+                continue
+    # If none worked, just skip (no error)
+    # st.sidebar.caption(" ")  # (optional) keep some spacing
+
+try_show_sidebar_logo(LOGO_CANDIDATES)
 
 # --- Paths ---
 DYES_YAML = "data/dyes.yaml"
