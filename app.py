@@ -188,25 +188,27 @@ def colorize_composite(A,colors):
     if m>0: rgb/=m
     return rgb
     
-def colorize_single_global(A_r, color, global_max):
-    """
-    使用同一个 global_max（来自 Ahat 的全局最大值）做归一，不再按通道单独归一。
-    这样就能保留不同染料之间的亮度差。
-    """
-    if global_max <= 0:
-        z = np.zeros_like(A_r, dtype=float)
-    else:
-        z = np.clip(A_r / global_max, 0.0, 1.0)
+def colorize_single_global(A_r, color, Amax):
+    """不对每个通道单独归一；用所有通道共享的 Amax 做线性映射。"""
+    if Amax <= 0:
+        return np.zeros(A_r.shape + (3,), dtype=float)
+    z = np.clip(A_r / Amax, 0.0, 1.0)
     return z[:, :, None] * np.asarray(color)[None, None, :]
 
-def colorize_composite_global(A, colors, global_max):
-    """
-    合成图也用同一个 global_max；各染料的相对强度会保留。
-    """
+def colorize_composite_global(A, colors, Amax):
+    """用全局 Amax 合成彩色图，保留通道间亮度差。"""
     H, W, R = A.shape
+    if Amax <= 0:
+        return np.zeros((H, W, 3), dtype=float)
     rgb = np.zeros((H, W, 3), dtype=float)
     for r in range(R):
-        rgb += colorize_single_global(A[:,
+        z = np.clip(A[:, :, r] / Amax, 0.0, 1.0)
+        rgb += z[:, :, None] * colors[r][None, None, :]
+    m = float(rgb.max())
+    if m > 0:
+        rgb /= m
+    return rgb
+
 # -------------------- Rod (capsule) scene --------------------
 def _capsule_profile(H,W,cx,cy,length,width,theta):
     yy,xx = np.mgrid[0:H,0:W].astype(float)
