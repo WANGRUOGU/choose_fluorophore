@@ -35,23 +35,60 @@ CHANNEL_WL = np.array([
 ], dtype=float)
 
 # ===== H5 datasets for synthetic generation =====
-CELL_H5_PATH  = "assets/cell_abundance.h5"   # /cells: (N,Ht,Wt), /labels: (N,)
-NOISE_H5_PATH = "assets/noise_quantiles.h5"          # /edges:(B+1,), /qs:(nq,), /Q:(B,C,nq)
+# use your actual filenames:
+CELL_H5_PATH  = "assets/cell_abundance.h5"
+NOISE_H5_PATH = "assets/noise_quantiles.h5"
+
+# optional import guard
+try:
+    import h5py
+    HAS_H5PY = True
+except Exception:
+    HAS_H5PY = False
+
+def _describe_file_issue(path):
+    import os
+    if not os.path.exists(path):
+        return f"file not found: {path}"
+    size = os.path.getsize(path)
+    if size < 32:
+        return f"file too small ({size} bytes): {path}"
+    # LFS pointer check
+    with open(path, "rb") as f:
+        head = f.read(200)
+    head_txt = head.decode("utf-8", errors="ignore")
+    if "git-lfs.github.com/spec/v1" in head_txt:
+        return ("Looks like a Git LFS pointer file (not the real binary). "
+                "Use git lfs pull or download the real .h5 and place it under assets/.")
+    # HDF5 signature
+    if head[:8] != b"\x89HDF\r\n\x1a\n":
+        return f"invalid HDF5 signature (first 8 bytes={head[:8]!r})"
+    return None
 
 @st.cache_resource(show_spinner=False)
 def load_cell_db(path=CELL_H5_PATH):
+    if not HAS_H5PY:
+        raise RuntimeError("h5py is not installed.")
+    issue = _describe_file_issue(path)
+    if issue:
+        raise RuntimeError(f"cell DB invalid: {issue}")
     f = h5py.File(path, "r")
-    cells  = f["/cells"]            # H5 dataset view (lazy)
+    cells  = f["/cells"]            # H5 dataset view
     labels = f["/labels"][:].astype(str)
     meta   = {k: f["/meta/"+k][()] for k in f["/meta"].keys()}
     return f, cells, labels, meta
 
 @st.cache_resource(show_spinner=False)
 def load_noise_db(path=NOISE_H5_PATH):
+    if not HAS_H5PY:
+        raise RuntimeError("h5py is not installed.")
+    issue = _describe_file_issue(path)
+    if issue:
+        raise RuntimeError(f"noise DB invalid: {issue}")
     f = h5py.File(path, "r")
     edges = f["/edges"][:]
     qs    = f["/qs"][:]
-    Q     = f["/Q"][:]             # (B, C, nq)
+    Q     = f["/Q"][:]   # (B, C, nq)
     return f, edges, qs, Q
 
 # ---------- Data loading ----------
