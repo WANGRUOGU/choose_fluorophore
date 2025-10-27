@@ -357,18 +357,46 @@ def run(groups, mode, laser_strategy, laser_list):
 
         # Optional simulation (emission-only -> per-channel max scaling并不体现亮度差，这里仅用于结构观感)
         if st.checkbox("Run rod simulation + NLS (heavier)", value=False):
-            C = 23; chan = 494.0 + 8.9*np.arange(C)
-            E = cached_interpolate_E_on_channels(wl, E_norm[:, sel_idx], chan)
+            # 与 Spectra viewer 同源的绝对有效谱
+            C = 23
+            chan = 494.0 + 8.9 * np.arange(C)
+            E_abs = E_raw_sel / (B + 1e-12)                    # (Wlen, R)
+            E = cached_interpolate_E_on_channels(wl, E_abs, chan)  # (C, R)
+        
+            # 前向：全局255 + Poisson；反演：NLS（不再内归一）
             Atrue, Ahat, rmse = simulate_rods_and_unmix(E, H=160, W=160, rods_per=3)
-            imgs = [("True (composite)", (colorize_composite(Atrue, colors)*255).astype(np.uint8))]
-            names = [labels[j].split(" – ",1)[1] for j in sel_idx]
-            for r, name in enumerate(names):
-                rgb = (colorize_single(Ahat[:,:,r], colors[r])*255).astype(np.uint8)
-                imgs.append((f"NLS ({name})", rgb))
-            cs = st.columns(len(imgs))
-            for c,(title,im) in zip(cs, imgs):
-                c.image(im, use_container_width=True); c.caption(title)
-            st.caption(f"Overall RMSE: {rmse:.4f}")
+        
+            # —— 全局归一显示（关键）——
+            colors = _ensure_colors(E.shape[1])
+            # 用同一个 Amax 对所有通道归一，保留 AF532 等暗通道的弱亮度
+            Amax_true = float(np.max(Atrue))
+            Amax_hat  = float(np.max(Ahat))
+        
+            def prettify_name(s):
+                # 原 label 形如 "Pool – AF405" 或 "Probe – AF405"
+                name = s.split(" – ", 1)[1] if " – " in s else s
+                # AF405 -> AF 405
+                if name.upper().startswith("AF") and len(name) > 2 and name[2:].isdigit():
+                    return f"AF {name[2:]}"
+                return name
+        
+            fluor_names = [prettify_name(s) for s in labels_sel]
+        
+            imgs = []
+            # True
+            true_rgb = colorize_composite_global(Atrue, colors, Amax_true)
+            imgs.append(("True", (true_rgb * 255).astype(np.uint8)))
+            # 各通道（Ahat，全局归一）
+            for r, name in enumerate(fluor_names):
+                rgb_r = colorize_single_global(Ahat[:, :, r], colors[r], Amax_hat)
+                imgs.append((name, (rgb_r * 255).astype(np.uint8)))
+        
+            cols = st.columns(len(imgs))
+            for c, (title, im) in zip(cols, imgs):
+                c.image(im, use_container_width=True)
+                c.caption(title)
+        
+            st.caption(f"RMSE: {rmse:.4f}")
 
     else:
         if not laser_list:
