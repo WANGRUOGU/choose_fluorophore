@@ -1,7 +1,6 @@
 # app.py
 import os
 import yaml
-import h5py
 import numpy as np
 import plotly.graph_objects as go
 import streamlit as st
@@ -29,7 +28,6 @@ if os.path.exists(LOGO_PATH):
 DYES_YAML = "data/dyes.yaml"
 PROBE_MAP_YAML = "data/probe_fluor_map.yaml"
 READOUT_POOL_YAML = "data/readout_fluorophores.yaml"
-NOISE_H5 = "assets/noise_quantiles.h5"
 
 # ---------- Load core data ----------
 wl, dye_db = load_dyes_yaml(DYES_YAML)
@@ -47,27 +45,6 @@ def load_readout_pool(path):
     return pool
 
 readout_pool = load_readout_pool(READOUT_POOL_YAML)
-
-# ---------- Noise DB (optional) ----------
-def try_load_noise_db(path):
-    """Load edges, quantiles, Q from H5; return (edges, qs, Q) or None."""
-    if not os.path.exists(path):
-        return None
-    try:
-        with h5py.File(path, "r") as f:
-            edges = np.array(f["/edges"][:], dtype=float)          # (B+1,)
-            qs    = np.array(f["/quantiles"][:], dtype=float)      # (K,)
-            Q     = np.array(f["/Q"][:], dtype=float)              # (B,C,K)
-        # sanity
-        if edges.ndim != 1 or qs.ndim != 1 or Q.ndim != 3:
-            return None
-        if edges.size < 2 or qs.size < 2 or Q.shape[2] != qs.size:
-            return None
-        return (edges, qs, Q)
-    except Exception:
-        return None
-
-noise_db = try_load_noise_db(NOISE_H5)
 
 # ---------- Sidebar ----------
 st.sidebar.header("Configuration")
@@ -175,7 +152,7 @@ def only_fluor_pair(a: str, b: str) -> str:
     fb = b.split(" – ", 1)[1]
     return f"{fa} vs {fb}"
 
-# ---------- Build E on 8.9nm grid ----------
+# ---------- Spectra -> channelized E (8.9 nm) ----------
 def interpolate_E_on_channels(wl, spectra_cols, chan_centers_nm):
     """
     wl: (W,) nm grid of dyes.yaml
@@ -190,7 +167,7 @@ def interpolate_E_on_channels(wl, spectra_cols, chan_centers_nm):
         E[:, j] = np.interp(chan_centers_nm, wl, y, left=y[0], right=y[-1])
     return E
 
-# ---------- Rod synthesis & NLS ----------
+# ---------- Rod synthesis & Poisson noise ----------
 DEFAULT_COLORS = np.array([
     [0.95, 0.25, 0.25],
     [0.25, 0.65, 0.95],
@@ -260,17 +237,27 @@ def _place_rods_scene(H, W, R, rods_per=3, max_tries=200, rng=None):
             rod_masks[r].append(np.zeros((H, W), dtype=bool))
     return Atrue, rod_masks
 
-def sample_noise_per_channel(mu, edges, qs, Qc, rng):
-    H, W = mu.shape
-    B = len(edges) - 1
-    old_q = np.linspace(0, 1, Qc.shape[1])
-    if not np.allclose(qs, old_q):
-        Qc = np.interp(qs[None, :], old_q[None, :], Qc, left=Qc[:, :1], right=Qc[:, -1])
-    bins = np.clip(np.digitize(mu.ravel(), edges[1:-1], right=False), 0, B - 1)
-    u = rng.random(mu.size)
-    k = np.clip((u * (len(qs) - 1)).astype(int), 0, len(qs) - 1)
-    noise = Qc[bins, k]
-    return noise.reshape(H, W)
+def add_poisson_noise_per_channel(Tclean, peak=255, rng=None):
+    """
+    For each channel:
+      - scale so its max -> peak (e.g., 255)
+      - sample Y ~ Poisson(X_scaled)
+      - scale back to [0,1] by /peak
+    """
+    rng = np.random.default_rng() if rng is None else rng
+    H, W, C = Tclean.shape
+    Tnoisy = np.empty_like(Tclean, dtype=float)
+    for c in range(C):
+        img = Tclean[:, :, c]
+        m = float(np.max(img))
+        if m <= 0:
+            Tnoisy[:, :, c] = 0.0
+            continue
+        scale = peak / m
+        lam = img * scale
+        counts = rng.poisson(lam).astype(float)
+        Tnoisy[:, :, c] = counts / peak
+    return Tnoisy
 
 def colorize_dominant(A, colors):
     H, W, R = A.shape
@@ -284,7 +271,11 @@ def colorize_dominant(A, colors):
     return rgb
 
 def nls_unmix(T, E, iters=2000, tol=1e-7):
-    M = T  # (Npix, C)
+    """
+    Nonnegative least squares via multiplicative updates.
+    T: (Npix,C), E: (C,R)
+    """
+    M = T
     Npix, C = M.shape
     R = E.shape[1]
     EtE = E.T @ E
@@ -302,26 +293,32 @@ def nls_unmix(T, E, iters=2000, tol=1e-7):
             break
     return A
 
-def simulate_rods_and_unmix(E, edges, qs, Q, H=256, W=256, rods_per=3, rng=None):
+def simulate_rods_and_unmix(E, H=256, W=256, rods_per=3, rng=None):
+    """
+    Build one mixed image with R*rods_per rods (non-overlapping), add Poisson noise,
+    run NLS, compute per-fluor RMSE and colored images.
+    E: (C,R) spectra on 8.9nm grid
+    """
     rng = np.random.default_rng() if rng is None else rng
     C, R = E.shape[0], E.shape[1]
     colors = _ensure_colors(R)
-    # Scene
+
+    # 1) rods scene
     Atrue, _ = _place_rods_scene(H, W, R, rods_per=rods_per, rng=rng)
-    # Forward (C channels)
+
+    # 2) forward (C channels)
     Tclean = np.zeros((H, W, C), dtype=float)
     for c in range(C):
         Tclean[:, :, c] = np.tensordot(Atrue, E[c, :], axes=([2], [0]))
-    # Noise
-    Tnoisy = np.empty_like(Tclean)
-    for c in range(C):
-        mu = Tclean[:, :, c]
-        res = sample_noise_per_channel(mu, edges, qs, Q[:, c, :], rng)
-        Tnoisy[:, :, c] = np.clip(mu + res, 0.0, None)
-    # NLS
+
+    # 3) Poisson noise (per-channel peak=255)
+    Tnoisy = add_poisson_noise_per_channel(Tclean, peak=255, rng=rng)
+
+    # 4) NLS unmix
     M = Tnoisy.reshape(-1, C)
     Ahat = nls_unmix(M, E).reshape(H, W, R)
-    # Display per fluor
+
+    # 5) RMSE & colored images
     imgs_rgb, rmses = [], []
     for r in range(R):
         err = Ahat[:, :, r] - Atrue[:, :, r]
@@ -427,28 +424,22 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
         )
         st.plotly_chart(fig, use_container_width=True)
 
-        # --- Rod simulation & unmix (if noise DB available) ---
-        if noise_db is not None:
-            edges, qs, Q = noise_db
-            C = Q.shape[1]
-            start_nm = 494.0
-            step_nm = 8.9
-            chan_centers = start_nm + step_nm * np.arange(C)
-            # use E_norm on channels as spectra (columns are selected)
-            E_sel = E_norm[:, sel_idx]
-            E = interpolate_E_on_channels(wl, E_sel, chan_centers)  # (C, R)
-            st.subheader("Simulate & unmix with rod-shaped cells")
-            imgs_rgb, rmses, _, _ = simulate_rods_and_unmix(
-                E=E, edges=edges, qs=qs, Q=Q,
-                H=256, W=256, rods_per=3, rng=np.random.default_rng(2025)
-            )
-            cols = st.columns(E.shape[1])
-            for r in range(E.shape[1]):
-                with cols[r]:
-                    st.image((imgs_rgb[r]*255).astype(np.uint8), use_container_width=True)
-                    st.caption(f"Fluor #{r+1} • RMSE = {rmses[r]:.4f}")
-        else:
-            st.info("Noise DB not found. Skipping rod simulation.")
+        # --- Rod simulation & unmix with Poisson noise (no DB needed) ---
+        C = 23
+        start_nm = 494.0
+        step_nm = 8.9
+        chan_centers = start_nm + step_nm * np.arange(C)
+        E_sel = E_norm[:, sel_idx]
+        E = interpolate_E_on_channels(wl, E_sel, chan_centers)  # (C, R)
+        st.subheader("Simulate & unmix with rod-shaped cells (Poisson noise)")
+        imgs_rgb, rmses, _, _ = simulate_rods_and_unmix(
+            E=E, H=256, W=256, rods_per=3, rng=np.random.default_rng(2025)
+        )
+        cols = st.columns(E.shape[1])
+        for r in range(E.shape[1]):
+            with cols[r]:
+                st.image((imgs_rgb[r]*255).astype(np.uint8), use_container_width=True)
+                st.caption(f"Fluor #{r+1} • RMSE = {rmses[r]:.4f}")
 
     else:
         if not laser_list:
@@ -606,29 +597,22 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
             )
         st.plotly_chart(fig, use_container_width=True)
 
-        # --- Rod simulation & unmix (if noise DB available) ---
-        if noise_db is not None:
-            edges, qs, Q = noise_db
-            C = Q.shape[1]
-            start_nm = 494.0
-            step_nm = 8.9
-            chan_centers = start_nm + step_nm * np.arange(C)
-            # build spectra columns for selected (use normalized effective E_norm_all)
-            E_sel = E_norm_all[:, sel_idx]
-            E = interpolate_E_on_channels(wl, E_sel, chan_centers)  # (C, R)
-            st.subheader("Simulate & unmix with rod-shaped cells")
-            imgs_rgb, rmses, _, _ = simulate_rods_and_unmix(
-                E=E, edges=edges, qs=qs, Q=Q,
-                H=256, W=256, rods_per=3, rng=np.random.default_rng(2025)
-            )
-            cols = st.columns(E.shape[1])
-            for r in range(E.shape[1]):
-                with cols[r]:
-                    st.image((imgs_rgb[r]*255).astype(np.uint8), use_container_width=True)
-                    st.caption(f"Fluor #{r+1} • RMSE = {rmses[r]:.4f}")
-        else:
-            st.info("Noise DB not found. Skipping rod simulation.")
-
+        # --- Rod simulation & unmix with Poisson noise ---
+        C = 23
+        start_nm = 494.0
+        step_nm = 8.9
+        chan_centers = start_nm + step_nm * np.arange(C)
+        E_sel = E_norm_all[:, sel_idx]
+        E = interpolate_E_on_channels(wl, E_sel, chan_centers)  # (C, R)
+        st.subheader("Simulate & unmix with rod-shaped cells (Poisson noise)")
+        imgs_rgb, rmses, _, _ = simulate_rods_and_unmix(
+            E=E, H=256, W=256, rods_per=3, rng=np.random.default_rng(2025)
+        )
+        cols = st.columns(E.shape[1])
+        for r in range(E.shape[1]):
+            with cols[r]:
+                st.image((imgs_rgb[r]*255).astype(np.uint8), use_container_width=True)
+                st.caption(f"Fluor #{r+1} • RMSE = {rmses[r]:.4f}")
 
 # Execute
 run_selection_and_display(groups, mode, laser_strategy, laser_list)
