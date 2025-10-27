@@ -138,7 +138,6 @@ def cached_interpolate_E_on_channels(wl,spectra_cols,chan_centers_nm):
 
 # -------------------- NLS + color --------------------
 def nls_unmix(Timg, E, iters=2000, tol=1e-6):
-    """Fast NMF-like MU with pixelwise normalization; expects Timg(H,W,C), E(C,R)."""
     H, W, C = Timg.shape
     E = np.asarray(E, dtype=np.float32)
     if E.ndim != 2 or E.shape[0] != C:
@@ -153,8 +152,7 @@ def nls_unmix(Timg, E, iters=2000, tol=1e-6):
 
     # 预计算
     EtE = E.T @ E
-
-    # ✅ 正确的最小二乘初始化：A0 = Mn @ E @ (EᵀE)⁻¹
+    # 正确的初值
     A = Mn @ E @ np.linalg.pinv(EtE)
     A[A < 0] = 0
 
@@ -167,14 +165,12 @@ def nls_unmix(Timg, E, iters=2000, tol=1e-6):
         if np.max(numer / (denom + 1e-12)) < 1 + tol:
             break
 
-    # 复原并归一
+    # 复原，但**不做全局最大值归一**
     A *= scale
-    mA = float(np.max(A))
-    if mA > 0:
-        A /= mA
+    # mA = float(np.max(A))
+    # if mA > 0: A /= mA   # ← 删除这两行
 
     return A.reshape(H, W, E.shape[1])
-
 
 def colorize_single(A_r,color):
     z=np.clip(A_r,0,1); m=float(z.max())
@@ -454,36 +450,46 @@ def run(groups, mode, laser_strategy, laser_list):
 
         # Optional simulation: Predicted uses absolute spectra + global scaling → show brightness differences
         if st.checkbox("Run rod simulation + NLS (heavier)", value=False):
-            # 1) 用 Spectra viewer 同源的绝对有效谱：E_abs = E_raw_sel / B
+            # 与 Spectra viewer 同源的绝对有效谱
             C = 23
             chan = 494.0 + 8.9 * np.arange(C)
-            E_abs = E_raw_sel / (B + 1e-12)         # (Wavelength, R)
+            E_abs = E_raw_sel / (B + 1e-12)                    # (Wlen, R)
             E = cached_interpolate_E_on_channels(wl, E_abs, chan)  # (C, R)
         
-            # 2) 仿真 + NLS（全局 255 + Poisson）
+            # 前向：全局255 + Poisson；反演：NLS（不再内归一）
             Atrue, Ahat, rmse = simulate_rods_and_unmix(E, H=160, W=160, rods_per=3)
         
-            # 3) 全局归一化显示（关键！）
+            # —— 全局归一显示（关键）——
             colors = _ensure_colors(E.shape[1])
-            Amax_true = float(Atrue.max())
-            Amax_hat  = float(Ahat.max())
+            # 用同一个 Amax 对所有通道归一，保留 AF532 等暗通道的弱亮度
+            Amax_true = float(np.max(Atrue))
+            Amax_hat  = float(np.max(Ahat))
+        
+            def prettify_name(s):
+                # 原 label 形如 "Pool – AF405" 或 "Probe – AF405"
+                name = s.split(" – ", 1)[1] if " – " in s else s
+                # AF405 -> AF 405
+                if name.upper().startswith("AF") and len(name) > 2 and name[2:].isdigit():
+                    return f"AF {name[2:]}"
+                return name
+        
+            fluor_names = [prettify_name(s) for s in labels_sel]
         
             imgs = []
+            # True
             true_rgb = colorize_composite_global(Atrue, colors, Amax_true)
-            imgs.append(("True (composite)", (true_rgb * 255).astype(np.uint8)))
-        
-            fluor_names = [s.split(" – ", 1)[1] for s in labels_sel]
+            imgs.append(("True", (true_rgb * 255).astype(np.uint8)))
+            # 各通道（Ahat，全局归一）
             for r, name in enumerate(fluor_names):
                 rgb_r = colorize_single_global(Ahat[:, :, r], colors[r], Amax_hat)
-                imgs.append((f"NLS ({name})", (rgb_r * 255).astype(np.uint8)))
+                imgs.append((name, (rgb_r * 255).astype(np.uint8)))
         
             cols = st.columns(len(imgs))
             for c, (title, im) in zip(cols, imgs):
                 c.image(im, use_container_width=True)
                 c.caption(title)
         
-            st.caption(f"Overall RMSE (Ahat vs Atrue): {rmse:.4f}")
-
+            st.caption(f"RMSE: {rmse:.4f}")
 
 # -------------------- Execute --------------------
 if __name__ == "__main__":
