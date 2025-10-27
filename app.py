@@ -264,12 +264,8 @@ def sample_noise_per_channel(Tc, edges, qs, Qc, rng):
     # ---- sanitize edges ----
     e = np.asarray(edges, dtype=float).ravel()
     e = e[np.isfinite(e)]
-    # need at least 2 edges (>= 1 bin)
     if e.size < 2:
-        # fallback: single bin [0, +inf)
         e = np.array([0.0, np.inf], dtype=float)
-
-    # enforce ascending & unique
     e = np.unique(e)
     if e.size < 2:
         e = np.array([0.0, np.inf], dtype=float)
@@ -277,64 +273,63 @@ def sample_noise_per_channel(Tc, edges, qs, Qc, rng):
     # ---- sanitize qs & align with Qc ----
     q = np.asarray(qs, dtype=float).ravel()
     q = q[np.isfinite(q)]
-    # clamp to [0,1]
     q = np.clip(q, 0.0, 1.0)
     if q.size < 2:
-        # minimal sane grid
         q = np.linspace(0, 1, 51, dtype=float)
 
     Qc = np.asarray(Qc, dtype=float)
     Bm1 = e.size - 1  # number of bins
 
-    # if Qc shape mismatches bins or nq, try to coerce
+    # fix Qc dims
     if Qc.ndim != 2:
-        # fallback: 1 bin, zero noise
         Qc = np.zeros((Bm1, q.size), dtype=float)
     else:
         B_qc, nq_qc = Qc.shape
-        # fix nq mismatch by 1D resampling along quantile axis
-        if nq_qc != q.size:
-            # build a simple linear grid 0..1 for old Qc and interp to new q
-            old_q = np.linspace(0, 1, max(2, nq_qc))
-            Qc = np.interp(q[None, :], old_q[None, :], Qc, left=Qc[:, :1], right=Qc[:, -1])
 
-        # fix bin count mismatch by nearest pad/trim
+        # (A) 修正分位数轴长度：逐行 1D 插值到新的 q
+        if nq_qc != q.size:
+            old_q = np.linspace(0, 1, max(2, nq_qc))
+            new_Qc = np.zeros((B_qc, q.size), dtype=float)
+            for b in range(B_qc):
+                row = Qc[b, :]
+                # np.interp 的 left/right 需要标量，这里用端点值
+                new_Qc[b, :] = np.interp(q, old_q, row, left=row[0], right=row[-1])
+            Qc = new_Qc  # (B_qc, len(q))
+
+        # (B) 修正 bin 数：裁剪或用最后一行 pad
         if B_qc != Bm1:
             if Bm1 < B_qc:
                 Qc = Qc[:Bm1, :]
             else:
-                pad = np.zeros((Bm1 - B_qc, Qc.shape[1]), dtype=float)
-                # pad with last row
-                if B_qc > 0:
-                    pad[:] = Qc[-1, :]
-                Qc = np.vstack([Qc, pad])
+                pad_rows = Bm1 - B_qc
+                last_row = Qc[-1:, :] if B_qc > 0 else np.zeros((1, Qc.shape[1]), dtype=float)
+                Qc = np.vstack([Qc, np.repeat(last_row, pad_rows, axis=0)])
 
-    # ---- digitize ----
-    # Note: np.digitize expects bin edges (strictly monotonic). We pass interior edges only.
+    # ---- 分箱 ----
     if e.size <= 2:
-        # only one bin → everything goes to bin 0
         bins = np.zeros_like(mu, dtype=int)
     else:
         bins = np.digitize(mu, e[1:-1], right=False)
         bins = np.clip(bins, 0, Bm1 - 1)
 
-    # ---- inverse-CDF sampling per bin ----
-    # ensure qs ascending for interp
+    # ---- 逐 bin 逆 CDF 采样 ----
+    # 确保 q 递增，并对 Qc 行做同样的重排（以防 q 原始不是单调的）
     sort_q_idx = np.argsort(q)
     q_sorted = q[sort_q_idx]
+    Qc_sorted = Qc[:, sort_q_idx]
 
     u = rng.random(mu.shape)
     noise = np.zeros_like(mu)
-    # vectorized by unique bins
+
     for b in np.unique(bins):
         sel = (bins == b)
         if not np.any(sel):
             continue
-        # reorder row to ascending q
-        qvals = Qc[b, :][sort_q_idx]
-        noise[sel] = np.interp(u[sel], q_sorted, qvals, left=qvals[0], right=qvals[-1])
+        row = Qc_sorted[b, :]             # (nq,)
+        noise[sel] = np.interp(u[sel], q_sorted, row, left=row[0], right=row[-1])
 
     return noise.reshape(H, W)
+
 
 
 def generate_synthetic_images(E, cells_ds, n_images=3, rng=None, noise_db=None):
