@@ -289,8 +289,39 @@ def run(groups,mode,laser_strategy,laser_list):
         tops=top_k_pairwise(S,labels_sel,k=k_show)
         st.subheader("Top pairwise similarities")
         _html_two_row_table("Pair","Similarity",[_pair_only_fluor(a,b) for _,a,b in tops],[v for v,_,_ in tops],color_second_row=True,fmt2=True)
-        st.subheader("Spectra viewer")
-        fig=go.Figure()
+                st.subheader("Spectra viewer")
+        fig = go.Figure()
         for t in range(len(labels_sel)):
-            y=E_raw_sel[:,t]/(B+1e-12)
-            fig.add_trace(go.Scatter(x=wl,y=y,
+            y = E_raw_sel[:, t] / (B + 1e-12)
+            fig.add_trace(go.Scatter(
+                x=wl,
+                y=y,
+                mode="lines",
+                name=labels_sel[t],
+                line=dict(color=_rgb01_to_plotly(colors[t]), width=2)
+            ))
+        fig.update_layout(
+            xaxis_title="Wavelength (nm)",
+            yaxis_title="Normalized intensity",
+            yaxis=dict(range=[0, 1.05])
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        if st.checkbox("Run rod simulation + NLS (heavier)", value=False):
+            C = 23
+            chan = 494 + 8.9 * np.arange(C)
+            E = cached_interpolate_E_on_channels(wl, E_raw_sel / (B + 1e-12), chan)
+            Atrue, Ahat, rmse = simulate_rods_and_unmix(E, H=160, W=160, rods_per=3)
+            imgs = [("True (composite)", (colorize_composite(Atrue, colors) * 255).astype(np.uint8))]
+            for r, name in enumerate(fluors):
+                rgb = (colorize_single(Ahat[:, :, r], colors[r]) * 255).astype(np.uint8)
+                imgs.append((f"NLS ({name})", rgb))
+            cs = st.columns(len(imgs))
+            for c, (title, im) in zip(cs, imgs):
+                c.image(im, use_container_width=True)
+                c.caption(title)
+            st.caption(f"Overall RMSE: {rmse:.4f}")
+
+# -------------------- Execute --------------------
+if __name__ == "__main__":
+    run(groups, mode, laser_strategy, laser_list)
