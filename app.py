@@ -197,18 +197,14 @@ def _ensure_2d_float_matrix(E, target_cols=None, dtype=np.float32):
     try:
         A = np.asarray(E, dtype=dtype)
     except Exception:
-        # 如果失败，先以 object 读入，再逐列堆叠
         obj = np.asarray(E, dtype=object)
-        # 处理 1 维 ragged （每个元素是一个列向量）
         if obj.ndim == 1 and obj.size > 0:
             cols = [np.asarray(v, dtype=dtype).ravel() for v in obj]
-            # 对齐长度（截短到最短）
             minlen = min(len(c) for c in cols)
             if minlen == 0:
                 raise ValueError("Empty columns in E.")
             A = np.stack([c[:minlen] for c in cols], axis=1)  # (W, N)
         else:
-            # 尝试逐行堆叠
             rows = []
             for v in obj.reshape(-1):
                 vv = np.asarray(v, dtype=dtype).ravel()
@@ -227,10 +223,11 @@ def _ensure_2d_float_matrix(E, target_cols=None, dtype=np.float32):
     if not np.isfinite(A).all():
         A = np.nan_to_num(A, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # 如果目标列数提供了，但不匹配，尝试一次转置修正
+    # ✅ 修正：如果“行数 != 目标列数 && 列数 == 目标列数”，则转置一次
     if target_cols is not None:
-        if A.shape[1] != target_cols and A.shape[0] == target_cols:
-            A = A.T  # 只转置一次
+        if A.shape[0] != target_cols and A.shape[1] == target_cols:
+            A = A.T
+
     return A.astype(dtype, copy=False)
 
 def nls_unmix(Timg, E, EtE=None, iters=3000, tol=1e-6, verbose=False, dtype=np.float32):
