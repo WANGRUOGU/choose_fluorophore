@@ -170,12 +170,18 @@ st.plotly_chart(fig, use_container_width=True)
 E = interpolate_E_on_channels(wl, S, chan_centers)  # (C,R)
 
 # -------------------- Run button --------------------
+# -------------------- Run button --------------------
 if st.button("Run simulation + unmix"):
     rng = np.random.default_rng(2025)
 
     # 1) Atrue (per-dye abundance maps), each in [0,1]
-    Atrue = place_rods_scene(H, W, R, rods_per=r o d s _ p e r:=rods_per, rng=rng,
-                             Lmin=Lmin, Lmax=Lmax, Wmin=Wmin_px, Wmax=Wmax_px)
+    Atrue = place_rods_scene(
+        H, W, R,
+        rods_per=rods_per,             # ← 修正这里
+        rng=rng,
+        Lmin=Lmin, Lmax=Lmax,
+        Wmin=Wmin_px, Wmax=Wmax_px
+    )
 
     # 2) Forward: Tclean = Atrue ⊗ E
     Tclean = np.zeros((H, W, C), dtype=float)
@@ -199,37 +205,36 @@ if st.button("Run simulation + unmix"):
     # 5) Unmix with the same E (8.9 nm sampled)
     Ahat = nls_unmix(Y, E, iters=1500, tol=1e-6)
 
-    # 6) Global normalize ALL Ahat maps together
+    # 6) Global normalize ALL Ahat maps together (single global max)
     Amax = float(np.max(Ahat))
-    if Amax > 0:
-        Ahat_vis = Ahat / Amax
-    else:
-        Ahat_vis = np.zeros_like(Ahat)
+    Ahat_vis = (Ahat / (Amax + 1e-12)) if Amax > 0 else np.zeros_like(Ahat)
 
     # -------------------- Display --------------------
     st.subheader("Abundance maps (global-normalized across all dyes)")
-    # Composite "True" using Atrue (also globally normalized for viewing)
+
+    # True composite（把 Atrue 也做一次全局归一后合成）
     Atrue_max = float(np.max(Atrue))
     Atrue_vis = Atrue / (Atrue_max + 1e-12)
 
     def colorize_stack(A, cols):
-        H,W,R = A.shape
-        rgb = np.zeros((H,W,3), dtype=float)
-        for r in range(R):
-            z = np.clip(A[:,:,r], 0.0, 1.0)
-            rgb += z[:,:,None] * cols[r][None,None,:]
-        m = float(rgb.max()); 
-        if m > 0: rgb /= m
+        H_, W_, R_ = A.shape
+        rgb = np.zeros((H_, W_, 3), dtype=float)
+        for r in range(R_):
+            z = np.clip(A[:, :, r], 0.0, 1.0)
+            rgb += z[:, :, None] * cols[r][None, None, :]
+        m = float(rgb.max())
+        if m > 0:
+            rgb /= m
         return (rgb * 255).astype(np.uint8)
 
     tiles = []
     tiles.append(("True", colorize_stack(Atrue_vis, colors)))
+
+    # 单通道展示：直接用 Ahat_vis（已是“整体 normalize”后的值），不要再对每通道各自拉满
     for r, name in enumerate(picked):
-        # single-channel color (no per-channel renorm; we already did a global max)
-        z = Ahat_vis[:, :, r]
-        rgb = (np.clip(z,0,1)[:,:,None] * colors[r][None,None,:])
-        rgb = (rgb / (rgb.max()+1e-12) * 255).astype(np.uint8) if rgb.max()>0 else (rgb*255).astype(np.uint8)
-        tiles.append((name, rgb))
+        z = np.clip(Ahat_vis[:, :, r], 0.0, 1.0)
+        rgb = (z[:, :, None] * colors[r][None, None, :])  # 不再二次归一
+        tiles.append((name, (rgb * 255).astype(np.uint8)))
 
     cols_ui = st.columns(len(tiles))
     for c_ui, (title, im) in zip(cols_ui, tiles):
@@ -238,3 +243,4 @@ if st.button("Run simulation + unmix"):
 
 else:
     st.info("点击上面的 **Run simulation + unmix** 按钮执行流程。")
+
