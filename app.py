@@ -137,44 +137,30 @@ def cached_interpolate_E_on_channels(wl,spectra_cols,chan_centers_nm):
     return np.nan_to_num(E, nan=0.0, posinf=0.0, neginf=0.0)
 
 # -------------------- NLS + color --------------------
-def nls_unmix(Timg, E, iters=2000, tol=1e-6):
+def nls_unmix(Timg,E,iters=2000,tol=1e-6):
     """Fast NMF-like MU with pixelwise normalization; expects Timg(H,W,C), E(C,R)."""
     H, W, C = Timg.shape
     E = np.asarray(E, dtype=np.float32)
     if E.ndim != 2 or E.shape[0] != C:
         raise ValueError(f"E shape {E.shape} mismatch with Timg channels {C}")
-
     M = Timg.reshape(-1, C).astype(np.float32, copy=False)
-
-    # 像素归一
-    scale = np.sqrt(np.mean(M**2, axis=1, keepdims=True))
-    scale[scale <= 0] = 1.0
-    Mn = M / scale
-
-    # 预计算
+    scale = np.sqrt(np.mean(M**2, axis=1, keepdims=True)); scale[scale<=0]=1.0
+    Mn = M/scale
     EtE = E.T @ E
-
-    # ✅ 正确的最小二乘初始化：A0 = Mn @ E @ (EᵀE)⁻¹
+    # 修复后的最小二乘初始化
     A = Mn @ E @ np.linalg.pinv(EtE)
-    A[A < 0] = 0
-
-    # 乘法更新
+    A[A<0]=0
     for _ in range(iters):
         numer = Mn @ E
         denom = (A @ EtE) + 1e-12
         A *= numer / denom
-        # 简单早停
+        # 早停：相对改进很小则退出（简单近似）
         if np.max(numer / (denom + 1e-12)) < 1 + tol:
             break
-
-    # 复原并归一
     A *= scale
     mA = float(np.max(A))
-    if mA > 0:
-        A /= mA
-
-    return A.reshape(H, W, E.shape[1])
-
+    if mA>0: A /= mA
+    return A.reshape(H,W,E.shape[1])
 
 def colorize_single(A_r,color):
     z=np.clip(A_r,0,1); m=float(z.max())
@@ -186,27 +172,6 @@ def colorize_composite(A,colors):
     for r in range(A.shape[2]): rgb+=colorize_single(A[:,:,r],colors[r])
     m=float(rgb.max()); 
     if m>0: rgb/=m
-    return rgb
-    
-def colorize_single_global(A_r, color, Amax):
-    """不对每个通道单独归一；用所有通道共享的 Amax 做线性映射。"""
-    if Amax <= 0:
-        return np.zeros(A_r.shape + (3,), dtype=float)
-    z = np.clip(A_r / Amax, 0.0, 1.0)
-    return z[:, :, None] * np.asarray(color)[None, None, :]
-
-def colorize_composite_global(A, colors, Amax):
-    """用全局 Amax 合成彩色图，保留通道间亮度差。"""
-    H, W, R = A.shape
-    if Amax <= 0:
-        return np.zeros((H, W, 3), dtype=float)
-    rgb = np.zeros((H, W, 3), dtype=float)
-    for r in range(R):
-        z = np.clip(A[:, :, r] / Amax, 0.0, 1.0)
-        rgb += z[:, :, None] * colors[r][None, None, :]
-    m = float(rgb.max())
-    if m > 0:
-        rgb /= m
     return rgb
 
 # -------------------- Rod (capsule) scene --------------------
@@ -231,7 +196,7 @@ def _place_rods_scene(H,W,R,rods_per=3,rng=None):
     rng = np.random.default_rng() if rng is None else rng
     Atrue = np.zeros((H,W,R), dtype=np.float32)
     occ = np.zeros((H,W), dtype=bool)
-    # smaller rods → faster & clearer
+    # smaller rods → this is the version before "thicker rods" change
     Lmin,Lmax = 18, 36
     Wmin,Wmax = 6, 10
     for r in range(R):
@@ -454,36 +419,19 @@ def run(groups, mode, laser_strategy, laser_list):
 
         # Optional simulation: Predicted uses absolute spectra + global scaling → show brightness differences
         if st.checkbox("Run rod simulation + NLS (heavier)", value=False):
-            # 1) 用 Spectra viewer 同源的绝对有效谱：E_abs = E_raw_sel / B
             C = 23
-            chan = 494.0 + 8.9 * np.arange(C)
-            E_abs = E_raw_sel / (B + 1e-12)         # (Wavelength, R)
-            E = cached_interpolate_E_on_channels(wl, E_abs, chan)  # (C, R)
-        
-            # 2) 仿真 + NLS（全局 255 + Poisson）
+            chan = 494.0 + 8.9*np.arange(C)
+            E = cached_interpolate_E_on_channels(wl, E_raw_sel/(B+1e-12), chan)
             Atrue, Ahat, rmse = simulate_rods_and_unmix(E, H=160, W=160, rods_per=3)
-        
-            # 3) 全局归一化显示（关键！）
-            colors = _ensure_colors(E.shape[1])
-            Amax_true = float(Atrue.max())
-            Amax_hat  = float(Ahat.max())
-        
-            imgs = []
-            true_rgb = colorize_composite_global(Atrue, colors, Amax_true)
-            imgs.append(("True (composite)", (true_rgb * 255).astype(np.uint8)))
-        
-            fluor_names = [s.split(" – ", 1)[1] for s in labels_sel]
-            for r, name in enumerate(fluor_names):
-                rgb_r = colorize_single_global(Ahat[:, :, r], colors[r], Amax_hat)
-                imgs.append((f"NLS ({name})", (rgb_r * 255).astype(np.uint8)))
-        
-            cols = st.columns(len(imgs))
-            for c, (title, im) in zip(cols, imgs):
-                c.image(im, use_container_width=True)
-                c.caption(title)
-        
-            st.caption(f"Overall RMSE (Ahat vs Atrue): {rmse:.4f}")
-
+            imgs = [("True (composite)", (colorize_composite(Atrue, colors)*255).astype(np.uint8))]
+            names = [s.split(" – ",1)[1] for s in labels_sel]
+            for r, name in enumerate(names):
+                rgb = (colorize_single(Ahat[:,:,r], colors[r])*255).astype(np.uint8)
+                imgs.append((f"NLS ({name})", rgb))
+            cs = st.columns(len(imgs))
+            for c,(title,im) in zip(cs, imgs):
+                c.image(im, use_container_width=True); c.caption(title)
+            st.caption(f"Overall RMSE: {rmse:.4f}")
 
 # -------------------- Execute --------------------
 if __name__ == "__main__":
