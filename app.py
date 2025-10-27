@@ -1,75 +1,49 @@
-# app.py — streamlined + small rod-shaped cells + brightness preserved in Predicted
-import json
-import numpy as np
-import plotly.graph_objects as go
-import streamlit as st
-from utils import (
-    load_dyes_yaml,
-    load_probe_fluor_map,
-    build_emission_only_matrix,
-    build_effective_with_lasers,
-    derive_powers_simultaneous,
-    derive_powers_separate,
-    solve_lexicographic_k,
-    cosine_similarity_matrix,
-    top_k_pairwise,
-)
+# app.py — minimal pipeline per your spec
+# Flow: A (max=1) -> E@8.9nm -> scale to 255 -> Poisson -> NLS with same E -> global-normalize Ahat -> display
 
-st.set_page_config(page_title="Choose Fluorophore", layout="wide")
+import numpy as np
+import streamlit as st
+import plotly.graph_objects as go
+
+from utils import load_dyes_yaml  # 只用这个：读取 data/dyes.yaml -> (wl, dye_db)
+
+st.set_page_config(page_title="Spectral Unmix Demo", layout="wide")
 
 # -------------------- Load data --------------------
 DYES_YAML = "data/dyes.yaml"
-PROBE_MAP_YAML = "data/probe_fluor_map.yaml"
-READOUT_POOL_YAML = "data/readout_fluorophores.yaml"
+wl, dye_db = load_dyes_yaml(DYES_YAML)  # wl: (W,), dye_db: {name: {"emission": (W,)...}}
 
-wl, dye_db = load_dyes_yaml(DYES_YAML)
-probe_map = load_probe_fluor_map(PROBE_MAP_YAML)
+ALL_DYES = sorted([k for k,v in dye_db.items() if isinstance(v, dict) and "emission" in v])
 
-def _load_readout_pool(path):
-    try:
-        import yaml, os
-        if not os.path.exists(path):
-            return []
-        with open(path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
-        items = data.get("fluorophores", []) or []
-        pool = sorted({s.strip() for s in items if isinstance(s, str) and s.strip()})
-        return [f for f in pool if f in dye_db]
-    except Exception:
-        return []
+# -------------------- Sidebar Config --------------------
+st.sidebar.header("Setup")
 
-readout_pool = _load_readout_pool(READOUT_POOL_YAML)
+picked = st.sidebar.multiselect("Fluorophores", ALL_DYES, default=ALL_DYES[:4])
+if not picked:
+    st.info("请选择至少一个染料（左侧）。")
+    st.stop()
 
-# -------------------- Sidebar --------------------
-st.sidebar.header("Configuration")
-mode = st.sidebar.radio(
-    "Mode",
-    options=("Emission spectra", "Predicted spectra"),
-    help=("Emission: 仅发射谱、峰值归一；Predicted: 含激发·QY·EC与激光，体现亮度差。")
-)
-source_mode = st.sidebar.radio("Selection source", ("By probes", "From readout pool"))
-k_show = st.sidebar.slider("Show top-K similarities", 5, 50, 10, 1)
+# Imaging channels (8.9 nm sampling)
+C = st.sidebar.number_input("Number of channels (C)", 4, 64, 23, 1)
+start_nm = st.sidebar.number_input("Channel start (nm)", int(max(350, wl.min())), int(min(800, wl.max())), 494, 1)
+step_nm = st.sidebar.number_input("Channel step (nm)", 1.0, 20.0, 8.9, 0.1)
+chan_centers = start_nm + step_nm * np.arange(int(C))
 
-laser_list = []
-laser_strategy = None
-if mode == "Predicted spectra":
-    laser_strategy = st.sidebar.radio("Laser usage", ("Simultaneous", "Separate"))
-    n = st.sidebar.number_input("Number of lasers", 1, 8, 4, 1)
-    cols = st.sidebar.columns(2)
-    defaults = [405, 488, 561, 639]
-    for i in range(n):
-        lam = cols[i % 2].number_input(
-            f"Laser {i+1} (nm)", int(wl.min()), int(max(700, wl.max())),
-            defaults[i] if i < len(defaults) else int(wl.min()), 1
-        )
-        laser_list.append(int(lam))
+# Image shape & rods
+H = st.sidebar.number_input("Image height", 64, 512, 160, 8)
+W = st.sidebar.number_input("Image width", 64, 512, 160, 8)
+rods_per = st.sidebar.slider("Rods per dye", 1, 6, 3, 1)
+Lmin = st.sidebar.slider("Rod length min (px)", 8, 80, 24, 1)
+Lmax = st.sidebar.slider("Rod length max (px)", 10, 120, 48, 1)
+Wmin_px = st.sidebar.slider("Rod width min (px)", 4, 60, 12, 1)
+Wmax_px = st.sidebar.slider("Rod width max (px)", 6, 80, 20, 1)
 
-# -------------------- Helper colors/tables --------------------
+# -------------------- Helper: colors, interp, rods --------------------
 DEFAULT_COLORS = np.array([
     [0.95, 0.25, 0.25], [0.25, 0.65, 0.95],
     [0.25, 0.85, 0.35], [0.90, 0.70, 0.20],
     [0.80, 0.40, 0.80], [0.25, 0.80, 0.80],
-    [0.85, 0.50, 0.35], [0.60, 0.60, 0.60],
+    [0.85, 0.50, 0.35], [0.60, 0.60, 0.60]
 ], dtype=float)
 
 def _ensure_colors(R):
@@ -86,134 +60,25 @@ def _rgb01_to_plotly(col):
     r,g,b = (int(255*x) for x in col)
     return f"rgb({r},{g},{b})"
 
-def _pair_only_fluor(a,b):
-    fa = a.split(" – ",1)[1] if " – " in a else a
-    fb = b.split(" – ",1)[1] if " – " in b else b
-    return f"{fa} vs {fb}"
-
-def _html_two_row_table(row0_label,row1_label,row0_vals,row1_vals,
-                        color_second_row=False,color_thresh=0.9,fmt2=False):
-    def esc(x): return (str(x).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"))
-    def fmtv(v):
-        if fmt2:
-            try: return f"{float(v):.3f}"
-            except: return esc(v)
-        return esc(v)
-    cells0 = "".join(f"<td style='padding:6px 10px;border:1px solid #ddd;'>{esc(v)}</td>" for v in row0_vals)
-    tds0 = f"<td style='padding:6px 10px;border:1px solid #ddd;white-space:nowrap;'>{esc(row0_label)}</td>{cells0}"
-    tds1_list=[]
-    for v in row1_vals:
-        style="padding:6px 10px;border:1px solid #ddd;"
-        if color_second_row:
-            try:
-                vv=float(v); style+=f"color:{'red' if vv>color_thresh else 'green'};"
-            except: pass
-        tds1_list.append(f"<td style='{style}'>{fmtv(v)}</td>")
-    tds1 = f"<td style='padding:6px 10px;border:1px solid #ddd;white-space:nowrap;'>{esc(row1_label)}</td>{''.join(tds1_list)}"
-    st.markdown(f"""
-    <div style="overflow-x:auto;">
-      <table style="border-collapse:collapse;width:100%;table-layout:auto;">
-        <tbody><tr>{tds0}</tr><tr>{tds1}</tr></tbody>
-      </table>
-    </div>
-    """, unsafe_allow_html=True)
-
-# -------------------- Cache wrappers --------------------
-@st.cache_data(show_spinner=False)
-def cached_build_effective_with_lasers(wl,dye_db,groups,laser_list,laser_strategy,powers):
-    groups_key = json.dumps({k:sorted(v) for k,v in sorted(groups.items())}, ensure_ascii=False)
-    _ = (tuple(sorted(laser_list)), laser_strategy, tuple(np.asarray(powers,float)) if powers is not None else None, groups_key)
-    return build_effective_with_lasers(wl,dye_db,groups,laser_list,laser_strategy,powers)
-
-@st.cache_data(show_spinner=False)
-def cached_interpolate_E_on_channels(wl,spectra_cols,chan_centers_nm):
+def interpolate_E_on_channels(wl, spectra_cols, chan_centers_nm):
+    """ wl:(W,), spectra_cols:(W,R) -> E:(C,R) @ chan_centers """
     spectra_cols = np.asarray(spectra_cols, dtype=float)
-    if spectra_cols.ndim == 1: spectra_cols = spectra_cols[:,None]
-    W,N = spectra_cols.shape
-    E = np.zeros((len(chan_centers_nm),N), dtype=float)
-    for j in range(N):
-        y = spectra_cols[:,j]
-        E[:,j] = np.interp(chan_centers_nm, wl, y, left=float(y[0]), right=float(y[-1]))
+    if spectra_cols.ndim == 1:
+        spectra_cols = spectra_cols[:, None]
+    Cn = len(chan_centers_nm); W, R = spectra_cols.shape
+    E = np.zeros((Cn, R), dtype=float)
+    for j in range(R):
+        y = spectra_cols[:, j]
+        E[:, j] = np.interp(chan_centers_nm, wl, y, left=float(y[0]), right=float(y[-1]))
     return np.nan_to_num(E, nan=0.0, posinf=0.0, neginf=0.0)
 
-# -------------------- NLS + color --------------------
-def nls_unmix(Timg, E, iters=2000, tol=1e-6):
-    H, W, C = Timg.shape
-    E = np.asarray(E, dtype=np.float32)
-    if E.ndim != 2 or E.shape[0] != C:
-        raise ValueError(f"E shape {E.shape} mismatch with Timg channels {C}")
-
-    M = Timg.reshape(-1, C).astype(np.float32, copy=False)
-
-    # 像素归一
-    scale = np.sqrt(np.mean(M**2, axis=1, keepdims=True))
-    scale[scale <= 0] = 1.0
-    Mn = M / scale
-
-    # 预计算
-    EtE = E.T @ E
-    # 正确的初值
-    A = Mn @ E @ np.linalg.pinv(EtE)
-    A[A < 0] = 0
-
-    # 乘法更新
-    for _ in range(iters):
-        numer = Mn @ E
-        denom = (A @ EtE) + 1e-12
-        A *= numer / denom
-        # 简单早停
-        if np.max(numer / (denom + 1e-12)) < 1 + tol:
-            break
-
-    # 复原，但**不做全局最大值归一**
-    A *= scale
-    # mA = float(np.max(A))
-    # if mA > 0: A /= mA   # ← 删除这两行
-
-    return A.reshape(H, W, E.shape[1])
-
-def colorize_single(A_r,color):
-    z=np.clip(A_r,0,1); m=float(z.max())
-    if m>0: z/=m
-    return z[:,:,None]*np.asarray(color)[None,None,:]
-
-def colorize_composite(A,colors):
-    rgb=np.zeros((A.shape[0],A.shape[1],3),dtype=float)
-    for r in range(A.shape[2]): rgb+=colorize_single(A[:,:,r],colors[r])
-    m=float(rgb.max()); 
-    if m>0: rgb/=m
-    return rgb
-    
-def colorize_single_global(A_r, color, Amax):
-    """不对每个通道单独归一；用所有通道共享的 Amax 做线性映射。"""
-    if Amax <= 0:
-        return np.zeros(A_r.shape + (3,), dtype=float)
-    z = np.clip(A_r / Amax, 0.0, 1.0)
-    return z[:, :, None] * np.asarray(color)[None, None, :]
-
-def colorize_composite_global(A, colors, Amax):
-    """用全局 Amax 合成彩色图，保留通道间亮度差。"""
-    H, W, R = A.shape
-    if Amax <= 0:
-        return np.zeros((H, W, 3), dtype=float)
-    rgb = np.zeros((H, W, 3), dtype=float)
-    for r in range(R):
-        z = np.clip(A[:, :, r] / Amax, 0.0, 1.0)
-        rgb += z[:, :, None] * colors[r][None, None, :]
-    m = float(rgb.max())
-    if m > 0:
-        rgb /= m
-    return rgb
-
-# -------------------- Rod (capsule) scene --------------------
 def _capsule_profile(H,W,cx,cy,length,width,theta):
     yy,xx = np.mgrid[0:H,0:W].astype(float)
     X=xx-cx; Y=yy-cy
     c,s = np.cos(theta), np.sin(theta)
     xp =  c*X + s*Y
     yp = -s*X + c*Y
-    half_L = 0.5*length
-    r = 0.5*width
+    half_L = 0.5*length; r = 0.5*width
     rect = (np.abs(xp)<=half_L) & (np.abs(yp)<=r)
     val = np.zeros((H,W))
     if np.any(rect): val[rect] = 1 - np.abs(yp[rect])/(r+1e-12)
@@ -223,306 +88,153 @@ def _capsule_profile(H,W,cx,cy,length,width,theta):
         if np.any(cap): val[cap] = np.maximum(val[cap], 1 - rho[cap]/(r+1e-12))
     return np.clip(val,0,1), val>0
 
-def _place_rods_scene(H,W,R,rods_per=3,rng=None):
+def place_rods_scene(H,W,R,rods_per=3,rng=None,Lmin=24,Lmax=48,Wmin=12,Wmax=20):
     rng = np.random.default_rng() if rng is None else rng
     Atrue = np.zeros((H,W,R), dtype=np.float32)
     occ = np.zeros((H,W), dtype=bool)
-    # smaller rods → faster & clearer
-    Lmin,Lmax = 18, 36
-    Wmin,Wmax = 12, 20
     for r in range(R):
         placed = 0; tries = 0
-        while placed < rods_per and tries < 200:
+        while placed < rods_per and tries < 300:
             tries += 1
             length = int(rng.integers(Lmin, Lmax+1))
             width  = int(rng.integers(Wmin, Wmax+1))
             theta  = float(rng.uniform(0, np.pi))
-            margin = 6 + int(max(length,width)/2)
+            margin = 6 + int(max(length,width)//2)
             if W - 2*margin <= 2 or H - 2*margin <= 2: break
             cx = int(rng.integers(margin, W-margin))
             cy = int(rng.integers(margin, H-margin))
             prof, mask = _capsule_profile(H,W,cx,cy,length,width,theta)
             if not np.any(mask): continue
             if np.any(occ & mask): continue
-            m=float(prof.max())
-            if m>0: prof/=m
+            m = float(prof.max())
+            if m > 0: prof /= m
             Atrue[:,:,r] = np.maximum(Atrue[:,:,r], prof.astype(np.float32))
             occ |= mask
             placed += 1
-    return np.clip(Atrue,0,1)
+    return np.clip(Atrue, 0, 1)
 
-# -------------------- Simulation --------------------
-def simulate_rods_and_unmix(E,H=160,W=160,rods_per=3,rng=None):
-    """Use global scaling Poisson noise → preserves inter-dye brightness."""
-    rng = np.random.default_rng() if rng is None else rng
-    E = np.asarray(E, dtype=float)
-    if E.ndim != 2: raise ValueError(f"E must be 2D, got {E.shape}")
-    C,R = E.shape
+# -------------------- NLS (no internal max-normalization) --------------------
+def nls_unmix(Timg, E, iters=2000, tol=1e-6):
+    """Timg:(H,W,C), E:(C,R) -> Ahat:(H,W,R)"""
+    H, W, C = Timg.shape
+    E = np.asarray(E, dtype=np.float32)
+    if E.ndim != 2 or E.shape[0] != C:
+        raise ValueError(f"E shape {E.shape} mismatch with Timg channels {C}")
+    M = Timg.reshape(-1, C).astype(np.float32, copy=False)
 
-    # scene
-    Atrue = _place_rods_scene(H,W,R,rods_per,rng)
+    # pixel-wise normalization
+    scale = np.sqrt(np.mean(M**2, axis=1, keepdims=True)); scale[scale<=0]=1.0
+    Mn = M / scale
 
-    # forward render
-    Tclean = np.zeros((H,W,C), dtype=float)
+    # LS init: A0 = Mn @ E @ (E^T E)^-1
+    EtE = E.T @ E
+    A = Mn @ E @ np.linalg.pinv(EtE)
+    A[A < 0] = 0
+
+    # MU iterations
+    for _ in range(iters):
+        numer = Mn @ E
+        denom = (A @ EtE) + 1e-12
+        A *= numer / denom
+        if np.max(numer / (denom + 1e-12)) < 1 + tol:
+            break
+
+    A *= scale  # restore per-pixel scale
+    A[A < 0] = 0
+    return A.reshape(H, W, E.shape[1])
+
+# -------------------- UI: spectra viewer --------------------
+R = len(picked)
+colors = _ensure_colors(R)
+
+st.title("Spectra → Forward (255) → Poisson → NLS → Global-normalize(Â)")
+
+# gather emission spectra (as stored)
+W = len(wl)
+S = np.zeros((W, R), dtype=float)
+for j, name in enumerate(picked):
+    S[:, j] = np.asarray(dye_db[name]["emission"], dtype=float)
+
+# Spectra viewer (normalize each trace to [0,1] for可视化，但 unmix/forward 用按 8.9nm 采样后的数值)
+st.subheader("Spectra viewer")
+fig = go.Figure()
+for j, name in enumerate(picked):
+    y = S[:, j]
+    y_plot = y / (np.max(y) + 1e-12)
+    fig.add_trace(go.Scatter(x=wl, y=y_plot, mode="lines", name=name,
+                             line=dict(color=_rgb01_to_plotly(colors[j]), width=2)))
+fig.update_layout(xaxis_title="Wavelength (nm)", yaxis_title="Normalized intensity", yaxis=dict(range=[0,1.05]))
+st.plotly_chart(fig, use_container_width=True)
+
+# 8.9 nm sampling for both forward and unmix
+E = interpolate_E_on_channels(wl, S, chan_centers)  # (C,R)
+
+# -------------------- Run button --------------------
+if st.button("Run simulation + unmix"):
+    rng = np.random.default_rng(2025)
+
+    # 1) Atrue (per-dye abundance maps), each in [0,1]
+    Atrue = place_rods_scene(H, W, R, rods_per=r o d s _ p e r:=rods_per, rng=rng,
+                             Lmin=Lmin, Lmax=Lmax, Wmin=Wmin_px, Wmax=Wmax_px)
+
+    # 2) Forward: Tclean = Atrue ⊗ E
+    Tclean = np.zeros((H, W, C), dtype=float)
     for c in range(C):
-        Tclean[:,:,c] = np.tensordot(Atrue, E[c,:], axes=([2],[0]))
+        # sum_r Atrue[:,:,r] * E[c,r]
+        Tclean[:, :, c] = np.tensordot(Atrue, E[c, :], axes=([2], [0]))
 
-    # global Poisson scaling to peak=255 (preserve brightness ratios)
-    peak = 255.0
+    # 3) Scale so max=255
     Tmax = float(np.max(Tclean))
-    if Tmax <= 0: 
-        Tnoisy = np.zeros_like(Tclean)
+    if Tmax <= 0:
+        st.error("Forward image is all zeros; try adjusting rods or spectra.")
+        st.stop()
+    s = 255.0 / Tmax
+    lam = Tclean * s
+
+    # 4) Poisson noise (scalar-wise => per-pixel-per-channel)
+    lam = np.nan_to_num(lam, nan=0.0, posinf=1e6, neginf=0.0)
+    lam = np.clip(lam, 0.0, 1e6)
+    Y = rng.poisson(lam).astype(float) / 255.0  # back to ~[0,1] scale
+
+    # 5) Unmix with the same E (8.9 nm sampled)
+    Ahat = nls_unmix(Y, E, iters=1500, tol=1e-6)
+
+    # 6) Global normalize ALL Ahat maps together
+    Amax = float(np.max(Ahat))
+    if Amax > 0:
+        Ahat_vis = Ahat / Amax
     else:
-        lam = Tclean * (peak / Tmax)
-        lam = np.nan_to_num(lam, nan=0.0, posinf=1e6, neginf=0.0)
-        lam = np.clip(lam, 0.0, 1e6)
-        Tnoisy = rng.poisson(lam).astype(float) / peak
+        Ahat_vis = np.zeros_like(Ahat)
 
-    # unmix
-    Ahat = nls_unmix(Tnoisy, E, iters=1500, tol=1e-6)
-    rmse = float(np.sqrt(np.mean((Ahat - Atrue)**2)))
-    return Atrue, Ahat, rmse
+    # -------------------- Display --------------------
+    st.subheader("Abundance maps (global-normalized across all dyes)")
+    # Composite "True" using Atrue (also globally normalized for viewing)
+    Atrue_max = float(np.max(Atrue))
+    Atrue_vis = Atrue / (Atrue_max + 1e-12)
 
-# -------------------- Main --------------------
-st.title("Fluorophore Selection for Multiplexed Imaging")
+    def colorize_stack(A, cols):
+        H,W,R = A.shape
+        rgb = np.zeros((H,W,3), dtype=float)
+        for r in range(R):
+            z = np.clip(A[:,:,r], 0.0, 1.0)
+            rgb += z[:,:,None] * cols[r][None,None,:]
+        m = float(rgb.max()); 
+        if m > 0: rgb /= m
+        return (rgb * 255).astype(np.uint8)
 
-use_pool = (source_mode == "From readout pool")
-if use_pool:
-    if not readout_pool:
-        st.info("Readout pool not found (data/readout_fluorophores.yaml)."); st.stop()
-    max_n = len(readout_pool)
-    N_pick = st.number_input("How many fluorophores", 1, max_n, min(4, max_n), 1)
-    groups = {"Pool": readout_pool[:]}
+    tiles = []
+    tiles.append(("True", colorize_stack(Atrue_vis, colors)))
+    for r, name in enumerate(picked):
+        # single-channel color (no per-channel renorm; we already did a global max)
+        z = Ahat_vis[:, :, r]
+        rgb = (np.clip(z,0,1)[:,:,None] * colors[r][None,None,:])
+        rgb = (rgb / (rgb.max()+1e-12) * 255).astype(np.uint8) if rgb.max()>0 else (rgb*255).astype(np.uint8)
+        tiles.append((name, rgb))
+
+    cols_ui = st.columns(len(tiles))
+    for c_ui, (title, im) in zip(cols_ui, tiles):
+        c_ui.image(im, use_container_width=True)
+        c_ui.caption(title)
+
 else:
-    all_probes = sorted(probe_map.keys())
-    picked = st.multiselect("Probes", options=all_probes)
-    if not picked:
-        st.info("Select at least one probe to proceed."); st.stop()
-    groups = {}
-    for p in picked:
-        cands = [f for f in probe_map.get(p, []) if f in dye_db]
-        if cands: groups[p] = cands
-    if not groups:
-        st.error("No valid candidates with spectra in dyes.yaml."); st.stop()
-    N_pick = None
-
-def run(groups, mode, laser_strategy, laser_list):
-    required_count = (N_pick if use_pool else None)
-
-    if mode == "Emission spectra":
-        # selection on emission-only (peak-normalized in utils)
-        E_norm, labels, idx_groups = build_emission_only_matrix(wl, dye_db, groups)
-        if E_norm.shape[1] == 0: st.error("No spectra."); st.stop()
-
-        sel_idx, _ = solve_lexicographic_k(
-            E_norm, idx_groups, labels,
-            levels=10, enforce_unique=True, required_count=required_count
-        )
-        colors = _ensure_colors(len(sel_idx))
-
-        # Selected table
-        if use_pool:
-            fluors = [labels[j].split(" – ",1)[1] for j in sel_idx]
-            st.subheader("Selected Fluorophores")
-            _html_two_row_table("Slot","Fluorophore",[f"Slot {i+1}" for i in range(len(fluors))],fluors)
-        else:
-            sel_pairs = [labels[j] for j in sel_idx]
-            st.subheader("Selected Fluorophores")
-            _html_two_row_table("Probe","Fluorophore",
-                                [s.split(" – ",1)[0] for s in sel_pairs],
-                                [s.split(" – ",1)[1] for s in sel_pairs])
-
-        # Pairwise similarities
-        S = cosine_similarity_matrix(E_norm[:, sel_idx])
-        tops = top_k_pairwise(S, [labels[j] for j in sel_idx], k=k_show)
-        st.subheader("Top pairwise similarities")
-        _html_two_row_table("Pair","Similarity",
-                            [_pair_only_fluor(a,b) for _,a,b in tops],
-                            [val for val,_,_ in tops],
-                            color_second_row=True, color_thresh=0.9, fmt2=True)
-
-        # Spectra viewer (per-trace normalized)
-        st.subheader("Spectra viewer")
-        fig = go.Figure()
-        for t,j in enumerate(sel_idx):
-            y = E_norm[:,j]; y = y/(np.max(y)+1e-12)
-            fig.add_trace(go.Scatter(
-                x=wl, y=y, mode="lines", name=labels[j],
-                line=dict(color=_rgb01_to_plotly(colors[t]), width=2)
-            ))
-        fig.update_layout(xaxis_title="Wavelength (nm)",
-                          yaxis_title="Normalized intensity",
-                          yaxis=dict(range=[0,1.05]))
-        st.plotly_chart(fig, use_container_width=True)
-
-        # Optional simulation (emission-only -> per-channel max scaling并不体现亮度差，这里仅用于结构观感)
-        # --- Emission branch: rod simulation + NLS (heavier) ---
-        if st.checkbox("Run rod simulation + NLS (heavier)", value=False):
-            # 1) 用 emission 的（已峰值归一的）发射谱做 8.9 nm 通道采样
-            C = 23
-            chan = 494.0 + 8.9 * np.arange(C)                # 8.9nm channel centers
-            E_em = cached_interpolate_E_on_channels(
-                wl, E_norm[:, sel_idx], chan                 # shape -> (C, R)
-            )
-        
-            # 2) 前向：全局缩放到 255 + Poisson；反演：NLS（函数内部不做全局max归一）
-            Atrue, Ahat, rmse = simulate_rods_and_unmix(E_em, H=160, W=160, rods_per=3)
-        
-            # 3) 用“同一个 Amax”对所有通道做全局归一来显示（保持通道间强弱）
-            colors = _ensure_colors(E_em.shape[1])
-            Amax_true = float(np.max(Atrue))
-            Amax_hat  = float(np.max(Ahat))
-        
-            def prettify_name(lbl: str) -> str:
-                name = lbl.split(" – ", 1)[1] if " – " in lbl else lbl
-                # AF405 -> AF 405
-                if name.upper().startswith("AF") and name[2:].isdigit():
-                    return f"AF {name[2:]}"
-                return name
-        
-            fluor_names = [prettify_name(labels[j]) for j in sel_idx]
-        
-            tiles = []
-            # True（全局合成）
-            true_rgb = colorize_composite_global(Atrue, colors, Amax_true)
-            tiles.append(("True", (true_rgb * 255).astype(np.uint8)))
-        
-            # 各通道（Ahat，全局归一）
-            for r, name in enumerate(fluor_names):
-                rgb_r = colorize_single_global(Ahat[:, :, r], colors[r], Amax_hat)
-                tiles.append((name, (rgb_r * 255).astype(np.uint8)))
-        
-            # 4) 展示
-            cols = st.columns(len(tiles))
-            for c, (title, im) in zip(cols, tiles):
-                c.image(im, use_container_width=True)
-                c.caption(title)
-        
-            st.caption(f"RMSE: {rmse:.4f}")
-
-
-    else:
-        if not laser_list:
-            st.error("Please specify laser wavelengths."); st.stop()
-
-        # Round A: emission-only provisional selection
-        E0, labels0, idx0 = build_emission_only_matrix(wl, dye_db, groups)
-        sel0, _ = solve_lexicographic_k(E0, idx0, labels0, levels=10, enforce_unique=True, required_count=required_count)
-        A_labels = [labels0[j] for j in sel0]
-
-        # (1) powers on A
-        if laser_strategy == "Simultaneous":
-            powers_A, _ = derive_powers_simultaneous(wl, dye_db, A_labels, laser_list)
-        else:
-            powers_A, _ = derive_powers_separate(wl, dye_db, A_labels, laser_list)
-
-        # first build (cached)
-        E_raw_all, E_norm_all, labels_all, idx_all = cached_build_effective_with_lasers(
-            wl, dye_db, groups, laser_list, laser_strategy, powers_A
-        )
-
-        # final selection
-        sel_idx, _ = solve_lexicographic_k(
-            E_norm_all, idx_all, labels_all, levels=10, enforce_unique=True, required_count=required_count
-        )
-        final_labels = [labels_all[j] for j in sel_idx]
-
-        # (2) recalibrate on final only
-        if laser_strategy == "Simultaneous":
-            powers, B = derive_powers_simultaneous(wl, dye_db, final_labels, laser_list)
-        else:
-            powers, B = derive_powers_separate(wl, dye_db, final_labels, laser_list)
-
-        # second build: only selected subset (cached)
-        if use_pool:
-            small_groups = {"Pool":[s.split(" – ",1)[1] for s in final_labels]}
-        else:
-            small_groups = {}
-            for s in final_labels:
-                p,f = s.split(" – ",1)
-                small_groups.setdefault(p,[]).append(f)
-
-        E_raw_sel, E_norm_sel, labels_sel, _ = cached_build_effective_with_lasers(
-            wl, dye_db, small_groups, laser_list, laser_strategy, powers
-        )
-
-        # Selected table
-        st.subheader("Selected Fluorophores (with lasers)")
-        fluors = [s.split(" – ",1)[1] for s in labels_sel]
-        _html_two_row_table("Slot","Fluorophore",
-                            [f"Slot {i+1}" for i in range(len(fluors))],
-                            fluors)
-
-        # Pairwise on normalized effective spectra
-        S = cosine_similarity_matrix(E_norm_sel)
-        tops = top_k_pairwise(S, labels_sel, k=k_show)
-        st.subheader("Top pairwise similarities")
-        _html_two_row_table("Pair","Similarity",
-                            [_pair_only_fluor(a,b) for _,a,b in tops],
-                            [val for val,_,_ in tops],
-                            color_second_row=True, color_thresh=0.9, fmt2=True)
-
-        # Spectra viewer (use absolute effective spectra /B → preserves relative brightness)
-        st.subheader("Spectra viewer")
-        colors = _ensure_colors(len(labels_sel))
-        fig = go.Figure()
-        for t in range(len(labels_sel)):
-            y = E_raw_sel[:, t] / (B + 1e-12)
-            fig.add_trace(go.Scatter(
-                x=wl, y=y, mode="lines", name=labels_sel[t],
-                line=dict(color=_rgb01_to_plotly(colors[t]), width=2)
-            ))
-        fig.update_layout(
-            xaxis_title="Wavelength (nm)",
-            yaxis_title="Normalized intensity (relative to B)",
-            yaxis=dict(range=[0,1.05])
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        # Optional simulation: Predicted uses absolute spectra + global scaling → show brightness differences
-        if st.checkbox("Run rod simulation + NLS (heavier)", value=False):
-            # 与 Spectra viewer 同源的绝对有效谱
-            C = 23
-            chan = 494.0 + 8.9 * np.arange(C)
-            E_abs = E_raw_sel / (B + 1e-12)                    # (Wlen, R)
-            E = cached_interpolate_E_on_channels(wl, E_abs, chan)  # (C, R)
-        
-            # 前向：全局255 + Poisson；反演：NLS（不再内归一）
-            Atrue, Ahat, rmse = simulate_rods_and_unmix(E, H=160, W=160, rods_per=3)
-        
-            # —— 全局归一显示（关键）——
-            colors = _ensure_colors(E.shape[1])
-            # 用同一个 Amax 对所有通道归一，保留 AF532 等暗通道的弱亮度
-            Amax_true = float(np.max(Atrue))
-            Amax_hat  = float(np.max(Ahat))
-        
-            def prettify_name(s):
-                # 原 label 形如 "Pool – AF405" 或 "Probe – AF405"
-                name = s.split(" – ", 1)[1] if " – " in s else s
-                # AF405 -> AF 405
-                if name.upper().startswith("AF") and len(name) > 2 and name[2:].isdigit():
-                    return f"AF {name[2:]}"
-                return name
-        
-            fluor_names = [prettify_name(s) for s in labels_sel]
-        
-            imgs = []
-            # True
-            true_rgb = colorize_composite_global(Atrue, colors, Amax_true)
-            imgs.append(("True", (true_rgb * 255).astype(np.uint8)))
-            # 各通道（Ahat，全局归一）
-            for r, name in enumerate(fluor_names):
-                rgb_r = colorize_single_global(Ahat[:, :, r], colors[r], Amax_hat)
-                imgs.append((name, (rgb_r * 255).astype(np.uint8)))
-        
-            cols = st.columns(len(imgs))
-            for c, (title, im) in zip(cols, imgs):
-                c.image(im, use_container_width=True)
-                c.caption(title)
-        
-            st.caption(f"RMSE: {rmse:.4f}")
-
-# -------------------- Execute --------------------
-if __name__ == "__main__":
-    run(groups, mode, laser_strategy, laser_list)
-
+    st.info("点击上面的 **Run simulation + unmix** 按钮执行流程。")
