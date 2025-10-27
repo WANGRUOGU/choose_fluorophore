@@ -188,60 +188,82 @@ def _ensure_colors(R):
                       np.abs(np.sin(2*np.pi*(hs+0.66)))*0.7+0.3], axis=1)
     return extra[:R]
 
-def _capsule_mask(H, W, cx, cy, length, width, theta_rad):
+def _capsule_profile(H, W, cx, cy, length, width, theta_rad):
+    """
+    Capsule (rounded rectangle) with intensity decaying from centerline to boundary:
+      - rect segment: val = 1 - |yp|/r
+      - endcaps:      val = 1 - rho/r
+    """
     yy, xx = np.mgrid[0:H, 0:W].astype(float)
     X = xx - cx
     Y = yy - cy
     c, s = np.cos(theta_rad), np.sin(theta_rad)
     xp =  c * X + s * Y
     yp = -s * X + c * Y
+
     half_L = 0.5 * length
     r = 0.5 * width
-    rect = (np.abs(xp) <= half_L) & (np.abs(yp) <= r)
-    dl = (xp + half_L) ** 2 + yp ** 2 <= r ** 2
-    dr = (xp - half_L) ** 2 + yp ** 2 <= r ** 2
-    return (rect | dl | dr)
+
+    # rectangular mid segment
+    rect_mask = (np.abs(xp) <= half_L) & (np.abs(yp) <= r)
+    rect_val = np.clip(1.0 - np.abs(yp) / (r + 1e-12), 0.0, 1.0)
+
+    # endcaps (left/right)
+    rhoL = np.sqrt((xp + half_L) ** 2 + yp ** 2)
+    rhoR = np.sqrt((xp - half_L) ** 2 + yp ** 2)
+    capL_mask = rhoL <= r
+    capR_mask = rhoR <= r
+    capL_val = np.clip(1.0 - rhoL / (r + 1e-12), 0.0, 1.0)
+    capR_val = np.clip(1.0 - rhoR / (r + 1e-12), 0.0, 1.0)
+
+    val = np.zeros((H, W), dtype=float)
+    val[rect_mask] = rect_val[rect_mask]
+    val[capL_mask] = np.maximum(val[capL_mask], capL_val[capL_mask])
+    val[capR_mask] = np.maximum(val[capR_mask], capR_val[capR_mask])
+    return val, (rect_mask | capL_mask | capR_mask)
 
 def _place_rods_scene(H, W, R, rods_per=3, max_tries=200, rng=None):
     rng = np.random.default_rng() if rng is None else rng
     Atrue = np.zeros((H, W, R), dtype=float)
-    rod_masks = [[] for _ in range(R)]
     occ = np.zeros((H, W), dtype=bool)
+
+    # sizes (square frame; lengths/widths kept reasonable)
     L_min, L_max = 40, 80
     W_min, W_max = 10, 18
+
     for r in range(R):
         placed, tries = 0, 0
         while placed < rods_per and tries < max_tries:
             tries += 1
-            length = rng.integers(L_min, L_max + 1)
-            width  = rng.integers(W_min, W_max + 1)
-            theta  = rng.uniform(0, np.pi)
-            margin = 5 + int(max(length, width) / 2)
+            length = int(rng.integers(L_min, L_max + 1))
+            width  = int(rng.integers(W_min, W_max + 1))
+            theta  = float(rng.uniform(0, np.pi))
+            margin = 6 + int(max(length, width) / 2)
             if W - 2*margin <= 2 or H - 2*margin <= 2:
                 break
-            cx = rng.integers(margin, W - margin)
-            cy = rng.integers(margin, H - margin)
-            m = _capsule_mask(H, W, cx, cy, length, width, theta)
-            if not np.any(m):      continue
-            if np.any(occ & m):    continue
-            yy, xx = np.mgrid[0:H, 0:W]
-            dist = ((xx - cx) ** 2 + (yy - cy) ** 2) ** 0.5
-            prof = np.clip(1.0 - (dist / (0.6 * length)), 0.2, 1.0)
-            a = np.zeros((H, W), dtype=float); a[m] = prof[m]
-            if a.max() > 0: a = a / a.max()
-            Atrue[:, :, r] += a
-            rod_masks[r].append(m.copy())
-            occ |= m
+            cx = int(rng.integers(margin, W - margin))
+            cy = int(rng.integers(margin, H - margin))
+
+            prof, mask = _capsule_profile(H, W, cx, cy, length, width, theta)
+            if not np.any(mask):      continue
+            if np.any(occ & mask):    continue
+
+            # normalize per-rod to [0,1], then add
+            if prof.max() > 0:
+                prof = prof / prof.max()
+            Atrue[:, :, r] = np.maximum(Atrue[:, :, r], prof)  # no overlap inside same fluor
+            occ |= mask
             placed += 1
-        while len(rod_masks[r]) < rods_per:
-            rod_masks[r].append(np.zeros((H, W), dtype=bool))
-    return Atrue, rod_masks
+
+    # small softening to avoid “hard edge”
+    Atrue = np.clip(Atrue, 0.0, 1.0)
+    return Atrue
 
 def add_poisson_noise_per_channel(Tclean, peak=255, rng=None):
     """
     For each channel:
       - scale so its max -> peak (e.g., 255)
-      - sample Y ~ Poisson(X_scaled)
+      - sample Y ~ Poisson(X_scaled) per pixel
       - scale back to [0,1] by /peak
     """
     rng = np.random.default_rng() if rng is None else rng
@@ -258,17 +280,6 @@ def add_poisson_noise_per_channel(Tclean, peak=255, rng=None):
         counts = rng.poisson(lam).astype(float)
         Tnoisy[:, :, c] = counts / peak
     return Tnoisy
-
-def colorize_dominant(A, colors):
-    H, W, R = A.shape
-    idx = np.argmax(A, axis=2)
-    val = A[np.arange(H)[:, None], np.arange(W)[None, :], idx]
-    rgb = np.zeros((H, W, 3), dtype=float)
-    for r in range(R):
-        mask = (idx == r)
-        for c in range(3):
-            rgb[..., c][mask] = colors[r, c] * val[mask]
-    return rgb
 
 def nls_unmix(T, E, iters=2000, tol=1e-7):
     """
@@ -293,18 +304,27 @@ def nls_unmix(T, E, iters=2000, tol=1e-7):
             break
     return A
 
+def _to_uint8_gray(img2d):
+    p = float(np.percentile(img2d, 99.5))
+    if p <= 1e-8:
+        return np.zeros_like(img2d, dtype=np.uint8)
+    z = np.clip(img2d / p, 0.0, 1.0)
+    z = np.power(z, 0.8)  # slight gamma
+    return (z * 255.0).astype(np.uint8)
+
 def simulate_rods_and_unmix(E, H=256, W=256, rods_per=3, rng=None):
     """
-    Build one mixed image with R*rods_per rods (non-overlapping), add Poisson noise,
-    run NLS, compute per-fluor RMSE and colored images.
+    Build one mixed image with R*rods_per rods (non-overlapping),
+    add Poisson noise, run NLS, and return maps & overall RMSE.
     E: (C,R) spectra on 8.9nm grid
+    Returns:
+      Atrue (H,W,R), Ahat (H,W,R), rmse_all (float)
     """
     rng = np.random.default_rng() if rng is None else rng
     C, R = E.shape[0], E.shape[1]
-    colors = _ensure_colors(R)
 
-    # 1) rods scene
-    Atrue, _ = _place_rods_scene(H, W, R, rods_per=rods_per, rng=rng)
+    # 1) rods scene (square)
+    Atrue = _place_rods_scene(H, W, R, rods_per=rods_per, rng=rng)
 
     # 2) forward (C channels)
     Tclean = np.zeros((H, W, C), dtype=float)
@@ -314,22 +334,14 @@ def simulate_rods_and_unmix(E, H=256, W=256, rods_per=3, rng=None):
     # 3) Poisson noise (per-channel peak=255)
     Tnoisy = add_poisson_noise_per_channel(Tclean, peak=255, rng=rng)
 
-    # 4) NLS unmix
+    # 4) NLS unmix on the single mixed image
     M = Tnoisy.reshape(-1, C)
     Ahat = nls_unmix(M, E).reshape(H, W, R)
 
-    # 5) RMSE & colored images
-    imgs_rgb, rmses = [], []
-    for r in range(R):
-        err = Ahat[:, :, r] - Atrue[:, :, r]
-        rmses.append(float(np.sqrt(np.mean(err**2))))
-        rgb = colorize_dominant(Ahat, colors)
-        p = float(np.percentile(rgb, 99.0))
-        if p > 1e-8:
-            rgb = np.clip(rgb / p, 0.0, 1.0)
-        rgb = np.power(np.clip(rgb + 0.03, 0.0, 1.0), 0.7)
-        imgs_rgb.append(rgb)
-    return imgs_rgb, rmses, Atrue, Ahat
+    # 5) Overall RMSE across all entries
+    rmse_all = float(np.sqrt(np.mean((Ahat - Atrue) ** 2)))
+
+    return Atrue, Ahat, rmse_all
 
 # ---------- Main ----------
 st.title("Fluorophore Selection for Multiplexed Imaging")
@@ -424,22 +436,26 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
         )
         st.plotly_chart(fig, use_container_width=True)
 
-        # --- Rod simulation & unmix with Poisson noise (no DB needed) ---
+        # --- Rod simulation & unmix with Poisson noise ---
         C = 23
         start_nm = 494.0
         step_nm = 8.9
         chan_centers = start_nm + step_nm * np.arange(C)
         E_sel = E_norm[:, sel_idx]
         E = interpolate_E_on_channels(wl, E_sel, chan_centers)  # (C, R)
-        st.subheader("Simulate & unmix with rod-shaped cells (Poisson noise)")
-        imgs_rgb, rmses, _, _ = simulate_rods_and_unmix(
+
+        st.subheader("Rod-shaped cells: ground-truth vs. NLS unmixing (Poisson noise)")
+        Atrue, Ahat, rmse_all = simulate_rods_and_unmix(
             E=E, H=256, W=256, rods_per=3, rng=np.random.default_rng(2025)
         )
-        cols = st.columns(E.shape[1])
-        for r in range(E.shape[1]):
-            with cols[r]:
-                st.image((imgs_rgb[r]*255).astype(np.uint8), use_container_width=True)
-                st.caption(f"Fluor #{r+1} • RMSE = {rmses[r]:.4f}")
+        R = E.shape[1]
+        for r in range(R):
+            colT, colH = st.columns(2)
+            with colT:
+                st.image(_to_uint8_gray(Atrue[:, :, r]), caption=f"True abundance (Fluor #{r+1})", use_container_width=True)
+            with colH:
+                st.image(_to_uint8_gray(Ahat[:, :, r]), caption=f"NLS abundance (Fluor #{r+1})", use_container_width=True)
+        st.caption(f"Overall RMSE (Ahat vs Atrue): {rmse_all:.4f}")
 
     else:
         if not laser_list:
@@ -597,22 +613,26 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
             )
         st.plotly_chart(fig, use_container_width=True)
 
-        # --- Rod simulation & unmix with Poisson noise ---
+        # --- Rod simulation & unmix (Poisson) ---
         C = 23
         start_nm = 494.0
         step_nm = 8.9
         chan_centers = start_nm + step_nm * np.arange(C)
         E_sel = E_norm_all[:, sel_idx]
         E = interpolate_E_on_channels(wl, E_sel, chan_centers)  # (C, R)
-        st.subheader("Simulate & unmix with rod-shaped cells (Poisson noise)")
-        imgs_rgb, rmses, _, _ = simulate_rods_and_unmix(
+
+        st.subheader("Rod-shaped cells: ground-truth vs. NLS unmixing (Poisson noise)")
+        Atrue, Ahat, rmse_all = simulate_rods_and_unmix(
             E=E, H=256, W=256, rods_per=3, rng=np.random.default_rng(2025)
         )
-        cols = st.columns(E.shape[1])
-        for r in range(E.shape[1]):
-            with cols[r]:
-                st.image((imgs_rgb[r]*255).astype(np.uint8), use_container_width=True)
-                st.caption(f"Fluor #{r+1} • RMSE = {rmses[r]:.4f}")
+        R = E.shape[1]
+        for r in range(R):
+            colT, colH = st.columns(2)
+            with colT:
+                st.image(_to_uint8_gray(Atrue[:, :, r]), caption=f"True abundance (Fluor #{r+1})", use_container_width=True)
+            with colH:
+                st.image(_to_uint8_gray(Ahat[:, :, r]), caption=f"NLS abundance (Fluor #{r+1})", use_container_width=True)
+        st.caption(f"Overall RMSE (Ahat vs Atrue): {rmse_all:.4f}")
 
 # Execute
 run_selection_and_display(groups, mode, laser_strategy, laser_list)
