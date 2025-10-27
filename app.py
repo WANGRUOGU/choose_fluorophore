@@ -35,7 +35,7 @@ CHANNEL_WL = np.array([
 ], dtype=float)
 
 # ===== H5 datasets for synthetic generation =====
-CELL_H5_PATH  = "assets/cell_abundance_singleF.h5"   # /cells: (N,Ht,Wt), /labels: (N,)
+CELL_H5_PATH  = "assets/cell_abundance.h5"   # /cells: (N,Ht,Wt), /labels: (N,)
 NOISE_H5_PATH = "assets/noise_quantiles.h5"          # /edges:(B+1,), /qs:(nq,), /Q:(B,C,nq)
 
 @st.cache_resource(show_spinner=False)
