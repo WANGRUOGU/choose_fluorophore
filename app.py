@@ -187,7 +187,26 @@ def colorize_composite(A,colors):
     m=float(rgb.max()); 
     if m>0: rgb/=m
     return rgb
+    
+def colorize_single_global(A_r, color, global_max):
+    """
+    使用同一个 global_max（来自 Ahat 的全局最大值）做归一，不再按通道单独归一。
+    这样就能保留不同染料之间的亮度差。
+    """
+    if global_max <= 0:
+        z = np.zeros_like(A_r, dtype=float)
+    else:
+        z = np.clip(A_r / global_max, 0.0, 1.0)
+    return z[:, :, None] * np.asarray(color)[None, None, :]
 
+def colorize_composite_global(A, colors, global_max):
+    """
+    合成图也用同一个 global_max；各染料的相对强度会保留。
+    """
+    H, W, R = A.shape
+    rgb = np.zeros((H, W, 3), dtype=float)
+    for r in range(R):
+        rgb += colorize_single_global(A[:,
 # -------------------- Rod (capsule) scene --------------------
 def _capsule_profile(H,W,cx,cy,length,width,theta):
     yy,xx = np.mgrid[0:H,0:W].astype(float)
@@ -433,19 +452,36 @@ def run(groups, mode, laser_strategy, laser_list):
 
         # Optional simulation: Predicted uses absolute spectra + global scaling → show brightness differences
         if st.checkbox("Run rod simulation + NLS (heavier)", value=False):
+            # 1) 用 Spectra viewer 同源的绝对有效谱：E_abs = E_raw_sel / B
             C = 23
-            chan = 494.0 + 8.9*np.arange(C)
-            E = cached_interpolate_E_on_channels(wl, E_raw_sel/(B+1e-12), chan)
+            chan = 494.0 + 8.9 * np.arange(C)
+            E_abs = E_raw_sel / (B + 1e-12)         # (Wavelength, R)
+            E = cached_interpolate_E_on_channels(wl, E_abs, chan)  # (C, R)
+        
+            # 2) 仿真 + NLS（全局 255 + Poisson）
             Atrue, Ahat, rmse = simulate_rods_and_unmix(E, H=160, W=160, rods_per=3)
-            imgs = [("True (composite)", (colorize_composite(Atrue, colors)*255).astype(np.uint8))]
-            names = [s.split(" – ",1)[1] for s in labels_sel]
-            for r, name in enumerate(names):
-                rgb = (colorize_single(Ahat[:,:,r], colors[r])*255).astype(np.uint8)
-                imgs.append((f"NLS ({name})", rgb))
-            cs = st.columns(len(imgs))
-            for c,(title,im) in zip(cs, imgs):
-                c.image(im, use_container_width=True); c.caption(title)
-            st.caption(f"Overall RMSE: {rmse:.4f}")
+        
+            # 3) 全局归一化显示（关键！）
+            colors = _ensure_colors(E.shape[1])
+            Amax_true = float(Atrue.max())
+            Amax_hat  = float(Ahat.max())
+        
+            imgs = []
+            true_rgb = colorize_composite_global(Atrue, colors, Amax_true)
+            imgs.append(("True (composite)", (true_rgb * 255).astype(np.uint8)))
+        
+            fluor_names = [s.split(" – ", 1)[1] for s in labels_sel]
+            for r, name in enumerate(fluor_names):
+                rgb_r = colorize_single_global(Ahat[:, :, r], colors[r], Amax_hat)
+                imgs.append((f"NLS ({name})", (rgb_r * 255).astype(np.uint8)))
+        
+            cols = st.columns(len(imgs))
+            for c, (title, im) in zip(cols, imgs):
+                c.image(im, use_container_width=True)
+                c.caption(title)
+        
+            st.caption(f"Overall RMSE (Ahat vs Atrue): {rmse:.4f}")
+
 
 # -------------------- Execute --------------------
 if __name__ == "__main__":
