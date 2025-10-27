@@ -525,39 +525,40 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
         st.plotly_chart(fig, use_container_width=True)
 
         # ===== Simulate & Unmix (8.9 nm channels) =====
-        st.subheader("Simulate & unmix (8.9 nm channels)")
-        try:
-            f_cells, cells_ds, cells_labels, cell_meta = load_cell_db()
-            f_noise, edges, qs, Q = load_noise_db()
-            have_data = True
-        except Exception as e:
-            have_data = False
-            st.info(f"Cell/noise DB not available: {e}")
+st.subheader("Simulate & unmix (8.9 nm channels)")
+try:
+    f_cells, cells_ds, cells_labels, cell_meta = load_cell_db()
+    f_noise, edges, qs, Q = load_noise_db()
+    have_data = True
+except Exception as e:
+    have_data = False
+    st.info(f"Cell/noise DB not available: {e}")
 
-        if have_data:
-            # Build E (C×R) from emission curves used above
-            E = build_E_matrix_from_selected(wl, labels_pair, sel_idx, E_source=E_norm, mode="Emission spectra", B=None)
+if have_data:
+    # Build E (C×R) from emission curves used above
+    E = build_E_matrix_from_selected(wl, labels_pair, sel_idx, E_source=E_norm, mode="Emission spectra", B=None)
 
-            # Generate three images and unmix
-            T_list, Atrue_list = generate_synthetic_images(
-                E=E, cells_ds=cells_ds, n_images=3,
-                rng=np.random.default_rng(123), noise_db=(edges, qs, Q)
-            )
+    # Generate images & unmix
+    T_list, Atrue_list = generate_synthetic_images(
+        E=E, cells_ds=cells_ds, n_images=3,
+        rng=np.random.default_rng(123), noise_db=(edges, qs, Q)
+    )
 
-            R = len(sel_idx)
-            COLORS = DEFAULT_COLORS[:R]
-            cols = st.columns(R)
+    R = len(sel_idx)
+    COLORS = DEFAULT_COLORS[:R]
 
-            for row in range(3):
-                T = T_list[row]
-                A_true = Atrue_list[row]
-                A_hat = nls_unmix(T, E, iters=400, tol=1e-8, verbose=False)
-                rmse = compute_rmse(A_hat, A_true)
-                rgb = colorize_dominant(A_hat, COLORS)
-                rgb = rgb / (rgb.max() + 1e-12)
-                for c in range(R):
-                    with cols[c]:
-                        st.image((rgb*255).astype(np.uint8), caption=f"RMSE={rmse:.4f}", use_container_width=True)
+    for row in range(3):
+        T = T_list[row]
+        A_true = Atrue_list[row]
+        A_hat = nls_unmix(T, E, iters=400, tol=1e-8, verbose=False)
+        rmse = compute_rmse(A_hat, A_true)
+
+        rgb = colorize_dominant(A_hat, COLORS)
+        rgb = rgb / (rgb.max() + 1e-12)  # ensure visible
+
+        st.image((rgb * 255).astype(np.uint8), use_container_width=True)
+        st.caption(f"RMSE = {rmse:.4f}")
+
 
     else:
         if not laser_list:
@@ -738,40 +739,40 @@ def run_selection_and_display(groups, mode, laser_strategy, laser_list):
         st.plotly_chart(fig, use_container_width=True)
 
         # ===== Simulate & Unmix (8.9 nm channels) =====
-        st.subheader("Simulate & unmix (8.9 nm channels)")
-        try:
-            f_cells, cells_ds, cells_labels, cell_meta = load_cell_db()
-            f_noise, edges, qs, Q = load_noise_db()
-            have_data = True
-        except Exception as e:
-            have_data = False
-            st.info(f"Cell/noise DB not available: {e}")
+st.subheader("Simulate & unmix (8.9 nm channels)")
+try:
+    f_cells, cells_ds, cells_labels, cell_meta = load_cell_db()
+    f_noise, edges, qs, Q = load_noise_db()
+    have_data = True
+except Exception as e:
+    have_data = False
+    st.info(f"Cell/noise DB not available: {e}")
 
-        if have_data:
-            # Build E (C×R) from final effective spectra displayed above
-            E = build_E_matrix_from_selected(
-                wl, labels_all, sel_idx, E_source=E_raw_all, mode="Predicted spectra", B=B
-            )
+if have_data:
+    # Build E (C×R) from emission curves used above
+    E = build_E_matrix_from_selected(wl, labels_pair, sel_idx, E_source=E_norm, mode="Emission spectra", B=None)
 
-            T_list, Atrue_list = generate_synthetic_images(
-                E=E, cells_ds=cells_ds, n_images=3,
-                rng=np.random.default_rng(123), noise_db=(edges, qs, Q)
-            )
+    # Generate images & unmix
+    T_list, Atrue_list = generate_synthetic_images(
+        E=E, cells_ds=cells_ds, n_images=3,
+        rng=np.random.default_rng(123), noise_db=(edges, qs, Q)
+    )
 
-            R = len(sel_idx)
-            COLORS = DEFAULT_COLORS[:R]
-            cols = st.columns(R)
+    R = len(sel_idx)
+    COLORS = DEFAULT_COLORS[:R]
 
-            for row in range(3):
-                T = T_list[row]
-                A_true = Atrue_list[row]
-                A_hat = nls_unmix(T, E, iters=400, tol=1e-8, verbose=False)
-                rmse = compute_rmse(A_hat, A_true)
-                rgb = colorize_dominant(A_hat, COLORS)
-                rgb = rgb / (rgb.max() + 1e-12)
-                for c in range(R):
-                    with cols[c]:
-                        st.image((rgb*255).astype(np.uint8), caption=f"RMSE={rmse:.4f}", use_container_width=True)
+    for row in range(3):
+        T = T_list[row]
+        A_true = Atrue_list[row]
+        A_hat = nls_unmix(T, E, iters=400, tol=1e-8, verbose=False)
+        rmse = compute_rmse(A_hat, A_true)
+
+        rgb = colorize_dominant(A_hat, COLORS)
+        rgb = rgb / (rgb.max() + 1e-12)  # ensure visible
+
+        st.image((rgb * 255).astype(np.uint8), use_container_width=True)
+        st.caption(f"RMSE = {rmse:.4f}")
+
 
 # Execute
 run_selection_and_display(groups, mode, laser_strategy, laser_list)
