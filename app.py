@@ -555,7 +555,8 @@ def run(groups, mode, laser_strategy, laser_list):
                 rmse_rows.append([nm, rmse_r])
             st.subheader("Per-fluorophore RMSE")
             _html_table(headers=["Fluorophore", "RMSE"], rows=rmse_rows, num_cols={1})
-             st.stop()
+            
+            st.stop()
 
 
 # -------------------- Execute --------------------
