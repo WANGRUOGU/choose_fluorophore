@@ -403,7 +403,7 @@ def run(groups, mode, laser_strategy, laser_list):
         st.plotly_chart(fig, use_container_width=True)
 
                 # Simulations
-        if st.checkbox("Simulations", value=False):
+        if st.checkbox("Simulations", value=False, key="sim_emission"):
             C = 23
             chan = 494.0 + 8.9*np.arange(C)
             E = cached_interpolate_E_on_channels(wl, E_norm[:, sel_idx], chan)
@@ -517,7 +517,7 @@ def run(groups, mode, laser_strategy, laser_list):
         st.plotly_chart(fig, use_container_width=True)
 
                 # Simulations
-        if st.checkbox("Simulations", value=False):
+        if st.checkbox("Simulations", value=False, key="sim_predicted"):
             C = 23
             chan = 494.0 + 8.9*np.arange(C)
             # 与“谱图查看器”一致地用 E_raw_sel/(B+eps) 进入通道
