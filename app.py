@@ -441,7 +441,7 @@ def run(groups, mode, laser_strategy, laser_list):
             st.subheader("Per-fluorophore RMSE")
             _html_table(headers=["Fluorophore", "RMSE"], rows=rmse_rows, num_cols={1})
 
-
+             st.stop()
         # Round A: provisional selection on emission-only
         E0, labels0, idx0 = build_emission_only_matrix(wl, dye_db, groups)
         sel0, _ = solve_lexicographic_k(E0, idx0, labels0, levels=10, enforce_unique=True, required_count=required_count)
@@ -555,6 +555,7 @@ def run(groups, mode, laser_strategy, laser_list):
                 rmse_rows.append([nm, rmse_r])
             st.subheader("Per-fluorophore RMSE")
             _html_table(headers=["Fluorophore", "RMSE"], rows=rmse_rows, num_cols={1})
+             st.stop()
 
 
 # -------------------- Execute --------------------
