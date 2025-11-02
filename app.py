@@ -74,6 +74,75 @@ DEFAULT_COLORS = np.array([
     [0.85, 0.50, 0.35], [0.60, 0.60, 0.60],
 ], dtype=float)
 
+def _to_uint8_gray(img2d):
+    z = np.asarray(img2d, dtype=float)
+    m = float(z.max())
+    if m > 0:
+        z = z / m
+    return (np.clip(z, 0, 1) * 255).astype(np.uint8)
+
+def _argmax_labelmap(Ahat, colors):
+    """
+    Ahat(H,W,R) -> RGB(H,W,3). 每个像素取 argmax 通道对应的颜色。
+    若该像素所有通道为 0，则设为黑色。
+    """
+    H, W, R = Ahat.shape
+    idx = np.argmax(Ahat, axis=2)                       # (H,W)
+    mx  = np.max(Ahat, axis=2)                          # (H,W)
+    rgb = np.zeros((H, W, 3), dtype=float)
+    cols = np.asarray(colors, dtype=float)
+
+    # 将每个像素映射到对应颜色
+    rgb = cols[idx]                                     # (H,W,3)
+    # 对“全零像素”强制置黑
+    rgb[mx <= 0] = 0.0
+
+    # 保持 0~1
+    rgb = np.clip(rgb, 0, 1)
+    return (rgb * 255).astype(np.uint8)
+
+def _chunk(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i+n]
+
+def _show_bw_grid(title, imgs_uint8, labels, cols_per_row=6):
+    st.markdown(f"**{title}**")
+    for row_imgs, row_labels in zip(_chunk(imgs_uint8, cols_per_row), _chunk(labels, cols_per_row)):
+        cs = st.columns(len(row_imgs))
+        for c, im, lb in zip(cs, row_imgs, row_labels):
+            c.image(im, use_container_width=True, clamp=True)
+            c.caption(lb)
+
+def _html_table(headers, rows, num_cols=None):
+    """
+    headers: List[str]
+    rows: List[List[Any]]
+    num_cols: set[int] 这些列按数值格式化（默认空）
+    """
+    num_cols = num_cols or set()
+    def esc(x): 
+        return str(x).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+    thead = "".join(f"<th style='padding:6px 10px;border:1px solid #ddd;text-align:left'>{esc(h)}</th>" for h in headers)
+    trs = []
+    for r in rows:
+        tds=[]
+        for j, v in enumerate(r):
+            text = f"{float(v):.4f}" if j in num_cols else esc(v)
+            align = "right" if j in num_cols else "left"
+            tds.append(f"<td style='padding:6px 10px;border:1px solid #ddd;text-align:{align}'>{text}</td>")
+        trs.append(f"<tr>{''.join(tds)}</tr>")
+    st.markdown(
+        f"""
+        <div style="overflow-x:auto;">
+          <table style="border-collapse:collapse;width:100%;table-layout:auto;">
+            <thead><tr>{thead}</tr></thead>
+            <tbody>{''.join(trs)}</tbody>
+          </table>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
 def _ensure_colors(R):
     if R <= len(DEFAULT_COLORS): return DEFAULT_COLORS[:R]
     hs = np.linspace(0, 1, R, endpoint=False)
@@ -333,24 +402,45 @@ def run(groups, mode, laser_strategy, laser_list):
                           yaxis=dict(range=[0,1.05]))
         st.plotly_chart(fig, use_container_width=True)
 
-        # Simulations
+                # Simulations
         if st.checkbox("Simulations", value=False):
-            C = 23; chan = 494.0 + 8.9*np.arange(C)
+            C = 23
+            chan = 494.0 + 8.9*np.arange(C)
             E = cached_interpolate_E_on_channels(wl, E_norm[:, sel_idx], chan)
-            Atrue, Ahat, rmse = simulate_rods_and_unmix(E, H=160, W=160, rods_per=3)
-            imgs = [("True", (colorize_composite(Atrue, colors)*255).astype(np.uint8))]
-            names = [_prettify_name(labels[j]) for j in sel_idx]
-            for r, name in enumerate(names):
-                rgb = (colorize_single(Ahat[:,:,r], colors[r])*255).astype(np.uint8)
-                imgs.append((name, rgb))
-            cs = st.columns(len(imgs))
-            for c,(title,im) in zip(cs, imgs):
-                c.image(im, use_container_width=True); c.caption(title)
-            st.caption(f"RMSE: {rmse:.4f}")
 
-    else:
-        if not laser_list:
-            st.error("Please specify laser wavelengths."); st.stop()
+            # 运行仿真
+            Atrue, Ahat, _ = simulate_rods_and_unmix(E, H=160, W=160, rods_per=3)
+
+            # 顶部两张大图：左=真实复合图（保持你的原显示方式），右=标签着色的unmixing
+            colL, colR = st.columns(2)
+            true_rgb = (colorize_composite(Atrue, colors) * 255).astype(np.uint8)
+            labelmap_rgb = _argmax_labelmap(Ahat, colors)
+
+            with colL:
+                st.image(true_rgb, use_container_width=True, clamp=True)
+                st.caption("True (composite)")
+
+            with colR:
+                st.image(labelmap_rgb, use_container_width=True, clamp=True)
+                st.caption("Unmixing (argmax label map)")
+
+            # 下方黑白分图：第一排 True、第二排 Unmixing
+            names = [_prettify_name(labels[j]) for j in sel_idx]
+            true_bw  = [_to_uint8_gray(Atrue[:,:,r]) for r in range(Atrue.shape[2])]
+            unmix_bw = [_to_uint8_gray(Ahat [:,:,r]) for r in range(Ahat.shape[2])]
+
+            st.divider()
+            _show_bw_grid("Per-fluorophore (True, grayscale)",   true_bw,  names, cols_per_row=6)
+            _show_bw_grid("Per-fluorophore (Unmixing, grayscale)", unmix_bw, names, cols_per_row=6)
+
+            # 每个染料的 RMSE 表
+            rmse_rows = []
+            for r, nm in enumerate(names):
+                rmse_r = np.sqrt(np.mean((Ahat[:,:,r] - Atrue[:,:,r])**2))
+                rmse_rows.append([nm, rmse_r])
+            st.subheader("Per-fluorophore RMSE")
+            _html_table(headers=["Fluorophore", "RMSE"], rows=rmse_rows, num_cols={1})
+
 
         # Round A: provisional selection on emission-only
         E0, labels0, idx0 = build_emission_only_matrix(wl, dye_db, groups)
@@ -426,22 +516,46 @@ def run(groups, mode, laser_strategy, laser_list):
         )
         st.plotly_chart(fig, use_container_width=True)
 
-        # Simulations
+                # Simulations
         if st.checkbox("Simulations", value=False):
             C = 23
             chan = 494.0 + 8.9*np.arange(C)
-            # For predicted, using E_raw_sel/(B+eps) keeps spectra aligned with viewer choice
+            # 与“谱图查看器”一致地用 E_raw_sel/(B+eps) 进入通道
             E = cached_interpolate_E_on_channels(wl, E_raw_sel/(B+1e-12), chan)
-            Atrue, Ahat, rmse = simulate_rods_and_unmix(E, H=160, W=160, rods_per=3)
-            imgs = [("True", (colorize_composite(Atrue, colors)*255).astype(np.uint8))]
+
+            # 运行仿真
+            Atrue, Ahat, _ = simulate_rods_and_unmix(E, H=160, W=160, rods_per=3)
+
+            # 顶部两张大图：左=真实复合图（保持原方式），右=标签着色的unmixing
+            colL, colR = st.columns(2)
+            true_rgb = (colorize_composite(Atrue, colors) * 255).astype(np.uint8)
+            labelmap_rgb = _argmax_labelmap(Ahat, colors)
+
+            with colL:
+                st.image(true_rgb, use_container_width=True, clamp=True)
+                st.caption("True (composite)")
+
+            with colR:
+                st.image(labelmap_rgb, use_container_width=True, clamp=True)
+                st.caption("Unmixing (argmax label map)")
+
+            # 下方黑白分图：第一排 True、第二排 Unmixing
             names = [_prettify_name(s) for s in labels_sel]
-            for r, name in enumerate(names):
-                rgb = (colorize_single(Ahat[:,:,r], colors[r])*255).astype(np.uint8)
-                imgs.append((name, rgb))
-            cs = st.columns(len(imgs))
-            for c,(title,im) in zip(cs, imgs):
-                c.image(im, use_container_width=True); c.caption(title)
-            st.caption(f"RMSE: {rmse:.4f}")
+            true_bw  = [_to_uint8_gray(Atrue[:,:,r]) for r in range(Atrue.shape[2])]
+            unmix_bw = [_to_uint8_gray(Ahat [:,:,r]) for r in range(Ahat.shape[2])]
+
+            st.divider()
+            _show_bw_grid("Per-fluorophore (True, grayscale)",   true_bw,  names, cols_per_row=6)
+            _show_bw_grid("Per-fluorophore (Unmixing, grayscale)", unmix_bw, names, cols_per_row=6)
+
+            # 每个染料的 RMSE 表
+            rmse_rows = []
+            for r, nm in enumerate(names):
+                rmse_r = np.sqrt(np.mean((Ahat[:,:,r] - Atrue[:,:,r])**2))
+                rmse_rows.append([nm, rmse_r])
+            st.subheader("Per-fluorophore RMSE")
+            _html_table(headers=["Fluorophore", "RMSE"], rows=rmse_rows, num_cols={1})
+
 
 # -------------------- Execute --------------------
 if __name__ == "__main__":
