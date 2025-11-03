@@ -485,10 +485,10 @@ def run(groups, mode, laser_strategy, laser_list):
         labelmap_rgb = _argmax_labelmap(Ahat, colors)
         with colL:
             st.image(true_rgb, use_container_width=True, clamp=True)
-            st.caption("True (composite)")
+            st.caption("True")
         with colR:
             st.image(labelmap_rgb, use_container_width=True, clamp=True)
-            st.caption("Unmixing (argmax label map)")
+            st.caption("Unmixing results")
 
         names = [_prettify_name(labels[j]) for j in sel_idx]
         unmix_bw = [_to_uint8_gray(Ahat[:, :, r]) for r in range(Ahat.shape[2])]
@@ -601,10 +601,10 @@ def run(groups, mode, laser_strategy, laser_list):
         labelmap_rgb = _argmax_labelmap(Ahat, colors)
         with colL:
             st.image(true_rgb, use_container_width=True, clamp=True)
-            st.caption("True (composite)")
+            st.caption("True")
         with colR:
             st.image(labelmap_rgb, use_container_width=True, clamp=True)
-            st.caption("Unmixing (argmax label map)")
+            st.caption("Unmixing results")
 
         names = [_prettify_name(s) for s in labels_sel]
         unmix_bw = [_to_uint8_gray(Ahat[:, :, r]) for r in range(Ahat.shape[2])]
