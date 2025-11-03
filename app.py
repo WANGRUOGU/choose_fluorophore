@@ -1,5 +1,4 @@
 # app.py — streamlined, English-only, E. coli–like rods, renamed UI/captions
-
 import json
 import numpy as np
 import plotly.graph_objects as go
@@ -47,22 +46,23 @@ mode = st.sidebar.radio(
     "Mode",
     options=("Emission spectra", "Predicted spectra"),
     help=("Emission: emission-only, peak-normalized.\n"
-          "Predicted: effective spectra with lasers (excitation · QY · EC).")
+          "Predicted: effective spectra with lasers (excitation · QY · EC)."),
+    key="mode_radio"
 )
-source_mode = st.sidebar.radio("Selection source", ("By probes", "From readout pool"))
-k_show = st.sidebar.slider("Show top-K similarities", 5, 50, 10, 1)
+source_mode = st.sidebar.radio("Selection source", ("By probes", "From readout pool"), key="source_radio")
+k_show = st.sidebar.slider("Show top-K similarities", 5, 50, 10, 1, key="k_show_slider")
 
 laser_list = []
 laser_strategy = None
 if mode == "Predicted spectra":
-    laser_strategy = st.sidebar.radio("Laser usage", ("Simultaneous", "Separate"))
-    n = st.sidebar.number_input("Number of lasers", 1, 8, 4, 1)
+    laser_strategy = st.sidebar.radio("Laser usage", ("Simultaneous", "Separate"), key="laser_strategy_radio")
+    n = st.sidebar.number_input("Number of lasers", 1, 8, 4, 1, key="num_lasers_input")
     cols = st.sidebar.columns(2)
     defaults = [405, 488, 561, 639]
     for i in range(n):
         lam = cols[i % 2].number_input(
             f"Laser {i+1} (nm)", int(wl.min()), int(max(700, wl.max())),
-            defaults[i] if i < len(defaults) else int(wl.min()), 1
+            defaults[i] if i < len(defaults) else int(wl.min()), 1, key=f"laser_{i+1}"
         )
         laser_list.append(int(lam))
 
@@ -74,6 +74,76 @@ DEFAULT_COLORS = np.array([
     [0.85, 0.50, 0.35], [0.60, 0.60, 0.60],
 ], dtype=float)
 
+def _ensure_colors(R):
+    if R <= len(DEFAULT_COLORS):
+        return DEFAULT_COLORS[:R]
+    hs = np.linspace(0, 1, R, endpoint=False)
+    extra = np.stack([
+        np.abs(np.sin(2*np.pi*hs))*0.7+0.3,
+        np.abs(np.sin(2*np.pi*(hs+0.33)))*0.7+0.3,
+        np.abs(np.sin(2*np.pi*(hs+0.66)))*0.7+0.3
+    ], axis=1)
+    return extra[:R]
+
+def _rgb01_to_plotly(col):
+    r, g, b = (int(255*x) for x in col)
+    return f"rgb({r},{g},{b})"
+
+def _pair_only_fluor(a, b):
+    fa = a.split(" – ", 1)[1] if " – " in a else a
+    fb = b.split(" – ", 1)[1] if " – " in b else b
+    return f"{fa} vs {fb}"
+
+def _html_two_row_table(row0_label, row1_label, row0_vals, row1_vals,
+                        color_second_row=False, color_thresh=0.9, fmt2=False):
+    def esc(x): return (str(x).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+    def fmtv(v):
+        if fmt2:
+            try:
+                return f"{float(v):.3f}"
+            except:
+                return esc(v)
+        return esc(v)
+    cells0 = "".join(f"<td style='padding:6px 10px;border:1px solid #ddd;'>{esc(v)}</td>" for v in row0_vals)
+    tds0 = f"<td style='padding:6px 10px;border:1px solid #ddd;white-space:nowrap;'>{esc(row0_label)}</td>{cells0}"
+    tds1_list = []
+    for v in row1_vals:
+        style = "padding:6px 10px;border:1px solid #ddd;"
+        if color_second_row:
+            try:
+                vv = float(v)
+                style += f"color:{'red' if vv > color_thresh else 'green'};"
+            except:
+                pass
+        tds1_list.append(f"<td style='{style}'>{fmtv(v)}</td>")
+    tds1 = f"<td style='padding:6px 10px;border:1px solid #ddd;white-space:nowrap;'>{esc(row1_label)}</td>{''.join(tds1_list)}"
+    st.markdown(f"""
+    <div style="overflow-x:auto;">
+      <table style="border-collapse:collapse;width:100%;table-layout:auto;">
+        <tbody><tr>{tds0}</tr><tr>{tds1}</tr></tbody>
+      </table>
+    </div>
+    """, unsafe_allow_html=True)
+
+@st.cache_data(show_spinner=False)
+def cached_build_effective_with_lasers(wl, dye_db, groups, laser_list, laser_strategy, powers):
+    groups_key = json.dumps({k: sorted(v) for k, v in sorted(groups.items())}, ensure_ascii=False)
+    _ = (tuple(sorted(laser_list)), laser_strategy, tuple(np.asarray(powers, float)) if powers is not None else None, groups_key)
+    return build_effective_with_lasers(wl, dye_db, groups, laser_list, laser_strategy, powers)
+
+@st.cache_data(show_spinner=False)
+def cached_interpolate_E_on_channels(wl, spectra_cols, chan_centers_nm):
+    spectra_cols = np.asarray(spectra_cols, dtype=float)
+    if spectra_cols.ndim == 1:
+        spectra_cols = spectra_cols[:, None]
+    W, N = spectra_cols.shape
+    E = np.zeros((len(chan_centers_nm), N), dtype=float)
+    for j in range(N):
+        y = spectra_cols[:, j]
+        E[:, j] = np.interp(chan_centers_nm, wl, y, left=float(y[0]), right=float(y[-1]))
+    return np.nan_to_num(E, nan=0.0, posinf=0.0, neginf=0.0)
+
+# ---------- New helpers for simulations layout ----------
 def _to_uint8_gray(img2d):
     z = np.asarray(img2d, dtype=float)
     m = float(z.max())
@@ -83,21 +153,15 @@ def _to_uint8_gray(img2d):
 
 def _argmax_labelmap(Ahat, colors):
     """
-    Ahat(H,W,R) -> RGB(H,W,3). 每个像素取 argmax 通道对应的颜色。
-    若该像素所有通道为 0，则设为黑色。
+    Ahat(H,W,R) -> RGB(H,W,3). Each pixel is colored by the max-abundance fluor.
+    Zero-only pixels -> black.
     """
     H, W, R = Ahat.shape
-    idx = np.argmax(Ahat, axis=2)                       # (H,W)
-    mx  = np.max(Ahat, axis=2)                          # (H,W)
-    rgb = np.zeros((H, W, 3), dtype=float)
+    idx = np.argmax(Ahat, axis=2)       # (H,W)
+    mx  = np.max(Ahat, axis=2)          # (H,W)
     cols = np.asarray(colors, dtype=float)
-
-    # 将每个像素映射到对应颜色
-    rgb = cols[idx]                                     # (H,W,3)
-    # 对“全零像素”强制置黑
+    rgb = cols[idx]                     # (H,W,3)
     rgb[mx <= 0] = 0.0
-
-    # 保持 0~1
     rgb = np.clip(rgb, 0, 1)
     return (rgb * 255).astype(np.uint8)
 
@@ -114,13 +178,8 @@ def _show_bw_grid(title, imgs_uint8, labels, cols_per_row=6):
             c.caption(lb)
 
 def _html_table(headers, rows, num_cols=None):
-    """
-    headers: List[str]
-    rows: List[List[Any]]
-    num_cols: set[int] 这些列按数值格式化（默认空）
-    """
     num_cols = num_cols or set()
-    def esc(x): 
+    def esc(x):
         return str(x).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
     thead = "".join(f"<th style='padding:6px 10px;border:1px solid #ddd;text-align:left'>{esc(h)}</th>" for h in headers)
     trs = []
@@ -143,71 +202,8 @@ def _html_table(headers, rows, num_cols=None):
         unsafe_allow_html=True
     )
 
-def _ensure_colors(R):
-    if R <= len(DEFAULT_COLORS): return DEFAULT_COLORS[:R]
-    hs = np.linspace(0, 1, R, endpoint=False)
-    extra = np.stack([
-        np.abs(np.sin(2*np.pi*hs))*0.7+0.3,
-        np.abs(np.sin(2*np.pi*(hs+0.33)))*0.7+0.3,
-        np.abs(np.sin(2*np.pi*(hs+0.66)))*0.7+0.3
-    ], axis=1)
-    return extra[:R]
-
-def _rgb01_to_plotly(col):
-    r,g,b = (int(255*x) for x in col)
-    return f"rgb({r},{g},{b})"
-
-def _pair_only_fluor(a,b):
-    fa = a.split(" – ",1)[1] if " – " in a else a
-    fb = b.split(" – ",1)[1] if " – " in b else b
-    return f"{fa} vs {fb}"
-
-def _html_two_row_table(row0_label,row1_label,row0_vals,row1_vals,
-                        color_second_row=False,color_thresh=0.9,fmt2=False):
-    def esc(x): return (str(x).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"))
-    def fmtv(v):
-        if fmt2:
-            try: return f"{float(v):.3f}"
-            except: return esc(v)
-        return esc(v)
-    cells0 = "".join(f"<td style='padding:6px 10px;border:1px solid #ddd;'>{esc(v)}</td>" for v in row0_vals)
-    tds0 = f"<td style='padding:6px 10px;border:1px solid #ddd;white-space:nowrap;'>{esc(row0_label)}</td>{cells0}"
-    tds1_list=[]
-    for v in row1_vals:
-        style="padding:6px 10px;border:1px solid #ddd;"
-        if color_second_row:
-            try:
-                vv=float(v); style+=f"color:{'red' if vv>color_thresh else 'green'};"
-            except: pass
-        tds1_list.append(f"<td style='{style}'>{fmtv(v)}</td>")
-    tds1 = f"<td style='padding:6px 10px;border:1px solid #ddd;white-space:nowrap;'>{esc(row1_label)}</td>{''.join(tds1_list)}"
-    st.markdown(f"""
-    <div style="overflow-x:auto;">
-      <table style="border-collapse:collapse;width:100%;table-layout:auto;">
-        <tbody><tr>{tds0}</tr><tr>{tds1}</tr></tbody>
-      </table>
-    </div>
-    """, unsafe_allow_html=True)
-
-@st.cache_data(show_spinner=False)
-def cached_build_effective_with_lasers(wl,dye_db,groups,laser_list,laser_strategy,powers):
-    groups_key = json.dumps({k:sorted(v) for k,v in sorted(groups.items())}, ensure_ascii=False)
-    _ = (tuple(sorted(laser_list)), laser_strategy, tuple(np.asarray(powers,float)) if powers is not None else None, groups_key)
-    return build_effective_with_lasers(wl,dye_db,groups,laser_list,laser_strategy,powers)
-
-@st.cache_data(show_spinner=False)
-def cached_interpolate_E_on_channels(wl,spectra_cols,chan_centers_nm):
-    spectra_cols = np.asarray(spectra_cols, dtype=float)
-    if spectra_cols.ndim == 1: spectra_cols = spectra_cols[:,None]
-    W,N = spectra_cols.shape
-    E = np.zeros((len(chan_centers_nm),N), dtype=float)
-    for j in range(N):
-        y = spectra_cols[:,j]
-        E[:,j] = np.interp(chan_centers_nm, wl, y, left=float(y[0]), right=float(y[-1]))
-    return np.nan_to_num(E, nan=0.0, posinf=0.0, neginf=0.0)
-
 # -------------------- NLS + color --------------------
-def nls_unmix(Timg,E,iters=2000,tol=1e-6):
+def nls_unmix(Timg, E, iters=2000, tol=1e-6):
     """Fast MU-style NLS with per-pixel normalization. Timg(H,W,C), E(C,R) -> A(H,W,R)."""
     H, W, C = Timg.shape
     E = np.asarray(E, dtype=np.float32)
@@ -217,7 +213,6 @@ def nls_unmix(Timg,E,iters=2000,tol=1e-6):
     scale = np.sqrt(np.mean(M**2, axis=1, keepdims=True)); scale[scale<=0]=1.0
     Mn = M/scale
     EtE = E.T @ E
-    # Correct LS init: A0 = Mn @ E @ (EᵀE)^(-1)
     A = Mn @ E @ np.linalg.pinv(EtE)
     A[A<0]=0
     for _ in range(iters):
@@ -229,48 +224,48 @@ def nls_unmix(Timg,E,iters=2000,tol=1e-6):
     A *= scale
     mA = float(np.max(A))
     if mA>0: A /= mA
-    return A.reshape(H,W,E.shape[1])
+    return A.reshape(H, W, E.shape[1])
 
-def colorize_single(A_r,color):
-    z=np.clip(A_r,0,1); m=float(z.max())
-    if m>0: z/=m
-    return z[:,:,None]*np.asarray(color)[None,None,:]
+def colorize_single(A_r, color):
+    z = np.clip(A_r, 0, 1); m = float(z.max())
+    if m > 0: z /= m
+    return z[:, :, None] * np.asarray(color)[None, None, :]
 
-def colorize_composite(A,colors):
-    rgb=np.zeros((A.shape[0],A.shape[1],3),dtype=float)
-    for r in range(A.shape[2]): rgb+=colorize_single(A[:,:,r],colors[r])
-    m=float(rgb.max()); 
-    if m>0: rgb/=m
+def colorize_composite(A, colors):
+    rgb = np.zeros((A.shape[0], A.shape[1], 3), dtype=float)
+    for r in range(A.shape[2]):
+        rgb += colorize_single(A[:, :, r], colors[r])
+    m = float(rgb.max())
+    if m > 0: rgb /= m
     return rgb
 
 # -------------------- Rod (capsule) scene --------------------
-def _capsule_profile(H,W,cx,cy,length,width,theta):
-    yy,xx = np.mgrid[0:H,0:W].astype(float)
-    X=xx-cx; Y=yy-cy
-    c,s = np.cos(theta), np.sin(theta)
+def _capsule_profile(H, W, cx, cy, length, width, theta):
+    yy, xx = np.mgrid[0:H, 0:W].astype(float)
+    X = xx - cx; Y = yy - cy
+    c, s = np.cos(theta), np.sin(theta)
     xp =  c*X + s*Y
     yp = -s*X + c*Y
     half_L = 0.5*length
     r = 0.5*width
-    rect = (np.abs(xp)<=half_L) & (np.abs(yp)<=r)
-    val = np.zeros((H,W))
+    rect = (np.abs(xp) <= half_L) & (np.abs(yp) <= r)
+    val = np.zeros((H, W))
     if np.any(rect): val[rect] = 1 - np.abs(yp[rect])/(r+1e-12)
-    for side in (-1,1):
-        rho = np.sqrt((xp+side*half_L)**2 + yp**2)
+    for side in (-1, 1):
+        rho = np.sqrt((xp + side*half_L)**2 + yp**2)
         cap = rho <= r
         if np.any(cap): val[cap] = np.maximum(val[cap], 1 - rho[cap]/(r+1e-12))
-    return np.clip(val,0,1), val>0
+    return np.clip(val, 0, 1), val > 0
 
-def _place_rods_scene(H,W,R,rods_per=3,rng=None):
+def _place_rods_scene(H, W, R, rods_per=3, rng=None):
     """
     Non-overlapping rods (capsules). Shorter + thicker to resemble E. coli.
     """
     rng = np.random.default_rng() if rng is None else rng
-    Atrue = np.zeros((H,W,R), dtype=np.float32)
-    occ = np.zeros((H,W), dtype=bool)
-    # E. coli–like: shorter & thicker than before
-    Lmin,Lmax = 18, 30     # shorter
-    Wmin,Wmax = 10, 16     # thicker
+    Atrue = np.zeros((H, W, R), dtype=np.float32)
+    occ = np.zeros((H, W), dtype=bool)
+    Lmin, Lmax = 18, 30
+    Wmin, Wmax = 10, 16
     for r in range(R):
         placed = 0; tries = 0
         while placed < rods_per and tries < 200:
@@ -278,39 +273,39 @@ def _place_rods_scene(H,W,R,rods_per=3,rng=None):
             length = int(rng.integers(Lmin, Lmax+1))
             width  = int(rng.integers(Wmin, Wmax+1))
             theta  = float(rng.uniform(0, np.pi))
-            margin = 6 + int(max(length,width)/2)
+            margin = 6 + int(max(length, width)/2)
             if W - 2*margin <= 2 or H - 2*margin <= 2: break
             cx = int(rng.integers(margin, W-margin))
             cy = int(rng.integers(margin, H-margin))
-            prof, mask = _capsule_profile(H,W,cx,cy,length,width,theta)
+            prof, mask = _capsule_profile(H, W, cx, cy, length, width, theta)
             if not np.any(mask): continue
             if np.any(occ & mask): continue
-            m=float(prof.max())
-            if m>0: prof/=m
-            Atrue[:,:,r] = np.maximum(Atrue[:,:,r], prof.astype(np.float32))
+            m = float(prof.max())
+            if m > 0: prof /= m
+            Atrue[:, :, r] = np.maximum(Atrue[:, :, r], prof.astype(np.float32))
             occ |= mask
             placed += 1
-    return np.clip(Atrue,0,1)
+    return np.clip(Atrue, 0, 1)
 
 # -------------------- Simulation core --------------------
-def simulate_rods_and_unmix(E,H=160,W=160,rods_per=3,rng=None):
+def simulate_rods_and_unmix(E, H=160, W=160, rods_per=3, rng=None):
     """
-    Forward: T = Atrue ⊗ E; global scale to peak=255; Poisson; NLS unmix; RMSE.
+    Forward: T = Atrue ⊗ E; global scale to peak=255; Poisson; NLS unmix.
     """
     rng = np.random.default_rng() if rng is None else rng
     E = np.asarray(E, dtype=float)
     if E.ndim != 2: raise ValueError(f"E must be 2D, got {E.shape}")
-    C,R = E.shape
+    C, R = E.shape
 
-    Atrue = _place_rods_scene(H,W,R,rods_per,rng)
+    Atrue = _place_rods_scene(H, W, R, rods_per, rng)
 
-    Tclean = np.zeros((H,W,C), dtype=float)
+    Tclean = np.zeros((H, W, C), dtype=float)
     for c in range(C):
-        Tclean[:,:,c] = np.tensordot(Atrue, E[c,:], axes=([2],[0]))
+        Tclean[:, :, c] = np.tensordot(Atrue, E[c, :], axes=([2], [0]))
 
     peak = 255.0
     Tmax = float(np.max(Tclean))
-    if Tmax <= 0: 
+    if Tmax <= 0:
         Tnoisy = np.zeros_like(Tclean)
     else:
         lam = Tclean * (peak / Tmax)
@@ -319,8 +314,7 @@ def simulate_rods_and_unmix(E,H=160,W=160,rods_per=3,rng=None):
         Tnoisy = rng.poisson(lam).astype(float) / peak
 
     Ahat = nls_unmix(Tnoisy, E, iters=1500, tol=1e-6)
-    rmse = float(np.sqrt(np.mean((Ahat - Atrue)**2)))
-    return Atrue, Ahat, rmse
+    return Atrue, Ahat
 
 # -------------------- Main --------------------
 st.title("Fluorophore Selection for Multiplexed Imaging")
@@ -330,11 +324,11 @@ if use_pool:
     if not readout_pool:
         st.info("Readout pool not found (data/readout_fluorophores.yaml)."); st.stop()
     max_n = len(readout_pool)
-    N_pick = st.number_input("How many fluorophores", 1, max_n, min(4, max_n), 1)
-    groups = {"Pool": readout_pool[:]}
+    N_pick = st.number_input("How many fluorophores", 1, max_n, min(4, max_n), 1, key="n_pick_pool")
+    groups = {"Pool": readout_pool[:] }
 else:
     all_probes = sorted(probe_map.keys())
-    picked = st.multiselect("Probes", options=all_probes)
+    picked = st.multiselect("Probes", options=all_probes, key="picked_probes")
     if not picked:
         st.info("Select at least one probe to proceed."); st.stop()
     groups = {}
@@ -356,8 +350,8 @@ def _prettify_name(label: str) -> str:
 def run(groups, mode, laser_strategy, laser_list):
     required_count = (N_pick if use_pool else None)
 
+    # ---------- EMISSION ----------
     if mode == "Emission spectra":
-        # Build emission-only (peak-normalized inside utils)
         E_norm, labels, idx_groups = build_emission_only_matrix(wl, dye_db, groups)
         if E_norm.shape[1] == 0: st.error("No spectra."); st.stop()
 
@@ -367,81 +361,80 @@ def run(groups, mode, laser_strategy, laser_list):
         )
         colors = _ensure_colors(len(sel_idx))
 
-        # Selected table
+        # Top panels (kept): Selected / Pairwise / Spectra viewer
         if use_pool:
-            fluors = [labels[j].split(" – ",1)[1] for j in sel_idx]
+            fluors = [labels[j].split(" – ", 1)[1] for j in sel_idx]
             st.subheader("Selected Fluorophores")
-            _html_two_row_table("Slot","Fluorophore",[f"Slot {i+1}" for i in range(len(fluors))],fluors)
+            _html_two_row_table("Slot", "Fluorophore",
+                                [f"Slot {i+1}" for i in range(len(fluors))],
+                                fluors)
         else:
             sel_pairs = [labels[j] for j in sel_idx]
             st.subheader("Selected Fluorophores")
-            _html_two_row_table("Probe","Fluorophore",
-                                [s.split(" – ",1)[0] for s in sel_pairs],
-                                [s.split(" – ",1)[1] for s in sel_pairs])
+            _html_two_row_table("Probe", "Fluorophore",
+                                [s.split(" – ", 1)[0] for s in sel_pairs],
+                                [s.split(" – ", 1)[1] for s in sel_pairs])
 
-        # Pairwise similarities
         S = cosine_similarity_matrix(E_norm[:, sel_idx])
         tops = top_k_pairwise(S, [labels[j] for j in sel_idx], k=k_show)
         st.subheader("Top pairwise similarities")
-        _html_two_row_table("Pair","Similarity",
-                            [_pair_only_fluor(a,b) for _,a,b in tops],
-                            [val for val,_,_ in tops],
+        _html_two_row_table("Pair", "Similarity",
+                            [_pair_only_fluor(a, b) for _, a, b in tops],
+                            [val for val, _, _ in tops],
                             color_second_row=True, color_thresh=0.9, fmt2=True)
 
-        # Spectra viewer (per-trace normalized)
         st.subheader("Spectra viewer")
         fig = go.Figure()
-        for t,j in enumerate(sel_idx):
-            y = E_norm[:,j]; y = y/(np.max(y)+1e-12)
+        for t, j in enumerate(sel_idx):
+            y = E_norm[:, j]; y = y/(np.max(y)+1e-12)
             fig.add_trace(go.Scatter(
                 x=wl, y=y, mode="lines", name=labels[j],
                 line=dict(color=_rgb01_to_plotly(colors[t]), width=2)
             ))
         fig.update_layout(xaxis_title="Wavelength (nm)",
                           yaxis_title="Normalized intensity",
-                          yaxis=dict(range=[0,1.05]))
+                          yaxis=dict(range=[0, 1.05]))
         st.plotly_chart(fig, use_container_width=True)
 
-                # Simulations
-        if st.checkbox("Simulations", value=False, key="sim_emission"):
-            C = 23
-            chan = 494.0 + 8.9*np.arange(C)
-            E = cached_interpolate_E_on_channels(wl, E_norm[:, sel_idx], chan)
+        # ---------- Simulations (always shown) ----------
+        C = 23
+        chan = 494.0 + 8.9*np.arange(C)
+        E = cached_interpolate_E_on_channels(wl, E_norm[:, sel_idx], chan)
 
-            # 运行仿真
-            Atrue, Ahat, _ = simulate_rods_and_unmix(E, H=160, W=160, rods_per=3)
+        Atrue, Ahat = simulate_rods_and_unmix(E, H=160, W=160, rods_per=3)
 
-            # 顶部两张大图：左=真实复合图（保持你的原显示方式），右=标签着色的unmixing
-            colL, colR = st.columns(2)
-            true_rgb = (colorize_composite(Atrue, colors) * 255).astype(np.uint8)
-            labelmap_rgb = _argmax_labelmap(Ahat, colors)
+        colL, colR = st.columns(2)
+        true_rgb = (colorize_composite(Atrue, colors) * 255).astype(np.uint8)
+        labelmap_rgb = _argmax_labelmap(Ahat, colors)
+        with colL:
+            st.image(true_rgb, use_container_width=True, clamp=True)
+            st.caption("True (composite)")
+        with colR:
+            st.image(labelmap_rgb, use_container_width=True, clamp=True)
+            st.caption("Unmixing (argmax label map)")
 
-            with colL:
-                st.image(true_rgb, use_container_width=True, clamp=True)
-                st.caption("True (composite)")
+        names = [_prettify_name(labels[j]) for j in sel_idx]
+        true_bw  = [_to_uint8_gray(Atrue[:, :, r]) for r in range(Atrue.shape[2])]
+        unmix_bw = [_to_uint8_gray(Ahat[:, :, r])  for r in range(Ahat.shape[2])]
 
-            with colR:
-                st.image(labelmap_rgb, use_container_width=True, clamp=True)
-                st.caption("Unmixing (argmax label map)")
+        st.divider()
+        _show_bw_grid("Per-fluorophore (True, grayscale)",     true_bw,  names, cols_per_row=6)
+        _show_bw_grid("Per-fluorophore (Unmixing, grayscale)", unmix_bw, names, cols_per_row=6)
 
-            # 下方黑白分图：第一排 True、第二排 Unmixing
-            names = [_prettify_name(labels[j]) for j in sel_idx]
-            true_bw  = [_to_uint8_gray(Atrue[:,:,r]) for r in range(Atrue.shape[2])]
-            unmix_bw = [_to_uint8_gray(Ahat [:,:,r]) for r in range(Ahat.shape[2])]
+        rmse_rows = []
+        for r, nm in enumerate(names):
+            rmse_r = np.sqrt(np.mean((Ahat[:, :, r] - Atrue[:, :, r])**2))
+            rmse_rows.append([nm, rmse_r])
+        st.subheader("Per-fluorophore RMSE")
+        _html_table(headers=["Fluorophore", "RMSE"], rows=rmse_rows, num_cols={1})
 
-            st.divider()
-            _show_bw_grid("Per-fluorophore (True, grayscale)",   true_bw,  names, cols_per_row=6)
-            _show_bw_grid("Per-fluorophore (Unmixing, grayscale)", unmix_bw, names, cols_per_row=6)
+        return  # stop here to avoid any duplicated panels
 
-            # 每个染料的 RMSE 表
-            rmse_rows = []
-            for r, nm in enumerate(names):
-                rmse_r = np.sqrt(np.mean((Ahat[:,:,r] - Atrue[:,:,r])**2))
-                rmse_rows.append([nm, rmse_r])
-            st.subheader("Per-fluorophore RMSE")
-            _html_table(headers=["Fluorophore", "RMSE"], rows=rmse_rows, num_cols={1})
+    # ---------- PREDICTED ----------
+    else:
+        if not laser_list:
+            st.error("Please specify laser wavelengths."); st.stop()
 
-            return
         # Round A: provisional selection on emission-only
         E0, labels0, idx0 = build_emission_only_matrix(wl, dye_db, groups)
         sel0, _ = solve_lexicographic_k(E0, idx0, labels0, levels=10, enforce_unique=True, required_count=required_count)
@@ -472,36 +465,35 @@ def run(groups, mode, laser_strategy, laser_list):
 
         # Build only selected subset
         if use_pool:
-            small_groups = {"Pool":[s.split(" – ",1)[1] for s in final_labels]}
+            small_groups = {"Pool": [s.split(" – ", 1)[1] for s in final_labels]}
         else:
             small_groups = {}
             for s in final_labels:
-                p,f = s.split(" – ",1)
-                small_groups.setdefault(p,[]).append(f)
+                p, f = s.split(" – ", 1)
+                small_groups.setdefault(p, []).append(f)
 
         E_raw_sel, E_norm_sel, labels_sel, _ = cached_build_effective_with_lasers(
             wl, dye_db, small_groups, laser_list, laser_strategy, powers
         )
 
-        # Selected table
+        colors = _ensure_colors(len(labels_sel))
+
+        # Top panels (kept): Selected / Pairwise / Spectra viewer
         st.subheader("Selected Fluorophores (with lasers)")
-        fluors = [s.split(" – ",1)[1] for s in labels_sel]
-        _html_two_row_table("Slot","Fluorophore",
+        fluors = [s.split(" – ", 1)[1] for s in labels_sel]
+        _html_two_row_table("Slot", "Fluorophore",
                             [f"Slot {i+1}" for i in range(len(fluors))],
                             fluors)
 
-        # Pairwise
         S = cosine_similarity_matrix(E_norm_sel)
         tops = top_k_pairwise(S, labels_sel, k=k_show)
         st.subheader("Top pairwise similarities")
-        _html_two_row_table("Pair","Similarity",
-                            [_pair_only_fluor(a,b) for _,a,b in tops],
-                            [val for val,_,_ in tops],
+        _html_two_row_table("Pair", "Similarity",
+                            [_pair_only_fluor(a, b) for _, a, b in tops],
+                            [val for val, _, _ in tops],
                             color_second_row=True, color_thresh=0.9, fmt2=True)
 
-        # Spectra viewer (absolute effective spectra / B to visualize relative levels)
         st.subheader("Spectra viewer")
-        colors = _ensure_colors(len(labels_sel))
         fig = go.Figure()
         for t in range(len(labels_sel)):
             y = E_raw_sel[:, t] / (B + 1e-12)
@@ -512,52 +504,43 @@ def run(groups, mode, laser_strategy, laser_list):
         fig.update_layout(
             xaxis_title="Wavelength (nm)",
             yaxis_title="Normalized intensity (relative to B)",
-            yaxis=dict(range=[0,1.05])
+            yaxis=dict(range=[0, 1.05])
         )
         st.plotly_chart(fig, use_container_width=True)
 
-                # Simulations
-        if st.checkbox("Simulations", value=False, key="sim_predicted"):
-            C = 23
-            chan = 494.0 + 8.9*np.arange(C)
-            # 与“谱图查看器”一致地用 E_raw_sel/(B+eps) 进入通道
-            E = cached_interpolate_E_on_channels(wl, E_raw_sel/(B+1e-12), chan)
+        # ---------- Simulations (always shown) ----------
+        C = 23
+        chan = 494.0 + 8.9*np.arange(C)
+        E = cached_interpolate_E_on_channels(wl, E_raw_sel/(B+1e-12), chan)
 
-            # 运行仿真
-            Atrue, Ahat, _ = simulate_rods_and_unmix(E, H=160, W=160, rods_per=3)
+        Atrue, Ahat = simulate_rods_and_unmix(E, H=160, W=160, rods_per=3)
 
-            # 顶部两张大图：左=真实复合图（保持原方式），右=标签着色的unmixing
-            colL, colR = st.columns(2)
-            true_rgb = (colorize_composite(Atrue, colors) * 255).astype(np.uint8)
-            labelmap_rgb = _argmax_labelmap(Ahat, colors)
+        colL, colR = st.columns(2)
+        true_rgb = (colorize_composite(Atrue, colors) * 255).astype(np.uint8)
+        labelmap_rgb = _argmax_labelmap(Ahat, colors)
+        with colL:
+            st.image(true_rgb, use_container_width=True, clamp=True)
+            st.caption("True (composite)")
+        with colR:
+            st.image(labelmap_rgb, use_container_width=True, clamp=True)
+            st.caption("Unmixing (argmax label map)")
 
-            with colL:
-                st.image(true_rgb, use_container_width=True, clamp=True)
-                st.caption("True (composite)")
+        names = [_prettify_name(s) for s in labels_sel]
+        true_bw  = [_to_uint8_gray(Atrue[:, :, r]) for r in range(Atrue.shape[2])]
+        unmix_bw = [_to_uint8_gray(Ahat[:, :, r])  for r in range(Ahat.shape[2])]
 
-            with colR:
-                st.image(labelmap_rgb, use_container_width=True, clamp=True)
-                st.caption("Unmixing (argmax label map)")
+        st.divider()
+        _show_bw_grid("Per-fluorophore (True, grayscale)",     true_bw,  names, cols_per_row=6)
+        _show_bw_grid("Per-fluorophore (Unmixing, grayscale)", unmix_bw, names, cols_per_row=6)
 
-            # 下方黑白分图：第一排 True、第二排 Unmixing
-            names = [_prettify_name(s) for s in labels_sel]
-            true_bw  = [_to_uint8_gray(Atrue[:,:,r]) for r in range(Atrue.shape[2])]
-            unmix_bw = [_to_uint8_gray(Ahat [:,:,r]) for r in range(Ahat.shape[2])]
+        rmse_rows = []
+        for r, nm in enumerate(names):
+            rmse_r = np.sqrt(np.mean((Ahat[:, :, r] - Atrue[:, :, r])**2))
+            rmse_rows.append([nm, rmse_r])
+        st.subheader("Per-fluorophore RMSE")
+        _html_table(headers=["Fluorophore", "RMSE"], rows=rmse_rows, num_cols={1})
 
-            st.divider()
-            _show_bw_grid("Per-fluorophore (True, grayscale)",   true_bw,  names, cols_per_row=6)
-            _show_bw_grid("Per-fluorophore (Unmixing, grayscale)", unmix_bw, names, cols_per_row=6)
-
-            # 每个染料的 RMSE 表
-            rmse_rows = []
-            for r, nm in enumerate(names):
-                rmse_r = np.sqrt(np.mean((Ahat[:,:,r] - Atrue[:,:,r])**2))
-                rmse_rows.append([nm, rmse_r])
-            st.subheader("Per-fluorophore RMSE")
-            _html_table(headers=["Fluorophore", "RMSE"], rows=rmse_rows, num_cols={1})
-            
-            return
-
+        return  # stop here to avoid any duplicated panels
 
 # -------------------- Execute --------------------
 if __name__ == "__main__":
