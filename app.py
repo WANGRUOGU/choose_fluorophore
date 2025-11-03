@@ -84,7 +84,7 @@ mode = st.sidebar.radio(
 
 source_mode = st.sidebar.radio(
     "Selection source",
-    ("By probes", "From readout pool", "From inventory", "EUB338 only"),
+    ("By probes", "From readout pool", "All fluorophores", "EUB338 only"),
     key="source_radio"
 )
 
@@ -420,7 +420,7 @@ if source_mode == "From readout pool":
     groups = {"Pool": pool}
     use_pool = True
 
-elif source_mode == "From inventory":
+elif source_mode == "All fluorophores":
     pool = inventory_pool[:]
     if not pool:
         st.error("No fluorophores found in probe_fluor_map.yaml that also exist in dyes.yaml."); st.stop()
@@ -522,10 +522,10 @@ def run(groups, mode, laser_strategy, laser_list):
         labelmap_rgb = _argmax_labelmap(Ahat, colors)
         with colL:
             st.image(true_rgb, use_container_width=True, clamp=True)
-            st.caption("True (composite)")
+            st.caption("True")
         with colR:
             st.image(labelmap_rgb, use_container_width=True, clamp=True)
-            st.caption("Unmixing (argmax label map; color=hue, brightness=max abundance)")
+            st.caption("Unmixing results")
 
         names = [_prettify_name(labels[j]) for j in sel_idx]
         unmix_bw = [_to_uint8_gray(Ahat[:, :, r]) for r in range(Ahat.shape[2])]
@@ -639,10 +639,10 @@ def run(groups, mode, laser_strategy, laser_list):
         labelmap_rgb = _argmax_labelmap(Ahat, colors)
         with colL:
             st.image(true_rgb, use_container_width=True, clamp=True)
-            st.caption("True (composite)")
+            st.caption("True")
         with colR:
             st.image(labelmap_rgb, use_container_width=True, clamp=True)
-            st.caption("Unmixing (argmax label map; color=hue, brightness=max abundance)")
+            st.caption("Unmixing results")
 
         names = [_prettify_name(s) for s in labels_sel]
         unmix_bw = [_to_uint8_gray(Ahat[:, :, r]) for r in range(Ahat.shape[2])]
