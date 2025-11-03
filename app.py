@@ -219,6 +219,28 @@ def _html_table(headers, rows, num_cols=None):
         """,
         unsafe_allow_html=True
     )
+def _capsule_expected_area(Lmin=18, Lmax=30, Wmin=10, Wmax=16):
+    """
+    估算单个胶囊形杆菌面积：矩形(2r*L) + 两端半圆(pi*r^2)。
+    用长度/宽度的中位数估计。
+    """
+    L = 0.5 * (Lmin + Lmax)          # ~24
+    W = 0.5 * (Wmin + Wmax)          # ~13
+    r = 0.5 * W
+    return 2 * r * L + np.pi * r * r
+
+def _suggest_canvas_size(R, rods_per, target_density=0.22, min_side=160):
+    """
+    根据要放的“R 个染料 × rods_per 个杆菌”估算所需方形画布边长。
+    target_density 是“(对象面积和) / 画布面积”的目标密度（越小越稀疏越容易不重叠）。
+    """
+    area_one = _capsule_expected_area()
+    total_obj_area = R * rods_per * area_one
+    # 留足非重叠/边界/随机失败空间
+    canvas_area = total_obj_area / max(1e-6, target_density)
+    side = int(np.ceil(np.sqrt(canvas_area)))
+    side = max(min_side, side)
+    return side, side
 
 # -------------------- NLS + color --------------------
 def nls_unmix(Timg, E, iters=2000, tol=1e-6):
@@ -275,48 +297,83 @@ def _capsule_profile(H, W, cx, cy, length, width, theta):
         if np.any(cap): val[cap] = np.maximum(val[cap], 1 - rho[cap]/(r+1e-12))
     return np.clip(val, 0, 1), val > 0
 
-def _place_rods_scene(H, W, R, rods_per=3, rng=None):
+def _place_rods_scene(H, W, R, rods_per=3, rng=None, max_trials_per_class=1200):
     """
-    Non-overlapping rods (capsules). Shorter + thicker to resemble E. coli.
+    Non-overlapping rods (capsules). Shorter & thicker to resemble E. coli.
+    返回：
+      - Atrue: (H,W,R)
+      - placed_counts: (R,) 每个染料实际放下的杆菌数量
     """
     rng = np.random.default_rng() if rng is None else rng
     Atrue = np.zeros((H, W, R), dtype=np.float32)
     occ = np.zeros((H, W), dtype=bool)
+    placed_counts = np.zeros(R, dtype=int)
+
+    # E. coli–like: shorter & thicker
     Lmin, Lmax = 18, 30
     Wmin, Wmax = 10, 16
+
     for r in range(R):
-        placed = 0; tries = 0
-        while placed < rods_per and tries < 200:
+        placed = 0
+        tries = 0
+        while placed < rods_per and tries < max_trials_per_class:
             tries += 1
-            length = int(rng.integers(Lmin, Lmax+1))
-            width  = int(rng.integers(Wmin, Wmax+1))
+            length = int(rng.integers(Lmin, Lmax + 1))
+            width  = int(rng.integers(Wmin, Wmax + 1))
             theta  = float(rng.uniform(0, np.pi))
-            margin = 6 + int(max(length, width)/2)
-            if W - 2*margin <= 2 or H - 2*margin <= 2: break
-            cx = int(rng.integers(margin, W-margin))
-            cy = int(rng.integers(margin, H-margin))
+            # 边界安全距离随尺寸略放大
+            margin = 6 + int(max(length, width) / 2)
+            if W - 2*margin <= 2 or H - 2*margin <= 2:
+                break
+            cx = int(rng.integers(margin, W - margin))
+            cy = int(rng.integers(margin, H - margin))
             prof, mask = _capsule_profile(H, W, cx, cy, length, width, theta)
-            if not np.any(mask): continue
-            if np.any(occ & mask): continue
+            if not np.any(mask): 
+                continue
+            if np.any(occ & mask):
+                continue
             m = float(prof.max())
-            if m > 0: prof /= m
+            if m > 0:
+                prof /= m
             Atrue[:, :, r] = np.maximum(Atrue[:, :, r], prof.astype(np.float32))
             occ |= mask
             placed += 1
-    return np.clip(Atrue, 0, 1)
+        placed_counts[r] = placed
+
+    return np.clip(Atrue, 0, 1), placed_counts
+
 
 # -------------------- Simulation core --------------------
-def simulate_rods_and_unmix(E, H=160, W=160, rods_per=3, rng=None):
+def simulate_rods_and_unmix(E, H=None, W=None, rods_per=3, rng=None):
     """
-    Forward: T = Atrue ⊗ E; global scale to peak=255; Poisson; NLS unmix.
+    Forward: T = Atrue ⊗ E; scale to peak=255; Poisson; NLS unmix.
+    画布大小若未给出，则按 R, rods_per 自动估算；若放不下则逐步放大画布重试。
     """
     rng = np.random.default_rng() if rng is None else rng
     E = np.asarray(E, dtype=float)
-    if E.ndim != 2: raise ValueError(f"E must be 2D, got {E.shape}")
+    if E.ndim != 2:
+        raise ValueError(f"E must be 2D, got {E.shape}")
     C, R = E.shape
 
-    Atrue = _place_rods_scene(H, W, R, rods_per, rng)
+    # 1) 估算或采用传入画布
+    if H is None or W is None:
+        H, W = _suggest_canvas_size(R, rods_per, target_density=0.22, min_side=160)
 
+    # 2) 放置；不够就放大重试
+    scale_attempts = 0
+    while True:
+        Atrue, placed = _place_rods_scene(H, W, R, rods_per, rng)
+        if np.all(placed >= rods_per):
+            break
+        if scale_attempts >= 4:
+            # 已尝试多次，给出最接近的结果（不会崩）
+            break
+        # 画布放大 25%，继续尝试
+        H = int(np.ceil(H * 1.25))
+        W = int(np.ceil(W * 1.25))
+        scale_attempts += 1
+
+    # 3) 前向成像与噪声
     Tclean = np.zeros((H, W, C), dtype=float)
     for c in range(C):
         Tclean[:, :, c] = np.tensordot(Atrue, E[c, :], axes=([2], [0]))
@@ -331,8 +388,10 @@ def simulate_rods_and_unmix(E, H=160, W=160, rods_per=3, rng=None):
         lam = np.clip(lam, 0.0, 1e6)
         Tnoisy = rng.poisson(lam).astype(float) / peak
 
+    # 4) 反演
     Ahat = nls_unmix(Tnoisy, E, iters=1500, tol=1e-6)
     return Atrue, Ahat
+
 
 # -------------------- Main --------------------
 st.title("Fluorophore Selection for Multiplexed Imaging")
@@ -419,7 +478,7 @@ def run(groups, mode, laser_strategy, laser_list):
         chan = 494.0 + 8.9*np.arange(C)
         E = cached_interpolate_E_on_channels(wl, E_norm[:, sel_idx], chan)
 
-        Atrue, Ahat = simulate_rods_and_unmix(E, H=160, W=160, rods_per=3)
+        Atrue, Ahat = simulate_rods_and_unmix(E, rods_per=3)
 
         colL, colR = st.columns(2)
         true_rgb = (colorize_composite(Atrue, colors) * 255).astype(np.uint8)
@@ -535,7 +594,7 @@ def run(groups, mode, laser_strategy, laser_list):
         chan = 494.0 + 8.9*np.arange(C)
         E = cached_interpolate_E_on_channels(wl, E_raw_sel/(B+1e-12), chan)
 
-        Atrue, Ahat = simulate_rods_and_unmix(E, H=160, W=160, rods_per=3)
+        Atrue, Ahat = simulate_rods_and_unmix(E, rods_per=3)
 
         colL, colR = st.columns(2)
         true_rgb = (colorize_composite(Atrue, colors) * 255).astype(np.uint8)
