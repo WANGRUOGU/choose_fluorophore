@@ -1,4 +1,5 @@
-EUB338:
+- name: EUB338
+  fluors: &EUB338_FL
   - Bodipy FL
   - Oregon Green 514
   - TET
@@ -31,61 +32,78 @@ EUB338:
   - ATTORho12
   - ATTO542
 
-ACT476:
+- name: "EUB 338"
+  fluors: *EUB338_FL
+
+- name: ACT476
+  fluors:
   - AF488
   - AF514
   - AF660
   - AF555
 
-CAM1021:
+- name: CAM1021
+  fluors:
   - Bodipy FL
 
-CAP371:
+- name: CAP371
+  fluors:
   - AF688
 
-COR595:
+- name: COR595
+  fluors:
   - AF647
   - AF660
 
-COR633:
+- name: COR633
+  fluors:
   - AF594
   - AF647
   - RRX
 
-FUS714:
+- name: FUS714
+  fluors:
   - AF555
   - Dual AF594
 
-GEM572:
+- name: GEM572
+  fluors:
   - Pacific Orange
 
-LEP568:
+- name: LEP568
+  fluors:
   - AF488
   - AF660
 
-NEI1030:
+- name: NEI1030
+  fluors:
   - TET
   - AF514
   - AF633
   - AF532
 
-PGI350:
+- name: PGI350
+  fluors:
   - AF488
   - Pacific Blue
 
-PRV392:
+- name: PRV392
+  fluors:
   - RRX
   - AF633
   - AF635
 
-ROT491:
+- name: ROT491
+  fluors:
   - AF647
   - AF610
 
-SEL60:
+- name: SEL60
+  fluors:
   - Bodipy FL
 
-STR405:
+- name: STR405
+  fluors:
   - AF548
   - AF594
   - AF633
@@ -93,51 +111,66 @@ STR405:
   - AF532
   - AF514
 
-TRP684:
+- name: TRP684
+  fluors:
   - AF594
 
-VEI488:
+- name: VEI488
+  fluors:
   - AF555
   - AF514
 
-ALF682:
+- name: ALF682
+  fluors:
   - AF555
 
-ALF968:
+- name: ALF968
+  fluors:
   - AF555
 
-CF319a:
+- name: CF319a
+  fluors:
   - AF488
 
-CFB562 mod1:
+- name: CFB562 mod1
+  fluors:
   - AF488
 
-GAM42a:
+- name: GAM42a
+  fluors:
   - RRX
 
-EUK516:
+- name: EUK516
+  fluors:
   - RRX
 
-Caa:
+- name: Caa
+  fluors:
   - AF514
   - Dual AF488
 
-Efae470:
+- name: Efae470
+  fluors:
   - AF594
 
-Eliz256:
+- name: Eliz256
+  fluors:
   - Cy3
 
-Eliz656:
+- name: Eliz656
+  fluors:
   - Cy3
 
-Eliz730:
+- name: Eliz730
+  fluors:
   - Cy3
 
-PsearA:
+- name: PsearA
+  fluors:
   - AF488
   - RRX
 
-PAS111:
+- name: PAS111
+  fluors:
   - AF660
   - RRX
