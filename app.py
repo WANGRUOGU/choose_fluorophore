@@ -151,19 +151,29 @@ def _to_uint8_gray(img2d):
         z = z / m
     return (np.clip(z, 0, 1) * 255).astype(np.uint8)
 
-def _argmax_labelmap(Ahat, colors):
+def _argmax_labelmap(Ahat, colors, rescale_global=False):
     """
-    Ahat(H,W,R) -> RGB(H,W,3). Each pixel is colored by the max-abundance fluor.
-    Zero-only pixels -> black.
+    彩色label map，每个像素：
+      - 颜色：取该像素中 abundance 最大的通道的预设颜色
+      - 亮度：取该像素的最大 abundance（mx）
+    如果 rescale_global=True，会把所有像素的 mx 再整体除以全局最大值，以确保范围在[0,1]。
     """
     H, W, R = Ahat.shape
     idx = np.argmax(Ahat, axis=2)       # (H,W)
     mx  = np.max(Ahat, axis=2)          # (H,W)
-    cols = np.asarray(colors, dtype=float)
-    rgb = cols[idx]                     # (H,W,3)
-    rgb[mx <= 0] = 0.0
+
+    if rescale_global:
+        m = float(mx.max())
+        if m > 0:
+            mx = mx / m
+
+    cols = np.asarray(colors, dtype=float)   # (R,3), 每种染料的RGB(0~1)
+    # 先取纯色，再按像素mx做亮度缩放
+    rgb = cols[idx] * mx[:, :, None]         # (H,W,3)
+
     rgb = np.clip(rgb, 0, 1)
     return (rgb * 255).astype(np.uint8)
+
 
 def _chunk(lst, n):
     for i in range(0, len(lst), n):
