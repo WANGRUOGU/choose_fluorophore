@@ -1,137 +1,143 @@
-- name: ACT476
-  fluors:
-  - AF488
-  - AF514
-  - AF660
-  - AF555
-- name: ALF682
-  fluors:
-  - AF555
-- name: ALF968
-  fluors:
-  - AF555
-- name: CAM1021
-  fluors:
+EUB338:
   - Bodipy FL
-- name: CF319a
-  fluors:
-  - AF488
-- name: CFB562
-  fluors:
-  - AF488
-- name: COR595
-  fluors:
-  - AF647
-  - AF660
-- name: COR633
-  fluors:
-  - RRX
-  - AF594
-  - AF647
-- name: Caa
-  fluors:
-  - AF514
-  - AF488
-- name: EUB338
-  fluors:
-  - Pacific Blue
-  - Bodipy FL
-  - FITC
-  - AF488
   - Oregon Green 514
   - TET
-  - AF514
   - Pacific Orange
-  - AF532
-  - AF555
+  - AF488
+  - AF514
   - AF594
+  - AF555
+  - FITC
+  - AF532
+  - Pacific Blue
+  - AF660
   - AF546
   - RRX
+  - AF647
   - AF633
   - AF405
-  - AF647
-  - AF660
-  - AF668
   - AF680
   - AF700
-  - Pacific Blue
+  - ATTO425
+  - ATTO465
+  - ATTO514
+  - ATTO532
+  - ATTO550
+  - ATTO565
+  - ATTO620
+  - ATTO633
+  - ATTO647
+  - ATTO665
+  - ATTORho12
   - ATTO542
-- name: EUK516
-  fluors:
-  - RRX
-- name: Efae470
-  fluors:
-  - AF594
-- name: Eliz276
-  fluors:
-  - Cy3
-- name: Eliz656
-  fluors:
-  - Cy3
-- name: Eliz730
-  fluors:
-  - Cy3
-- name: FUS714
-  fluors:
+
+ACT476:
+  - AF488
+  - AF514
+  - AF660
   - AF555
+
+CAM1021:
+  - Bodipy FL
+
+CAP371:
+  - AF688
+
+COR595:
+  - AF647
+  - AF660
+
+COR633:
   - AF594
-- name: GAM42a
-  fluors:
+  - AF647
   - RRX
-- name: GEM572
-  fluors:
+
+FUS714:
+  - AF555
+  - Dual AF594
+
+GEM572:
   - Pacific Orange
-- name: LEP568
-  fluors:
+
+LEP568:
   - AF488
   - AF660
-- name: LEP569
-  fluors:
-  - AF660
-- name: NEI1030
-  fluors:
+
+NEI1030:
   - TET
   - AF514
-  - AF532
   - AF633
-- name: PAS111
-  fluors:
-  - AF660
-  - RRX
-- name: PGI350
-  fluors:
-  - Pacific Blue
+  - AF532
+
+PGI350:
   - AF488
-- name: PRV392
-  fluors:
+  - Pacific Blue
+
+PRV392:
   - RRX
   - AF633
   - AF635
-- name: PsearA
-  fluors:
-  - AF488
-  - RRX
-- name: ROT491
-  fluors:
+
+ROT491:
   - AF647
   - AF610
-- name: SEL60
-  fluors:
+
+SEL60:
   - Bodipy FL
-- name: STR405
-  fluors:
-  - AF546
+
+STR405:
+  - AF548
   - AF594
   - AF633
   - AF660
-  - AF514
-- name: STR406
-  fluors:
   - AF532
-- name: TRP684
-  fluors:
-  - AF594
-- name: VEI488
-  fluors:
   - AF514
+
+TRP684:
+  - AF594
+
+VEI488:
   - AF555
+  - AF514
+
+ALF682:
+  - AF555
+
+ALF968:
+  - AF555
+
+CF319a:
+  - AF488
+
+CFB562 mod1:
+  - AF488
+
+GAM42a:
+  - RRX
+
+EUK516:
+  - RRX
+
+Caa:
+  - AF514
+  - Dual AF488
+
+Efae470:
+  - AF594
+
+Eliz256:
+  - Cy3
+
+Eliz656:
+  - Cy3
+
+Eliz730:
+  - Cy3
+
+PsearA:
+  - AF488
+  - RRX
+
+PAS111:
+  - AF660
+  - RRX
