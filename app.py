@@ -181,11 +181,19 @@ def _chunk(lst, n):
 
 def _show_bw_grid(title, imgs_uint8, labels, cols_per_row=6):
     st.markdown(f"**{title}**")
-    for row_imgs, row_labels in zip(_chunk(imgs_uint8, cols_per_row), _chunk(labels, cols_per_row)):
-        cs = st.columns(len(row_imgs))
-        for c, im, lb in zip(cs, row_imgs, row_labels):
-            c.image(im, use_container_width=True, clamp=True)
-            c.caption(lb)
+    n = len(imgs_uint8)
+    for i in range(0, n, cols_per_row):
+        chunk_imgs = imgs_uint8[i:i+cols_per_row]
+        chunk_labels = labels[i:i+cols_per_row]
+        cols = st.columns(cols_per_row)
+        for j in range(cols_per_row):
+            if j < len(chunk_imgs):
+                cols[j].image(chunk_imgs[j], use_container_width=True, clamp=True)
+                cols[j].caption(chunk_labels[j])
+            else:
+                # 占位，保持这一行每列同宽
+                cols[j].markdown("&nbsp;")
+
 
 def _html_table(headers, rows, num_cols=None):
     num_cols = num_cols or set()
@@ -424,19 +432,23 @@ def run(groups, mode, laser_strategy, laser_list):
             st.caption("Unmixing (argmax label map)")
 
         names = [_prettify_name(labels[j]) for j in sel_idx]
-        true_bw  = [_to_uint8_gray(Atrue[:, :, r]) for r in range(Atrue.shape[2])]
-        unmix_bw = [_to_uint8_gray(Ahat[:, :, r])  for r in range(Ahat.shape[2])]
-
+        unmix_bw = [_to_uint8_gray(Ahat[:, :, r]) for r in range(Ahat.shape[2])]
+        
         st.divider()
-        _show_bw_grid("Per-fluorophore (True, grayscale)",     true_bw,  names, cols_per_row=6)
         _show_bw_grid("Per-fluorophore (Unmixing, grayscale)", unmix_bw, names, cols_per_row=6)
 
-        rmse_rows = []
-        for r, nm in enumerate(names):
-            rmse_r = np.sqrt(np.mean((Ahat[:, :, r] - Atrue[:, :, r])**2))
-            rmse_rows.append([nm, rmse_r])
+        rmse_vals = []
+        for r in range(len(names)):
+            rmse_vals.append(np.sqrt(np.mean((Ahat[:, :, r] - Atrue[:, :, r])**2)))
         st.subheader("Per-fluorophore RMSE")
-        _html_table(headers=["Fluorophore", "RMSE"], rows=rmse_rows, num_cols={1})
+        _html_two_row_table(
+            row0_label="Fluorophore",
+            row1_label="RMSE",
+            row0_vals=names,
+            row1_vals=rmse_vals,
+            fmt2=True  # 显示为小数（.3f）
+        )
+
 
         return  # stop here to avoid any duplicated panels
 
@@ -536,19 +548,24 @@ def run(groups, mode, laser_strategy, laser_list):
             st.caption("Unmixing (argmax label map)")
 
         names = [_prettify_name(s) for s in labels_sel]
-        true_bw  = [_to_uint8_gray(Atrue[:, :, r]) for r in range(Atrue.shape[2])]
-        unmix_bw = [_to_uint8_gray(Ahat[:, :, r])  for r in range(Ahat.shape[2])]
-
+        unmix_bw = [_to_uint8_gray(Ahat[:, :, r]) for r in range(Ahat.shape[2])]
+        
         st.divider()
-        _show_bw_grid("Per-fluorophore (True, grayscale)",     true_bw,  names, cols_per_row=6)
         _show_bw_grid("Per-fluorophore (Unmixing, grayscale)", unmix_bw, names, cols_per_row=6)
 
-        rmse_rows = []
-        for r, nm in enumerate(names):
-            rmse_r = np.sqrt(np.mean((Ahat[:, :, r] - Atrue[:, :, r])**2))
-            rmse_rows.append([nm, rmse_r])
+
+        rmse_vals = []
+        for r in range(len(names)):
+            rmse_vals.append(np.sqrt(np.mean((Ahat[:, :, r] - Atrue[:, :, r])**2)))
         st.subheader("Per-fluorophore RMSE")
-        _html_table(headers=["Fluorophore", "RMSE"], rows=rmse_rows, num_cols={1})
+        _html_two_row_table(
+            row0_label="Fluorophore",
+            row1_label="RMSE",
+            row0_vals=names,
+            row1_vals=rmse_vals,
+            fmt2=True
+        )
+
 
         return  # stop here to avoid any duplicated panels
 
