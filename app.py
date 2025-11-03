@@ -40,6 +40,38 @@ def _load_readout_pool(path):
 
 readout_pool = _load_readout_pool(READOUT_POOL_YAML)
 
+def _get_inventory_from_probe_map():
+    """Union of all fluorophores that appear anywhere in probe_fluor_map.yaml and exist in dyes.yaml."""
+    inv = set()
+    for _, vals in probe_map.items():
+        if not isinstance(vals, (list, tuple)):
+            continue
+        for f in vals:
+            if isinstance(f, str):
+                fs = f.strip()
+                if fs and fs in dye_db:
+                    inv.add(fs)
+    return sorted(inv)
+
+inventory_pool = _get_inventory_from_probe_map()
+
+def _get_eub338_pool():
+    """Candidates under the EUB 338 probe key (various spellings), filtered to dyes.yaml presence."""
+    targets = {"eub338", "eub 338", "eub-338"}
+    def norm(s): return "".join(s.lower().split())
+    for k in probe_map.keys():
+        if norm(k) in targets:
+            cands = [f for f in probe_map.get(k, []) if f in dye_db]
+            return sorted({c.strip() for c in cands})
+    # relaxed fallback
+    import re
+    def norm2(s): return re.sub(r"[^a-z0-9]+", "", s.lower())
+    for k in probe_map.keys():
+        if norm2(k) == "eub338":
+            cands = [f for f in probe_map.get(k, []) if f in dye_db]
+            return sorted({c.strip() for c in cands})
+    return []
+
 # -------------------- Sidebar --------------------
 st.sidebar.header("Configuration")
 mode = st.sidebar.radio(
@@ -49,7 +81,13 @@ mode = st.sidebar.radio(
           "Predicted: effective spectra with lasers (excitation · QY · EC)."),
     key="mode_radio"
 )
-source_mode = st.sidebar.radio("Selection source", ("By probes", "From readout pool"), key="source_radio")
+
+source_mode = st.sidebar.radio(
+    "Selection source",
+    ("By probes", "From readout pool", "From inventory", "EUB338 only"),
+    key="source_radio"
+)
+
 k_show = st.sidebar.slider("Show top-K similarities", 5, 50, 10, 1, key="k_show_slider")
 
 laser_list = []
@@ -153,27 +191,21 @@ def _to_uint8_gray(img2d):
 
 def _argmax_labelmap(Ahat, colors, rescale_global=False):
     """
-    彩色label map，每个像素：
-      - 颜色：取该像素中 abundance 最大的通道的预设颜色
-      - 亮度：取该像素的最大 abundance（mx）
-    如果 rescale_global=True，会把所有像素的 mx 再整体除以全局最大值，以确保范围在[0,1]。
+    Colored label map:
+      - hue from the channel with maximum abundance per pixel
+      - brightness from that maximum abundance
     """
     H, W, R = Ahat.shape
-    idx = np.argmax(Ahat, axis=2)       # (H,W)
-    mx  = np.max(Ahat, axis=2)          # (H,W)
-
+    idx = np.argmax(Ahat, axis=2)  # (H,W)
+    mx  = np.max(Ahat, axis=2)     # (H,W)
     if rescale_global:
         m = float(mx.max())
         if m > 0:
             mx = mx / m
-
-    cols = np.asarray(colors, dtype=float)   # (R,3), 每种染料的RGB(0~1)
-    # 先取纯色，再按像素mx做亮度缩放
+    cols = np.asarray(colors, dtype=float)   # (R,3)
     rgb = cols[idx] * mx[:, :, None]         # (H,W,3)
-
     rgb = np.clip(rgb, 0, 1)
     return (rgb * 255).astype(np.uint8)
-
 
 def _chunk(lst, n):
     for i in range(0, len(lst), n):
@@ -191,9 +223,7 @@ def _show_bw_grid(title, imgs_uint8, labels, cols_per_row=6):
                 cols[j].image(chunk_imgs[j], use_container_width=True, clamp=True)
                 cols[j].caption(chunk_labels[j])
             else:
-                # 占位，保持这一行每列同宽
                 cols[j].markdown("&nbsp;")
-
 
 def _html_table(headers, rows, num_cols=None):
     num_cols = num_cols or set()
@@ -219,28 +249,6 @@ def _html_table(headers, rows, num_cols=None):
         """,
         unsafe_allow_html=True
     )
-def _capsule_expected_area(Lmin=18, Lmax=30, Wmin=10, Wmax=16):
-    """
-    估算单个胶囊形杆菌面积：矩形(2r*L) + 两端半圆(pi*r^2)。
-    用长度/宽度的中位数估计。
-    """
-    L = 0.5 * (Lmin + Lmax)          # ~24
-    W = 0.5 * (Wmin + Wmax)          # ~13
-    r = 0.5 * W
-    return 2 * r * L + np.pi * r * r
-
-def _suggest_canvas_size(R, rods_per, target_density=0.22, min_side=160):
-    """
-    根据要放的“R 个染料 × rods_per 个杆菌”估算所需方形画布边长。
-    target_density 是“(对象面积和) / 画布面积”的目标密度（越小越稀疏越容易不重叠）。
-    """
-    area_one = _capsule_expected_area()
-    total_obj_area = R * rods_per * area_one
-    # 留足非重叠/边界/随机失败空间
-    canvas_area = total_obj_area / max(1e-6, target_density)
-    side = int(np.ceil(np.sqrt(canvas_area)))
-    side = max(min_side, side)
-    return side, side
 
 # -------------------- NLS + color --------------------
 def nls_unmix(Timg, E, iters=2000, tol=1e-6):
@@ -300,9 +308,7 @@ def _capsule_profile(H, W, cx, cy, length, width, theta):
 def _place_rods_scene(H, W, R, rods_per=3, rng=None, max_trials_per_class=1200):
     """
     Non-overlapping rods (capsules). Shorter & thicker to resemble E. coli.
-    返回：
-      - Atrue: (H,W,R)
-      - placed_counts: (R,) 每个染料实际放下的杆菌数量
+    Returns Atrue(H,W,R) and per-class placed_counts(R,).
     """
     rng = np.random.default_rng() if rng is None else rng
     Atrue = np.zeros((H, W, R), dtype=np.float32)
@@ -321,7 +327,6 @@ def _place_rods_scene(H, W, R, rods_per=3, rng=None, max_trials_per_class=1200):
             length = int(rng.integers(Lmin, Lmax + 1))
             width  = int(rng.integers(Wmin, Wmax + 1))
             theta  = float(rng.uniform(0, np.pi))
-            # 边界安全距离随尺寸略放大
             margin = 6 + int(max(length, width) / 2)
             if W - 2*margin <= 2 or H - 2*margin <= 2:
                 break
@@ -342,12 +347,26 @@ def _place_rods_scene(H, W, R, rods_per=3, rng=None, max_trials_per_class=1200):
 
     return np.clip(Atrue, 0, 1), placed_counts
 
+# ---- canvas sizing helpers ----
+def _capsule_expected_area(Lmin=18, Lmax=30, Wmin=10, Wmax=16):
+    L = 0.5 * (Lmin + Lmax)          # ~24
+    W = 0.5 * (Wmin + Wmax)          # ~13
+    r = 0.5 * W
+    return 2 * r * L + np.pi * r * r
+
+def _suggest_canvas_size(R, rods_per, target_density=0.22, min_side=160):
+    area_one = _capsule_expected_area()
+    total_obj_area = R * rods_per * area_one
+    canvas_area = total_obj_area / max(1e-6, target_density)
+    side = int(np.ceil(np.sqrt(canvas_area)))
+    side = max(min_side, side)
+    return side, side
 
 # -------------------- Simulation core --------------------
 def simulate_rods_and_unmix(E, H=None, W=None, rods_per=3, rng=None):
     """
     Forward: T = Atrue ⊗ E; scale to peak=255; Poisson; NLS unmix.
-    画布大小若未给出，则按 R, rods_per 自动估算；若放不下则逐步放大画布重试。
+    Auto-resize canvas so each fluorophore can place 'rods_per' rods if possible.
     """
     rng = np.random.default_rng() if rng is None else rng
     E = np.asarray(E, dtype=float)
@@ -355,25 +374,21 @@ def simulate_rods_and_unmix(E, H=None, W=None, rods_per=3, rng=None):
         raise ValueError(f"E must be 2D, got {E.shape}")
     C, R = E.shape
 
-    # 1) 估算或采用传入画布
     if H is None or W is None:
         H, W = _suggest_canvas_size(R, rods_per, target_density=0.22, min_side=160)
 
-    # 2) 放置；不够就放大重试
     scale_attempts = 0
     while True:
         Atrue, placed = _place_rods_scene(H, W, R, rods_per, rng)
         if np.all(placed >= rods_per):
             break
         if scale_attempts >= 4:
-            # 已尝试多次，给出最接近的结果（不会崩）
+            # give best-effort result
             break
-        # 画布放大 25%，继续尝试
         H = int(np.ceil(H * 1.25))
         W = int(np.ceil(W * 1.25))
         scale_attempts += 1
 
-    # 3) 前向成像与噪声
     Tclean = np.zeros((H, W, C), dtype=float)
     for c in range(C):
         Tclean[:, :, c] = np.tensordot(Atrue, E[c, :], axes=([2], [0]))
@@ -388,22 +403,42 @@ def simulate_rods_and_unmix(E, H=None, W=None, rods_per=3, rng=None):
         lam = np.clip(lam, 0.0, 1e6)
         Tnoisy = rng.poisson(lam).astype(float) / peak
 
-    # 4) 反演
     Ahat = nls_unmix(Tnoisy, E, iters=1500, tol=1e-6)
     return Atrue, Ahat
-
 
 # -------------------- Main --------------------
 st.title("Fluorophore Selection for Multiplexed Imaging")
 
-use_pool = (source_mode == "From readout pool")
-if use_pool:
-    if not readout_pool:
+# -------------------- Source selection -> groups --------------------
+use_pool = False
+if source_mode == "From readout pool":
+    pool = readout_pool[:]
+    if not pool:
         st.info("Readout pool not found (data/readout_fluorophores.yaml)."); st.stop()
-    max_n = len(readout_pool)
+    max_n = len(pool)
     N_pick = st.number_input("How many fluorophores", 1, max_n, min(4, max_n), 1, key="n_pick_pool")
-    groups = {"Pool": readout_pool[:] }
-else:
+    groups = {"Pool": pool}
+    use_pool = True
+
+elif source_mode == "From inventory":
+    pool = inventory_pool[:]
+    if not pool:
+        st.error("No fluorophores found in probe_fluor_map.yaml that also exist in dyes.yaml."); st.stop()
+    max_n = len(pool)
+    N_pick = st.number_input("How many fluorophores", 1, max_n, min(4, max_n), 1, key="n_pick_inv")
+    groups = {"Pool": pool}
+    use_pool = True
+
+elif source_mode == "EUB338 only":
+    pool = _get_eub338_pool()
+    if not pool:
+        st.error("No candidates found for EUB 338 in probe_fluor_map.yaml."); st.stop()
+    max_n = len(pool)
+    N_pick = st.number_input("How many fluorophores", 1, max_n, min(4, max_n), 1, key="n_pick_eub338")
+    groups = {"Pool": pool}
+    use_pool = True
+
+else:  # "By probes"
     all_probes = sorted(probe_map.keys())
     picked = st.multiselect("Probes", options=all_probes, key="picked_probes")
     if not picked:
@@ -411,7 +446,8 @@ else:
     groups = {}
     for p in picked:
         cands = [f for f in probe_map.get(p, []) if f in dye_db]
-        if cands: groups[p] = cands
+        if cands:
+            groups[p] = cands
     if not groups:
         st.error("No valid candidates with spectra in dyes.yaml."); st.stop()
     N_pick = None
@@ -438,7 +474,7 @@ def run(groups, mode, laser_strategy, laser_list):
         )
         colors = _ensure_colors(len(sel_idx))
 
-        # Top panels (kept): Selected / Pairwise / Spectra viewer
+        # Top panels (kept, once): Selected / Pairwise / Spectra viewer
         if use_pool:
             fluors = [labels[j].split(" – ", 1)[1] for j in sel_idx]
             st.subheader("Selected Fluorophores")
@@ -478,6 +514,7 @@ def run(groups, mode, laser_strategy, laser_list):
         chan = 494.0 + 8.9*np.arange(C)
         E = cached_interpolate_E_on_channels(wl, E_norm[:, sel_idx], chan)
 
+        # auto-size canvas to ensure each fluor has 3 rods
         Atrue, Ahat = simulate_rods_and_unmix(E, rods_per=3)
 
         colL, colR = st.columns(2)
@@ -485,17 +522,18 @@ def run(groups, mode, laser_strategy, laser_list):
         labelmap_rgb = _argmax_labelmap(Ahat, colors)
         with colL:
             st.image(true_rgb, use_container_width=True, clamp=True)
-            st.caption("True")
+            st.caption("True (composite)")
         with colR:
             st.image(labelmap_rgb, use_container_width=True, clamp=True)
-            st.caption("Unmixing results")
+            st.caption("Unmixing (argmax label map; color=hue, brightness=max abundance)")
 
         names = [_prettify_name(labels[j]) for j in sel_idx]
         unmix_bw = [_to_uint8_gray(Ahat[:, :, r]) for r in range(Ahat.shape[2])]
-        
+
         st.divider()
         _show_bw_grid("Per-fluorophore (Unmixing, grayscale)", unmix_bw, names, cols_per_row=6)
 
+        # Transposed RMSE table: row1=Fluorophore, row2=RMSE
         rmse_vals = []
         for r in range(len(names)):
             rmse_vals.append(np.sqrt(np.mean((Ahat[:, :, r] - Atrue[:, :, r])**2)))
@@ -505,9 +543,8 @@ def run(groups, mode, laser_strategy, laser_list):
             row1_label="RMSE",
             row0_vals=names,
             row1_vals=rmse_vals,
-            fmt2=True  # 显示为小数（.3f）
+            fmt2=True
         )
-
 
         return  # stop here to avoid any duplicated panels
 
@@ -592,6 +629,7 @@ def run(groups, mode, laser_strategy, laser_list):
         # ---------- Simulations (always shown) ----------
         C = 23
         chan = 494.0 + 8.9*np.arange(C)
+        # Keep alignment with viewer choice
         E = cached_interpolate_E_on_channels(wl, E_raw_sel/(B+1e-12), chan)
 
         Atrue, Ahat = simulate_rods_and_unmix(E, rods_per=3)
@@ -601,17 +639,16 @@ def run(groups, mode, laser_strategy, laser_list):
         labelmap_rgb = _argmax_labelmap(Ahat, colors)
         with colL:
             st.image(true_rgb, use_container_width=True, clamp=True)
-            st.caption("True")
+            st.caption("True (composite)")
         with colR:
             st.image(labelmap_rgb, use_container_width=True, clamp=True)
-            st.caption("Unmixing results")
+            st.caption("Unmixing (argmax label map; color=hue, brightness=max abundance)")
 
         names = [_prettify_name(s) for s in labels_sel]
         unmix_bw = [_to_uint8_gray(Ahat[:, :, r]) for r in range(Ahat.shape[2])]
-        
+
         st.divider()
         _show_bw_grid("Per-fluorophore (Unmixing, grayscale)", unmix_bw, names, cols_per_row=6)
-
 
         rmse_vals = []
         for r in range(len(names)):
@@ -624,7 +661,6 @@ def run(groups, mode, laser_strategy, laser_list):
             row1_vals=rmse_vals,
             fmt2=True
         )
-
 
         return  # stop here to avoid any duplicated panels
 
