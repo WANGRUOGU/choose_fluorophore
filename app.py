@@ -93,12 +93,14 @@ def _open_text(path):
 
 def _load_sampler_yaml(path):
     import os, yaml, numpy as np
+
     # try .yaml then .yaml.gz
     if not os.path.exists(path):
         if os.path.exists(path + ".gz"):
             path = path + ".gz"
         else:
             return None
+
     with _open_text(path) as f:
         yml = yaml.safe_load(f) or {}
 
@@ -113,6 +115,7 @@ def _load_sampler_yaml(path):
         return None
 
     out = {"C": C, "bin_edges": bin_edges, "storage": storage}
+
     if storage == "samples":
         out["samples"] = yml.get("samples") or [[] for _ in range(C)]
     elif storage == "hist":
@@ -128,7 +131,7 @@ def _load_sampler_yaml(path):
         else:
             return None
 
-    # ---- robust numeric max (skip garbage) ----
+    # ---- robust numeric max (skip garbage & nested) ----
     def _safe_max_from_iter(x):
         m = None
         stack = [x]
@@ -153,6 +156,7 @@ def _load_sampler_yaml(path):
                 mv = _safe_max_from_iter(b)
                 if mv is not None and mv > max_val:
                     max_val = mv
+
     elif storage == "hist":
         for c in range(C):
             chan = out["hist"][c] if c < len(out["hist"]) else []
@@ -161,6 +165,7 @@ def _load_sampler_yaml(path):
                 mv = _safe_max_from_iter(centers)
                 if mv is not None and mv > max_val:
                     max_val = mv
+
     elif storage == "quantiles":
         qvals = out["q_values"]
         for c in range(C):
@@ -172,7 +177,6 @@ def _load_sampler_yaml(path):
 
     out["max_intensity"] = float(max_val)
     return out
-
 
 # -------------------- Sidebar --------------------
 st.sidebar.header("Configuration")
@@ -475,35 +479,65 @@ def _sample_channel_from_bins(I_flat, edges, pools, rng):
     """
     I_flat: (N,) predicted intensities for a single channel
     edges:  (B+1,) bin edges (ascending)
-    pools:  list[B] of arrays with real intensity samples
+    pools:  list[B] of arrays/lists with real intensity samples (可能含空或脏数据)
     Returns y_flat: (N,) sampled real intensities.
     """
+    import numpy as np
+
     edges = np.asarray(edges, float)
     N = I_flat.size
     y = np.zeros(N, dtype=float)
+
+    # locate bins
     b = np.searchsorted(edges, I_flat, side='right') - 1
     b = np.clip(b, 0, len(edges) - 2)
+
+    def _pool_empty(p):
+        try:
+            return (p is None) or (len(p) == 0)
+        except Exception:
+            return True
+
+    def _pool_to_array(p):
+        # 尽量转为 1D float 数组；失败则返回空
+        try:
+            arr = np.asarray(p, dtype=float).ravel()
+            arr = arr[np.isfinite(arr)]
+            return arr
+        except Exception:
+            return np.array([], dtype=float)
+
     uniq = np.unique(b)
     for ub in uniq:
         mask = (b == ub)
-        pool = pools[ub]
-        if not pool:
-            L = ub - 1; R = ub + 1; found = None
+        pool = pools[ub] if ub < len(pools) else None
+
+        arr = np.array([], dtype=float) if _pool_empty(pool) else _pool_to_array(pool)
+        if arr.size == 0:
+            # fallback: 最近的非空 bin；再不行就用该 bin 区间内均匀采样
+            found = None
+            L, R = ub - 1, ub + 1
             while L >= 0 or R < len(pools):
-                if L >= 0 and pools[L]:
-                    found = pools[L]; break
-                if R < len(pools) and pools[R]:
-                    found = pools[R]; break
+                cand = None
+                if L >= 0 and not _pool_empty(pools[L]):
+                    cand = _pool_to_array(pools[L])
+                    if cand.size: found = cand; break
+                if R < len(pools) and not _pool_empty(pools[R]):
+                    cand = _pool_to_array(pools[R])
+                    if cand.size: found = cand; break
                 L -= 1; R += 1
-            if found is None:
-                y[mask] = 0.0
+            if found is not None:
+                idx = rng.integers(0, found.size, size=mask.sum())
+                y[mask] = found[idx]
             else:
-                idx = rng.integers(0, len(found), size=mask.sum())
-                y[mask] = np.asarray(found, float)[idx]
+                left, right = edges[ub], edges[ub+1]
+                y[mask] = rng.uniform(left, right, size=mask.sum())
         else:
-            idx = rng.integers(0, len(pool), size=mask.sum())
-            y[mask] = np.asarray(pool, float)[idx]
+            idx = rng.integers(0, arr.size, size=mask.sum())
+            y[mask] = arr[idx]
+
     return y
+
 
 def simulate_with_sampler(E, sampler, rods_per=3, rng=None):
     """
