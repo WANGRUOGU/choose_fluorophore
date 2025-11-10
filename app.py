@@ -177,6 +177,8 @@ def _load_sampler_yaml(path):
 
     out["max_intensity"] = float(max_val)
     return out
+# ---- load sampler once at module level ----
+SAMPLER = _load_sampler_yaml(SAMPLER_YAML)
 
 # -------------------- Sidebar --------------------
 st.sidebar.header("Configuration")
