@@ -639,8 +639,10 @@ def _prettify_name(label: str) -> str:
         return f"AF {name[2:]}"
     return name
 
-def run(groups, mode, laser_strategy, laser_list):
-    required_count = (N_pick if use_pool else None)
+def run(groups, mode, laser_strategy, laser_list, sampler):
+    if sampler is None:
+        st.error("sampler.yaml not found or invalid. Please place it at data/sampler.yaml.")
+        st.stop()
 
     # -------------------- EMISSION branch --------------------
     if mode == "Emission spectra":
@@ -860,4 +862,4 @@ if __name__ == "__main__":
                 run_groups[p] = cands
         if not run_groups:
             st.stop()
-    run(run_groups, mode, laser_strategy, laser_list)
+   run(run_groups, mode, laser_strategy, laser_list, SAMPLER)
