@@ -660,8 +660,11 @@ def run(groups, mode, laser_strategy, laser_list, sampler):
         # Selection on the subset-normalized matrix
         sel_idx, _ = solve_lexicographic_k(
             E_sub, idx_groups, labels,
-            levels=10, enforce_unique=True, required_count=required_count
+            levels=10, enforce_unique=True
         )
+        if required_count is not None:
+            sel_idx = sel_idx[:required_count]
+
         colors = _ensure_colors(len(sel_idx))
 
         # Selected list
@@ -739,7 +742,10 @@ def run(groups, mode, laser_strategy, laser_list, sampler):
 
         # Provisional selection on emission-only
         E0, labels0, idx0 = build_emission_only_matrix(wl, dye_db, groups)
-        sel0, _ = solve_lexicographic_k(E0, idx0, labels0, levels=10, enforce_unique=True, required_count=required_count)
+        sel0, _ = solve_lexicographic_k(E0, idx0, labels0, levels=10, enforce_unique=True)
+        if required_count is not None:
+            sel0 = sel0[:required_count]
+
         A_labels = [labels0[j] for j in sel0]
 
         # Powers on provisional set
@@ -755,8 +761,11 @@ def run(groups, mode, laser_strategy, laser_list, sampler):
 
         # Final selection on E_norm_all
         sel_idx, _ = solve_lexicographic_k(
-            E_norm_all, idx_all, labels_all, levels=10, enforce_unique=True, required_count=required_count
+            E_norm_all, idx_all, labels_all, levels=10, enforce_unique=True
         )
+        if required_count is not None:
+            sel_idx = sel_idx[:required_count]
+
         final_labels = [labels_all[j] for j in sel_idx]
 
         # Recalibrate powers on final set
