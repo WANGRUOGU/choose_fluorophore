@@ -840,9 +840,7 @@ def run(groups, mode, laser_strategy, laser_list, sampler):
 
 # -------------------- Execute --------------------
 if __name__ == "__main__":
-    run_groups = None
-    # groups are built earlier depending on sidebar selection
-    # Recompute here to ensure latest state:
+    # Build groups according to sidebar state
     if source_mode == "From readout pool":
         pool = readout_pool[:]
         run_groups = {"Pool": pool}
@@ -853,7 +851,6 @@ if __name__ == "__main__":
         pool = _get_eub338_pool()
         run_groups = {"Pool": pool}
     else:
-        # By probes, pull selected again (Streamlit keeps state)
         picked = st.session_state.get("picked_probes", [])
         run_groups = {}
         for p in picked or []:
@@ -862,4 +859,5 @@ if __name__ == "__main__":
                 run_groups[p] = cands
         if not run_groups:
             st.stop()
-   run(run_groups, mode, laser_strategy, laser_list, SAMPLER)
+
+    run(run_groups, mode, laser_strategy, laser_list, SAMPLER)
