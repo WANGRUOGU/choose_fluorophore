@@ -85,35 +85,126 @@ def _get_eub338_pool():
     return []
 
 # -------------------- Sampler loader --------------------
+# --- drop-in replacement for _load_sampler_yaml (robust & gzip-aware) ---
+def _open_text(path):
+    import os, gzip
+    if path.endswith(".gz"):
+        return gzip.open(path, "rt", encoding="utf-8")
+    return open(path, "r", encoding="utf-8")
+
 def _load_sampler_yaml(path):
     """
-    Expect YAML with:
+    Robust loader for sampler.yaml (or sampler.yaml.gz).
+
+    Supports:
+      storage: 'samples' | 'hist' | 'quantiles'
+    Expected YAML keys:
       type: per_channel_bins
       bin_edges: list[C] of list[B+1]
-      samples:   list[C] of list[B] of list[int/float]
-    Returns dict with C, bin_edges, samples, max_intensity.
+
+      when storage='samples':
+        samples: list[C] of list[B] of list[number]
+
+      when storage='hist':
+        hist: list[C] of list[B] of {centers:[], counts:[]}
+
+      when storage='quantiles':
+        q_levels: list[Q]
+        q_values: list[C] of list[B] of list[Q]
+
+      meta.storage may also contain the storage type.
     """
-    import os, yaml
+    import os, yaml, numpy as np
+
+    # try .yaml then .yaml.gz
     if not os.path.exists(path):
-        return None
-    with open(path, "r", encoding="utf-8") as f:
+        if os.path.exists(path + ".gz"):
+            path = path + ".gz"
+        else:
+            return None
+
+    with _open_text(path) as f:
         yml = yaml.safe_load(f) or {}
+
     if (yml.get("type") or "").lower() != "per_channel_bins":
         return None
-    bin_edges = yml.get("bin_edges") or []
-    samples = yml.get("samples") or []
-    C = len(bin_edges)
-    if C == 0 or C != len(samples):
-        return None
-    max_val = 0.0
-    for c in range(C):
-        for b in samples[c]:
-            if b:
-                mv = float(np.max(np.asarray(b, dtype=float)))
-                if mv > max_val: max_val = mv
-    return {"C": C, "bin_edges": bin_edges, "samples": samples, "max_intensity": max_val}
 
-SAMPLER = _load_sampler_yaml(SAMPLER_YAML)
+    storage = (yml.get("meta", {}) or {}).get("storage") or yml.get("storage") or "samples"
+    storage = str(storage).lower()
+
+    bin_edges = yml.get("bin_edges") or []
+    C = len(bin_edges)
+    if C == 0:
+        return None
+
+    out = {"C": C, "bin_edges": bin_edges, "storage": storage}
+
+    if storage == "samples":
+        out["samples"] = yml.get("samples") or [[] for _ in range(C)]
+    elif storage == "hist":
+        out["hist"] = yml.get("hist") or [[] for _ in range(C)]
+    elif storage == "quantiles":
+        out["q_levels"] = yml.get("q_levels") or yml.get("quantile_levels")
+        out["q_values"] = yml.get("q_values") or [[] for _ in range(C)]
+    else:
+        # unknown storage; try to fall back to samples if key exists
+        if "samples" in yml:
+            storage = "samples"
+            out["storage"] = "samples"
+            out["samples"] = yml.get("samples") or [[] for _ in range(C)]
+        else:
+            return None
+
+    # ---- robust numeric max (skip garbage) ----
+    def safe_max_list(lst):
+        """Return max numeric value in a (possibly messy) list; None if none."""
+        m = None
+        # flatten one level if elements are nested lists/tuples
+        for x in lst:
+            if isinstance(x, (list, tuple)):
+                val = safe_max_list(x)
+                if val is not None:
+                    m = val if (m is None or val > m) else m
+            else:
+                try:
+                    v = float(x)
+                    if np.isfinite(v):
+                        m = v if (m is None or v > m) else m
+                except Exception:
+                    continue
+        return m
+
+    max_val = 0.0
+    if storage == "samples":
+        # samples[c][b] is (list of numbers), but may contain empties / strings / None
+        for c in range(C):
+            chan = out["samples"][c] if c < len(out["samples"]) else []
+            for b in chan:
+                mv = safe_max_list(b if isinstance(b, (list, tuple)) else [b])
+                if mv is not None and mv > max_val:
+                    max_val = mv
+
+    elif storage == "hist":
+        # use centers as proxy for max intensity
+        for c in range(C):
+            chan = out["hist"][c] if c < len(out["hist"]) else []
+            for hb in chan:
+                centers = (hb or {}).get("centers", [])
+                mv = safe_max_list(centers if isinstance(centers, (list, tuple)) else [centers])
+                if mv is not None and mv > max_val:
+                    max_val = mv
+
+    elif storage == "quantiles":
+        q_vals = out["q_values"]
+        for c in range(C):
+            chan = q_vals[c] if c < len(q_vals) else []
+            for qb in chan:
+                mv = safe_max_list(qb if isinstance(qb, (list, tuple)) else [qb])
+                if mv is not None and mv > max_val:
+                    max_val = mv
+
+    out["max_intensity"] = float(max_val)
+    return out
 
 # -------------------- Sidebar --------------------
 st.sidebar.header("Configuration")
