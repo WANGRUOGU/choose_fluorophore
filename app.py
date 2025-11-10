@@ -40,6 +40,16 @@ READOUT_POOL_YAML = "data/readout_fluorophores.yaml"
 wl, dye_db = load_dyes_yaml(DYES_YAML)
 probe_map = load_probe_fluor_map(PROBE_MAP_YAML)
 
+def solve_lexi_topk(E, idx_groups, labels, required_count=None, **kwargs):
+    """
+    Wrapper around utils.solve_lexicographic_k that optionally truncates to top-K.
+    Removes unsupported keyword 'required_count' from the upstream call.
+    """
+    sel_idx, meta = solve_lexicographic_k(E, idx_groups, labels, **kwargs)
+    if required_count is not None:
+        sel_idx = sel_idx[:int(required_count)]
+    return sel_idx, meta
+
 def _load_readout_pool(path):
     try:
         import yaml, os
@@ -658,9 +668,9 @@ def run(groups, mode, laser_strategy, laser_list, sampler):
         E_sub, gmax = subset_and_normalize_matrix(wl, E_full, CHANNEL_WAVELENGTHS)  # (33 x N)
 
         # Selection on the subset-normalized matrix
-        sel_idx, _ = solve_lexicographic_k(
+        sel_idx, _ = solve_lexi_topk(
             E_sub, idx_groups, labels,
-            levels=10, enforce_unique=True
+            required_count=required_count, levels=10, enforce_unique=True
         )
         if required_count is not None:
             sel_idx = sel_idx[:required_count]
@@ -742,7 +752,7 @@ def run(groups, mode, laser_strategy, laser_list, sampler):
 
         # Provisional selection on emission-only
         E0, labels0, idx0 = build_emission_only_matrix(wl, dye_db, groups)
-        sel0, _ = solve_lexicographic_k(E0, idx0, labels0, levels=10, enforce_unique=True)
+        sel0, _ = solve_lexi_topk(E0, idx0, labels0, required_count=required_count, levels=10, enforce_unique=True)
         if required_count is not None:
             sel0 = sel0[:required_count]
 
@@ -760,8 +770,9 @@ def run(groups, mode, laser_strategy, laser_list, sampler):
         )
 
         # Final selection on E_norm_all
-        sel_idx, _ = solve_lexicographic_k(
-            E_norm_all, idx_all, labels_all, levels=10, enforce_unique=True
+        sel_idx, _ = solve_lexi_topk(
+            E_norm_all, idx_all, labels_all,
+            required_count=required_count, levels=10, enforce_unique=True
         )
         if required_count is not None:
             sel_idx = sel_idx[:required_count]
