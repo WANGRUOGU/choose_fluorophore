@@ -1,4 +1,3 @@
-
 # app.py — streamlined, English-only, E. coli–like rods, renamed UI/captions
 import json
 import numpy as np
@@ -271,6 +270,8 @@ def nls_unmix(Timg, E, iters=2000, tol=1e-6):
         if np.max(numer / (denom + 1e-12)) < 1 + tol:
             break
     A *= scale
+    mA = float(np.max(A))
+    if mA>0: A /= mA
     return A.reshape(H, W, E.shape[1])
 
 def colorize_single(A_r, color):
@@ -344,7 +345,7 @@ def _place_rods_scene(H, W, R, rods_per=3, rng=None, max_trials_per_class=1200):
             placed += 1
         placed_counts[r] = placed
 
-    return np.clip(Atrue * 255.0, 0, 255).astype(np.float32), placed_counts
+    return np.clip(Atrue, 0, 1), placed_counts
 
 # ---- canvas sizing helpers ----
 def _capsule_expected_area(Lmin=18, Lmax=30, Wmin=10, Wmax=16):
@@ -509,19 +510,16 @@ def run(groups, mode, laser_strategy, laser_list):
         st.plotly_chart(fig, use_container_width=True)
 
         # ---------- Simulations (always shown) ----------
-        CHANNEL_CENTERS_NM = np.array([
-            414, 423, 432, 441, 450, 459, 468, 477, 486, 494, 503, 512, 521, 530,
-            539, 548, 557, 566, 575, 583, 592, 601, 610, 619, 628, 637, 646, 655,
-            664, 673, 681, 690, 717
-        ], dtype=float)
-        E = cached_interpolate_E_on_channels(wl, E_norm[:, sel_idx], CHANNEL_CENTERS_NM)
+        C = 23
+        chan = 494.0 + 8.9*np.arange(C)
+        E = cached_interpolate_E_on_channels(wl, E_norm[:, sel_idx], chan)
 
         # auto-size canvas to ensure each fluor has 3 rods
         Atrue, Ahat = simulate_rods_and_unmix(E, rods_per=3)
 
         colL, colR = st.columns(2)
-        true_rgb = (colorize_composite(Atrue / 255.0, colors) * 255).astype(np.uint8)
-        labelmap_rgb = _argmax_labelmap(Ahat, colors, rescale_global=True)
+        true_rgb = (colorize_composite(Atrue, colors) * 255).astype(np.uint8)
+        labelmap_rgb = _argmax_labelmap(Ahat, colors)
         with colL:
             st.image(true_rgb, use_container_width=True, clamp=True)
             st.caption("True")
@@ -537,7 +535,6 @@ def run(groups, mode, laser_strategy, laser_list):
 
         # Transposed RMSE table: row1=Fluorophore, row2=RMSE
         rmse_vals = []
-        Atrue01 = Atrue / 255.0
         for r in range(len(names)):
             rmse_vals.append(np.sqrt(np.mean((Ahat[:, :, r] - Atrue[:, :, r])**2)))
         st.subheader("Per-fluorophore RMSE")
@@ -633,13 +630,13 @@ def run(groups, mode, laser_strategy, laser_list):
         C = 23
         chan = 494.0 + 8.9*np.arange(C)
         # Keep alignment with viewer choice
-        E = cached_interpolate_E_on_channels(wl, E_raw_sel/(B+1e-12), CHANNEL_CENTERS_NM)
+        E = cached_interpolate_E_on_channels(wl, E_raw_sel/(B+1e-12), chan)
 
         Atrue, Ahat = simulate_rods_and_unmix(E, rods_per=3)
 
         colL, colR = st.columns(2)
-        true_rgb = (colorize_composite(Atrue / 255.0, colors) * 255).astype(np.uint8)
-        labelmap_rgb = _argmax_labelmap(Ahat, colors, rescale_global=True)
+        true_rgb = (colorize_composite(Atrue, colors) * 255).astype(np.uint8)
+        labelmap_rgb = _argmax_labelmap(Ahat, colors)
         with colL:
             st.image(true_rgb, use_container_width=True, clamp=True)
             st.caption("True")
@@ -654,7 +651,6 @@ def run(groups, mode, laser_strategy, laser_list):
         _show_bw_grid("Per-fluorophore (Unmixing, grayscale)", unmix_bw, names, cols_per_row=6)
 
         rmse_vals = []
-        Atrue01 = Atrue / 255.0
         for r in range(len(names)):
             rmse_vals.append(np.sqrt(np.mean((Ahat[:, :, r] - Atrue[:, :, r])**2)))
         st.subheader("Per-fluorophore RMSE")
