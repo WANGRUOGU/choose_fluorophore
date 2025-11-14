@@ -593,12 +593,10 @@ def run(groups, mode, laser_strategy, laser_list):
         E_raw_sel, E_norm_sel, labels_sel, _ = cached_build_effective_with_lasers(
             wl, dye_db, small_groups, laser_list, laser_strategy, powers
         )
-        
+        colors = _ensure_colors(len(labels_sel))
         E_raw_all_view, _, labels_all_view, _ = cached_build_effective_with_lasers(
             wl, dye_db, groups, laser_list, laser_strategy, powers
         )
-        
-        colors = _ensure_colors(len(labels_sel))
 
         # Top panels (kept): Selected / Pairwise / Spectra viewer
         st.subheader("Selected Fluorophores (with lasers)")
@@ -617,42 +615,62 @@ def run(groups, mode, laser_strategy, laser_list):
 
         st.subheader("Spectra viewer")
 
-        # 选中 vs 未选中 区分
-        selected_set = set(labels_sel)  # 完整 label，比如 "EUB338 – AF594"
-        color_map = {lab: _rgb01_to_plotly(colors[i]) for i, lab in enumerate(labels_sel)}
+        # 左边画图，右边控制亮/暗
+        col_fig, col_ctrl = st.columns([4, 1])
 
-        fig = go.Figure()
-        for j, lab in enumerate(labels_all_view):
-            y = E_raw_all_view[:, j] / (B + 1e-12)
+        # 所有染料（包括没选中的）各自的颜色（只用于 viewer）
+        colors_all = _ensure_colors(len(labels_all_view))
+        color_map_all = {
+            lab: _rgb01_to_plotly(colors_all[i])
+            for i, lab in enumerate(labels_all_view)
+        }
 
-            if lab in selected_set:
-                # 被选中的：亮、彩色、粗线
-                fig.add_trace(go.Scatter(
-                    x=wl,
-                    y=y,
-                    mode="lines",
-                    name=lab,
-                    line=dict(color=color_map[lab], width=2),
-                    opacity=1.0
-                ))
-            else:
-                # 未选中的：暗、灰色、细线、默认不在 legend 中
-                fig.add_trace(go.Scatter(
-                    x=wl,
-                    y=y,
-                    mode="lines",
-                    name=lab,
-                    line=dict(color="rgba(160,160,160,0.7)", width=1),
-                    opacity=0.2,
-                    showlegend=False
-                ))
+        # 默认高亮：选中的那几个
+        default_highlight = list(labels_sel)
 
-        fig.update_layout(
-            xaxis_title="Wavelength (nm)",
-            yaxis_title="Normalized intensity (relative to B)",
-            yaxis=dict(range=[0, 1.05])
-        )
-        st.plotly_chart(fig, use_container_width=True)
+        with col_ctrl:
+            st.markdown("**Highlight dyes**")
+            highlight_labels = st.multiselect(
+                "Click to toggle brightness",
+                options=labels_all_view,
+                default=default_highlight,
+                key="spectra_highlight"
+            )
+
+        with col_fig:
+            fig = go.Figure()
+            for j, lab in enumerate(labels_all_view):
+                y = E_raw_all_view[:, j] / (B + 1e-12)
+                base_color = color_map_all[lab]
+
+                if lab in highlight_labels:
+                    # 亮：不透明、线粗
+                    fig.add_trace(go.Scatter(
+                        x=wl,
+                        y=y,
+                        mode="lines",
+                        name=lab,
+                        line=dict(color=base_color, width=2),
+                        opacity=1.0,
+                    ))
+                else:
+                    # 暗：同色，但线细 + 低透明度，并且不占 legend
+                    fig.add_trace(go.Scatter(
+                        x=wl,
+                        y=y,
+                        mode="lines",
+                        name=lab,
+                        line=dict(color=base_color, width=1),
+                        opacity=0.15,
+                        showlegend=False,
+                    ))
+
+            fig.update_layout(
+                xaxis_title="Wavelength (nm)",
+                yaxis_title="Normalized intensity (relative to B)",
+                yaxis=dict(range=[0, 1.05])
+            )
+            st.plotly_chart(fig, use_container_width=True)
 
         # ---------- Simulations (always shown) ----------
         C = 23
