@@ -593,7 +593,11 @@ def run(groups, mode, laser_strategy, laser_list):
         E_raw_sel, E_norm_sel, labels_sel, _ = cached_build_effective_with_lasers(
             wl, dye_db, small_groups, laser_list, laser_strategy, powers
         )
-
+        
+        E_raw_all_view, _, labels_all_view, _ = cached_build_effective_with_lasers(
+            wl, dye_db, groups, laser_list, laser_strategy, powers
+        )
+        
         colors = _ensure_colors(len(labels_sel))
 
         # Top panels (kept): Selected / Pairwise / Spectra viewer
@@ -612,13 +616,37 @@ def run(groups, mode, laser_strategy, laser_list):
                             color_second_row=True, color_thresh=0.9, fmt2=True)
 
         st.subheader("Spectra viewer")
+
+        # 选中 vs 未选中 区分
+        selected_set = set(labels_sel)  # 完整 label，比如 "EUB338 – AF594"
+        color_map = {lab: _rgb01_to_plotly(colors[i]) for i, lab in enumerate(labels_sel)}
+
         fig = go.Figure()
-        for t in range(len(labels_sel)):
-            y = E_raw_sel[:, t] / (B + 1e-12)
-            fig.add_trace(go.Scatter(
-                x=wl, y=y, mode="lines", name=labels_sel[t],
-                line=dict(color=_rgb01_to_plotly(colors[t]), width=2)
-            ))
+        for j, lab in enumerate(labels_all_view):
+            y = E_raw_all_view[:, j] / (B + 1e-12)
+
+            if lab in selected_set:
+                # 被选中的：亮、彩色、粗线
+                fig.add_trace(go.Scatter(
+                    x=wl,
+                    y=y,
+                    mode="lines",
+                    name=lab,
+                    line=dict(color=color_map[lab], width=2),
+                    opacity=1.0
+                ))
+            else:
+                # 未选中的：暗、灰色、细线、默认不在 legend 中
+                fig.add_trace(go.Scatter(
+                    x=wl,
+                    y=y,
+                    mode="lines",
+                    name=lab,
+                    line=dict(color="rgba(160,160,160,0.7)", width=1),
+                    opacity=0.2,
+                    showlegend=False
+                ))
+
         fig.update_layout(
             xaxis_title="Wavelength (nm)",
             yaxis_title="Normalized intensity (relative to B)",
