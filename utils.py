@@ -177,38 +177,40 @@ def _interp_at(w, y, x):
     return float(y[i]*(1-t) + y[i+1]*t)
 
 
-def derive_powers_simultaneous(wl, dye_db, selection_labels, laser_wavelengths,
-                               strong_frac: float = 0.1):
+def derive_powers_simultaneous(wl, dye_db, selection_labels, laser_wavelengths):
     """
-    Simultaneous firing with 'useful-segment gating' and
-    'strong-contributor filtering' per segment.
+    Simultaneous firing with 'useful-segment gating':
 
-    - 一段 [lam[i], lam[i+1]) 被认为 useful: 至少一个已选染料的全局 emission 峰值落在这段。
-    - 第一个 useful 段：设 P[start] = 1，并以此段的最大亮度定义全局 B。
-    - 后续段 s：只考虑在该段中 "增量亮度能力" ΔL_j(s)=M_j(s)*c_sj
-      接近最大值的染料 (≥ strong_frac * max ΔL)，用它们来限制 P[s]。
+      - 按激光划分波段 [lam[i], lam[i+1])。
+      - 某个波段是 useful，当且仅当至少一个已选染料的全局 emission 峰值落在该段内。
+      - 找到第一个 useful 段 start：
+           P[start] = 1，
+           B = max_j ( seg_peak_j(start) * coef_j(lam[start]) )
+      - 对后续每个 useful 段 s：
+           用约束 (pre_j + coef_j(lam[s])*P[s]) * seg_peak_j(s) ≤ B
+           解出每个染料对 P[s] 的上界，取最小的那个。
 
-    这样可以避免在某个段里被 e.g. Pacific Blue 这种几乎不被该 laser 激发的染料卡住 power。
+    注意：这里的 coef 一律用 _interp_at 采样 excitation，和 build_effective_with_lasers 完全一致。
     """
     lam = np.array(sorted(laser_wavelengths), dtype=float)
-    segs = _segments_from_lasers(wl, lam)
+    segs = _segments_from_lasers(wl, lam)  # 你已有的 helper
     W = len(wl)
 
-    # Selected dye records
+    # 参与标定的染料（第一次 emission-only 选出的那批）
     fls = [s.split(" – ", 1)[1] for s in selection_labels]
     recs = [dye_db[f] for f in fls if f in dye_db]
 
-    # Helper: excitation*QY*EC at laser l (nearest-grid)
+    # 用插值方式取 excitation(λ_laser) * QY * EC
     def coef(rec, l):
         ex = rec["excitation"]
         qy = rec["quantum_yield"]
         ec = rec["extinction_coeff"]
-        if ex is None or len(ex) != W or qy is None or ec is None:
+        if ex is None or len(ex) != W or qy is None:
             return 0.0
-        idx = _nearest_idx_from_grid(wl, l)
-        return float(ex[idx] * qy * (ec if ec is not None else 1.0))
+        ex_l = _interp_at(wl, ex, l)   # 🔴 改成插值，而不是最近格点
+        return float(ex_l * qy * (ec if ec is not None else 1.0))
 
-    # Helper: peak emission inside [lo,hi)
+    # 波段内 emission 峰值
     def seg_peak(rec, lo, hi):
         em = rec["emission"]
         if em is None or len(em) != W:
@@ -219,7 +221,7 @@ def derive_powers_simultaneous(wl, dye_db, selection_labels, laser_wavelengths,
             return 0.0
         return float(np.max(em[loi:hii]))
 
-    # ---- decide which segments are 'useful' by global emission peak location ----
+    # -------- 1. 标记每个段是否 useful --------
     useful = [False] * len(segs)
     for rec in recs:
         em = rec.get("emission", None)
@@ -235,7 +237,7 @@ def derive_powers_simultaneous(wl, dye_db, selection_labels, laser_wavelengths,
     if not any(useful):
         return [0.0] * len(lam), 0.0
 
-    # ---- find first useful segment and initialize B ----
+    # -------- 2. 找到第一个 useful 段，设 P[start]=1 并定义 B --------
     start = None
     for s, u in enumerate(useful):
         if u:
@@ -247,51 +249,37 @@ def derive_powers_simultaneous(wl, dye_db, selection_labels, laser_wavelengths,
 
     lo0, hi0 = segs[start]
     M0 = np.array([seg_peak(r, lo0, hi0) for r in recs])
-    a0 = np.array([coef(r, lam[start]) for r in recs])
+    a0 = np.array([coef(r, lam[start])     for r in recs])
     B = float(np.max(a0 * M0)) if np.any(M0 > 0) else 0.0
 
-    # ---- march forward over later segments ----
+    # -------- 3. 依次往后算每个 useful 段的 P[s] --------
     for s in range(start + 1, len(lam)):
         if not useful[s]:
             P[s] = 0.0
             continue
 
         lo, hi = segs[s]
-        M = np.array([seg_peak(r, lo, hi) for r in recs])          # emission 峰值
-        c_s = np.array([coef(r, lam[s]) for r in recs])            # 当前 laser 上的 exc*QY*EC
+        M = np.array([seg_peak(r, lo, hi)     for r in recs])  # 段内 emission 峰值 M_j(s)
+        c_s = np.array([coef(r, lam[s])       for r in recs])  # 当前 laser 的系数 coef_j(λ_s)
 
-        # 已有 lasers 的累积亮度系数（不含当前 laser）
+        # 之前各 laser 的累计贡献 pre_j = Σ_m< s coef_j(λ_m) * P[m]
         pre = np.zeros(len(recs))
         for m in range(start, s):
             if P[m] <= 0.0:
                 continue
-            c_m = np.array([coef(r, lam[m]) for r in recs])
+            c_m = np.array([coef(r, lam[m])   for r in recs])
             pre += c_m * P[m]
 
-        # 增量亮度能力 ΔL = M * c_s，用它来判断谁是真正“由本 laser 主导”的染料
-        incr = M * c_s
-        max_incr = float(np.max(incr)) if np.any(incr > 0) else 0.0
-
-        # 如果这一段根本没有什么染料被当前 laser 激发，就不调这个 laser
-        if max_incr <= 0.0:
-            P[s] = 0.0
-            continue
-
-        # 只用“增量亮度不太小”的染料来限制 P[s]
-        strong_mask = incr >= strong_frac * max_incr
-
-        feasible = (M > 0) & (c_s > 0) & strong_mask
-        if not np.any(feasible):
-            # 回退：如果过滤后一个都没有，就退回到原始逻辑
-            feasible = (M > 0) & (c_s > 0)
-
+        feasible = (M > 0) & (c_s > 0)
         if not np.any(feasible):
             P[s] = 0.0
         else:
+            # 保证 (pre_j + c_sj * P[s]) * M_j ≤ B
             bounds = (B / (M[feasible] * c_s[feasible])) - (pre[feasible] / c_s[feasible])
             P[s] = max(0.0, float(np.min(bounds)))
 
     return [float(x) for x in P], float(B)
+
 
 
 
