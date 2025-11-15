@@ -177,17 +177,18 @@ def _interp_at(w, y, x):
     return float(y[i]*(1-t) + y[i+1]*t)
 
 
-def derive_powers_simultaneous(wl, dye_db, selection_labels, laser_wavelengths):
+def derive_powers_simultaneous(wl, dye_db, selection_labels, laser_wavelengths,
+                               strong_frac: float = 0.1):
     """
-    Simultaneous firing with 'useful-segment gating':
-      - A segment [lam[i], lam[i+1]) is 'useful' iff at least one selected dye has its
-        global emission peak located inside that segment. Otherwise set P[i]=0 and skip it.
-      - Among useful segments, find the first one in wavelength order; set its power=1 and
-        define B = max_i( seg_peak_i * coef_i(lam[start]) ).
-      - For each subsequent useful segment s, choose the smallest nonnegative P[s] so that
-        the segment's peak does not exceed B when adding cumulative contributions from all
-        lasers with indices <= s (inside that segment we sum coefficients of all m<=s).
-    Returns (powers_sorted_by_wavelength, B).
+    Simultaneous firing with 'useful-segment gating' and
+    'strong-contributor filtering' per segment.
+
+    - 一段 [lam[i], lam[i+1]) 被认为 useful: 至少一个已选染料的全局 emission 峰值落在这段。
+    - 第一个 useful 段：设 P[start] = 1，并以此段的最大亮度定义全局 B。
+    - 后续段 s：只考虑在该段中 "增量亮度能力" ΔL_j(s)=M_j(s)*c_sj
+      接近最大值的染料 (≥ strong_frac * max ΔL)，用它们来限制 P[s]。
+
+    这样可以避免在某个段里被 e.g. Pacific Blue 这种几乎不被该 laser 激发的染料卡住 power。
     """
     lam = np.array(sorted(laser_wavelengths), dtype=float)
     segs = _segments_from_lasers(wl, lam)
@@ -199,7 +200,9 @@ def derive_powers_simultaneous(wl, dye_db, selection_labels, laser_wavelengths):
 
     # Helper: excitation*QY*EC at laser l (nearest-grid)
     def coef(rec, l):
-        ex = rec["excitation"]; qy = rec["quantum_yield"]; ec = rec["extinction_coeff"]
+        ex = rec["excitation"]
+        qy = rec["quantum_yield"]
+        ec = rec["extinction_coeff"]
         if ex is None or len(ex) != W or qy is None or ec is None:
             return 0.0
         idx = _nearest_idx_from_grid(wl, l)
@@ -218,20 +221,17 @@ def derive_powers_simultaneous(wl, dye_db, selection_labels, laser_wavelengths):
 
     # ---- decide which segments are 'useful' by global emission peak location ----
     useful = [False] * len(segs)
-    # precompute each dye's global-peak wavelength
     for rec in recs:
         em = rec.get("emission", None)
         if em is None or len(em) != W:
             continue
-        jmax = int(np.argmax(em))  # if ties, first max is fine
+        jmax = int(np.argmax(em))
         lam_peak = wl[jmax]
-        # mark the segment containing lam_peak
         for s, (lo, hi) in enumerate(segs):
             if lo <= lam_peak < hi:
                 useful[s] = True
                 break
 
-    # if none useful, trivial
     if not any(useful):
         return [0.0] * len(lam), 0.0
 
@@ -255,11 +255,12 @@ def derive_powers_simultaneous(wl, dye_db, selection_labels, laser_wavelengths):
         if not useful[s]:
             P[s] = 0.0
             continue
-        lo, hi = segs[s]
-        M = np.array([seg_peak(r, lo, hi) for r in recs])
-        c_s = np.array([coef(r, lam[s]) for r in recs])
 
-        # cumulative contribution from earlier lasers (only those we kept)
+        lo, hi = segs[s]
+        M = np.array([seg_peak(r, lo, hi) for r in recs])          # emission 峰值
+        c_s = np.array([coef(r, lam[s]) for r in recs])            # 当前 laser 上的 exc*QY*EC
+
+        # 已有 lasers 的累积亮度系数（不含当前 laser）
         pre = np.zeros(len(recs))
         for m in range(start, s):
             if P[m] <= 0.0:
@@ -267,15 +268,31 @@ def derive_powers_simultaneous(wl, dye_db, selection_labels, laser_wavelengths):
             c_m = np.array([coef(r, lam[m]) for r in recs])
             pre += c_m * P[m]
 
-        feasible = (M > 0) & (c_s > 0)
+        # 增量亮度能力 ΔL = M * c_s，用它来判断谁是真正“由本 laser 主导”的染料
+        incr = M * c_s
+        max_incr = float(np.max(incr)) if np.any(incr > 0) else 0.0
+
+        # 如果这一段根本没有什么染料被当前 laser 激发，就不调这个 laser
+        if max_incr <= 0.0:
+            P[s] = 0.0
+            continue
+
+        # 只用“增量亮度不太小”的染料来限制 P[s]
+        strong_mask = incr >= strong_frac * max_incr
+
+        feasible = (M > 0) & (c_s > 0) & strong_mask
+        if not np.any(feasible):
+            # 回退：如果过滤后一个都没有，就退回到原始逻辑
+            feasible = (M > 0) & (c_s > 0)
+
         if not np.any(feasible):
             P[s] = 0.0
         else:
-            # ensure: (pre + c_s*P[s]) * M <= B  =>  P[s] <= B/(M*c_s) - pre/c_s
             bounds = (B / (M[feasible] * c_s[feasible])) - (pre[feasible] / c_s[feasible])
             P[s] = max(0.0, float(np.min(bounds)))
 
     return [float(x) for x in P], float(B)
+
 
 
 
