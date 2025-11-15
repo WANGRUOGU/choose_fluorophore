@@ -337,34 +337,69 @@ def build_effective_with_lasers(wl, dye_db, groups, laser_wavelengths, mode, pow
     lam = np.array(sorted(laser_wavelengths), dtype=float)
     pw = np.array(powers, dtype=float)
 
-    def _nearest_idx_from_grid_local(wl, lam):
-        idx = int(round(lam - wl[0]))
-        if idx < 0: idx = 0
-        if idx >= len(wl): idx = len(wl) - 1
+    def _nearest_idx_from_grid_local(wl_, lam_):
+        idx = int(round(lam_ - wl_[0]))
+        if idx < 0:
+            idx = 0
+        if idx >= len(wl_):
+            idx = len(wl_) - 1
         return idx
 
-    def _segments_from_lasers_local(wl, lasers_sorted):
-        segs = []
-        for i, l in enumerate(lasers_sorted):
-            lo = l
-            hi = lasers_sorted[i+1] if i+1 < len(lasers_sorted) else wl[-1] + 1
-            segs.append((lo, hi))
-        return segs
+    def _segments_from_lasers_local(wl_, lasers_sorted):
+        segs_ = []
+        for i_, l_ in enumerate(lasers_sorted):
+            lo_ = l_
+            hi_ = lasers_sorted[i_ + 1] if i_ + 1 < len(lasers_sorted) else wl_[-1] + 1
+            segs_.append((lo_, hi_))
+        return segs_
+
+    # ---- DEBUG helper: print PB excitation at each laser ----
+    def _debug_pacific_blue(fluor_name, ex, qy, ec, mode_tag: str):
+        name_clean = (fluor_name or "").strip().lower()
+        if name_clean != "pacific blue":
+            return
+        try:
+            import streamlit as st
+            lines = [f"[DEBUG {mode_tag}] {fluor_name} excitation at lasers:"]
+            for i_, l_ in enumerate(lam):
+                ex_val = _interp_at(wl, ex, l_)
+                coef = ex_val * qy * (ec if ec is not None else 1.0) * pw[i_]
+                lines.append(
+                    f"  λ = {l_:.1f} nm: ex(λ) = {ex_val:.6g}, "
+                    f"coef*P = {coef:.6g}  (pw[{i_}] = {pw[i_]:.4g})"
+                )
+            st.text("\n".join(lines))
+        except Exception:
+            # 如果在非 Streamlit 环境运行，就打印到控制台
+            print(f"[DEBUG {mode_tag}] {fluor_name} excitation at lasers:")
+            for i_, l_ in enumerate(lam):
+                ex_val = _interp_at(wl, ex, l_)
+                coef = ex_val * qy * (ec if ec is not None else 1.0) * pw[i_]
+                print(
+                    f"  λ = {l_:.1f} nm: ex(λ) = {ex_val:.6g}, "
+                    f"coef*P = {coef:.6g}  (pw[{i_}] = {pw[i_]:.4g})"
+                )
 
     cols, labels, idx_groups = [], [], []
     col_id = 0
 
     if mode == "Separate":
+        # --------- SEPARATE 模式 ----------
         for probe, cand_list in groups.items():
             idxs = []
             for fluor in cand_list:
                 rec = dye_db.get(fluor)
                 if rec is None:
                     continue
-                em = rec["emission"]; ex = rec["excitation"]
-                qy = rec["quantum_yield"]; ec = rec["extinction_coeff"]
+                em = rec["emission"]
+                ex = rec["excitation"]
+                qy = rec["quantum_yield"]
+                ec = rec["extinction_coeff"]
                 if em is None or ex is None or len(em) != W or len(ex) != W:
                     continue
+
+                # DEBUG: Pacific Blue 在各 laser 的 excitation 情况（Separate 模式）
+                _debug_pacific_blue(fluor, ex, qy, ec, mode_tag="Separate")
 
                 per_laser_blocks = []
                 for i, l in enumerate(lam):
@@ -388,6 +423,7 @@ def build_effective_with_lasers(wl, dye_db, groups, laser_wavelengths, mode, pow
         return E_raw, E_norm, labels, idx_groups
 
     else:
+        # --------- SIMULTANEOUS 模式（原来的分段算法） ----------
         segs = _segments_from_lasers_local(wl, lam)
         for probe, cand_list in groups.items():
             idxs = []
@@ -395,10 +431,15 @@ def build_effective_with_lasers(wl, dye_db, groups, laser_wavelengths, mode, pow
                 rec = dye_db.get(fluor)
                 if rec is None:
                     continue
-                em = rec["emission"]; ex = rec["excitation"]
-                qy = rec["quantum_yield"]; ec = rec["extinction_coeff"]
+                em = rec["emission"]
+                ex = rec["excitation"]
+                qy = rec["quantum_yield"]
+                ec = rec["extinction_coeff"]
                 if em is None or ex is None or len(em) != W or len(ex) != W:
                     continue
+
+                # DEBUG: Pacific Blue 在各 laser 的 excitation 情况（Simultaneous 模式）
+                _debug_pacific_blue(fluor, ex, qy, ec, mode_tag="Simultaneous")
 
                 eff = np.zeros(W, dtype=float)
                 for i, (lo, hi) in enumerate(segs):
@@ -420,16 +461,12 @@ def build_effective_with_lasers(wl, dye_db, groups, laser_wavelengths, mode, pow
         if not cols:
             Z = np.zeros((W, 0))
             return Z, Z, [], []
-if fluor == "Pacific Blue":
-    val_405 = _interp_at(wl, ex, 405)
-    val_488 = _interp_at(wl, ex, 488)
-    import streamlit as st
-    st.write("PB ex(405) = ", float(val_405))
-    st.write("PB ex(488) = ", float(val_488))
+
         E_raw = np.stack(cols, axis=1)
         denom = np.linalg.norm(E_raw, axis=0, keepdims=True) + 1e-12
         E_norm = E_raw / denom
         return E_raw, E_norm, labels, idx_groups
+
 
 
 # =================== Global-unique constraint ===================
