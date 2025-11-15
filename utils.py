@@ -179,106 +179,172 @@ def _interp_at(w, y, x):
 
 def derive_powers_simultaneous(wl, dye_db, selection_labels, laser_wavelengths):
     """
-    Simultaneous firing with 'useful-segment gating':
+    Simultaneous 模式下，严格按照下面逻辑确定各激光功率：
 
-      - 按激光划分波段 [lam[i], lam[i+1])。
-      - 某个波段是 useful，当且仅当至少一个已选染料的全局 emission 峰值落在该段内。
-      - 找到第一个 useful 段 start：
-           P[start] = 1，
-           B = max_j ( seg_peak_j(start) * coef_j(lam[start]) )
-      - 对后续每个 useful 段 s：
-           用约束 (pre_j + coef_j(lam[s])*P[s]) * seg_peak_j(s) ≤ B
-           解出每个染料对 P[s] 的上界，取最小的那个。
+    1. 将激光波长排序得到 lam[0] < lam[1] < ...，并定义波段
+       [lam[i], lam[i+1])，最后一段为 [lam[-1], wl[-1]+1)。
 
-    注意：这里的 coef 一律用 _interp_at 采样 excitation，和 build_effective_with_lasers 完全一致。
+    2. 只用 selection_labels 对应的 fluorophore 来标定功率：
+       - 找出每个染料全局 emission 峰值所在的波段；
+       - 某个波段只要有一个峰值落在其中，就称为“有峰值波段”。
+
+    3. 对于“没有峰值”的波段，其左边界激光功率设为 0。
+
+    4. 在最左的“有峰值波段” s0：
+       - 设该段左边界激光的功率 P[s0] = 1；
+       - 对每个染料 j 计算：
+            seg_peak_j = 该段内 emission 的最大值 M_{j,s0}
+            k_j        = excitation(L_s0)*QY*EC
+            value_j    = seg_peak_j * k_j
+         取所有 value_j 的最大值作为全局亮度上限 B。
+
+    5. 对后续每个“有峰值波段” s：
+       - 对每个染料 j：
+            pre_j = sum_{m < s} excitation(L_m)*QY*EC * P[m]
+            k_js  = excitation(L_s)*QY*EC
+            seg_peak_j = 该段内 emission 的最大值 M_{j,s}
+            需要满足：seg_peak_j * (pre_j + k_js * P[s]) <= B
+            令 f_j(c) = seg_peak_j * (pre_j + k_js * c)，
+            解 f_j(c) = B 得到：
+                c_j = (B/seg_peak_j - pre_j) / k_js
+            只保留 c_j > 0 作为有效上界。
+         在所有有效 c_j 中取最小值，作为该段左边界激光的功率 P[s]。
+
+    返回值：
+        powers_sorted_by_wavelength: len(lam) 的列表，和升序的 lam 一一对应
+        B: 初始段定义的亮度上限
     """
-    lam = np.array(sorted(laser_wavelengths), dtype=float)
-    segs = _segments_from_lasers(wl, lam)  # 你已有的 helper
+    import numpy as np
+
+    # 1) 激光排序
+    lam = np.array(sorted(set(float(l) for l in laser_wavelengths)), dtype=float)
     W = len(wl)
 
-    # 参与标定的染料（第一次 emission-only 选出的那批）
-    fls = [s.split(" – ", 1)[1] for s in selection_labels]
-    recs = [dye_db[f] for f in fls if f in dye_db]
+    if lam.size == 0:
+        return [0.0] * 0, 0.0
 
-    # 用插值方式取 excitation(λ_laser) * QY * EC
-    def coef(rec, l):
-        ex = rec["excitation"]
-        qy = rec["quantum_yield"]
-        ec = rec["extinction_coeff"]
-        if ex is None or len(ex) != W or qy is None:
-            return 0.0
-        ex_l = _interp_at(wl, ex, l)   # 🔴 改成插值，而不是最近格点
-        return float(ex_l * qy * (ec if ec is not None else 1.0))
+    # 2) 只用 selection_labels 对应的染料
+    fluor_names = [s.split(" – ", 1)[1] for s in selection_labels]
+    recs = []
+    for f in fluor_names:
+        rec = dye_db.get(f)
+        if rec is None:
+            continue
+        em = rec.get("emission")
+        ex = rec.get("excitation")
+        if em is None or ex is None or len(em) != W or len(ex) != W:
+            continue
+        recs.append(rec)
 
-    # 波段内 emission 峰值
-    def seg_peak(rec, lo, hi):
-        em = rec["emission"]
-        if em is None or len(em) != W:
-            return 0.0
+    if not recs:
+        # 没有可用染料，就全部功率设 0
+        return [0.0] * len(lam), 0.0
+
+    # 分段 helper（和 build_effective_with_lasers 保持一致）
+    segs = _segments_from_lasers(wl, lam)
+
+    def seg_peak(rec, seg_index):
+        """该染料 rec 在第 seg_index 段内 emission 最大值。"""
+        lo, hi = segs[seg_index]
         loi = _nearest_idx_from_grid(wl, lo)
         hii = _nearest_idx_from_grid(wl, hi - 1) + 1
         if loi >= hii:
             return 0.0
+        em = rec["emission"]
         return float(np.max(em[loi:hii]))
 
-    # -------- 1. 标记每个段是否 useful --------
-    useful = [False] * len(segs)
+    def coef_at(rec, l):
+        """在激光波长 l 下的 excitation * QY * EC（用插值方式取 ex(l)）。"""
+        ex = rec["excitation"]
+        qy = rec.get("quantum_yield", None)
+        ec = rec.get("extinction_coeff", None)
+        if ex is None or len(ex) != W or qy is None:
+            return 0.0
+        ex_l = _interp_at(wl, ex, l)
+        return float(ex_l * qy * (ec if ec is not None else 1.0))
+
+    # 3) 标记每个波段是否有峰值
+    seg_has_peak = [False] * len(segs)
     for rec in recs:
-        em = rec.get("emission", None)
+        em = rec["emission"]
         if em is None or len(em) != W:
             continue
         jmax = int(np.argmax(em))
         lam_peak = wl[jmax]
         for s, (lo, hi) in enumerate(segs):
             if lo <= lam_peak < hi:
-                useful[s] = True
+                seg_has_peak[s] = True
                 break
 
-    if not any(useful):
-        return [0.0] * len(lam), 0.0
+    peak_segs = [s for s, u in enumerate(seg_has_peak) if u]
 
-    # -------- 2. 找到第一个 useful 段，设 P[start]=1 并定义 B --------
-    start = None
-    for s, u in enumerate(useful):
-        if u:
-            start = s
-            break
-
+    # 初始化功率（默认 0）
     P = np.zeros(len(lam), dtype=float)
-    P[start] = 1.0
 
-    lo0, hi0 = segs[start]
-    M0 = np.array([seg_peak(r, lo0, hi0) for r in recs])
-    a0 = np.array([coef(r, lam[start])     for r in recs])
-    B = float(np.max(a0 * M0)) if np.any(M0 > 0) else 0.0
+    if not peak_segs:
+        # 没有任何有峰值的段，保持全 0
+        return P.tolist(), 0.0
 
-    # -------- 3. 依次往后算每个 useful 段的 P[s] --------
-    for s in range(start + 1, len(lam)):
-        if not useful[s]:
-            P[s] = 0.0
+    # 4) 最左的有峰值段 s0
+    s0 = peak_segs[0]
+    # 没有峰值的段左边界激光 power = 0 已经由 P 的初始值保证
+    P[s0] = 1.0
+
+    # 用 s0 段定义 B
+    B = 0.0
+    for rec in recs:
+        m0 = seg_peak(rec, s0)  # 该段内 emission 峰值
+        if m0 <= 0:
             continue
+        k0 = coef_at(rec, lam[s0]) * P[s0]
+        val = m0 * k0
+        if val > B:
+            B = val
 
-        lo, hi = segs[s]
-        M = np.array([seg_peak(r, lo, hi)     for r in recs])  # 段内 emission 峰值 M_j(s)
-        c_s = np.array([coef(r, lam[s])       for r in recs])  # 当前 laser 的系数 coef_j(λ_s)
+    if B <= 0.0:
+        # 理论上不太会出现，退化情况：所有东西都是 0
+        return P.tolist(), 0.0
 
-        # 之前各 laser 的累计贡献 pre_j = Σ_m< s coef_j(λ_m) * P[m]
-        pre = np.zeros(len(recs))
-        for m in range(start, s):
-            if P[m] <= 0.0:
+    # 5) 对后续每个有峰值段，依次求该段的激光功率
+    for s in peak_segs[1:]:
+        cand_c = []
+
+        for rec in recs:
+            # 该段 emission 峰值
+            m_seg = seg_peak(rec, s)
+            if m_seg <= 0.0:
                 continue
-            c_m = np.array([coef(r, lam[m])   for r in recs])
-            pre += c_m * P[m]
 
-        feasible = (M > 0) & (c_s > 0)
-        if not np.any(feasible):
-            P[s] = 0.0
+            # pre_j = 之前所有已经确定的激光在该染料上的总系数
+            pre_j = 0.0
+            for m_idx in range(s):
+                if P[m_idx] == 0.0:
+                    continue
+                k_prev = coef_at(rec, lam[m_idx])
+                pre_j += k_prev * P[m_idx]
+
+            # 当前段左边界激光的系数 k_js
+            k_js = coef_at(rec, lam[s])
+            if k_js <= 0.0:
+                # 这一段该染料对当前激光不敏感，不会给出上界
+                continue
+
+            # 解 m_seg * (pre_j + k_js * c) = B
+            c_j = (B / m_seg - pre_j) / k_js
+
+            # 只保留 c_j > 0 的解作为有效上界
+            if c_j > 0.0:
+                cand_c.append(c_j)
+
+        if cand_c:
+            P[s] = float(max(0.0, min(cand_c)))
         else:
-            # 保证 (pre_j + c_sj * P[s]) * M_j ≤ B
-            bounds = (B / (M[feasible] * c_s[feasible])) - (pre[feasible] / c_s[feasible])
-            P[s] = max(0.0, float(np.min(bounds)))
+            # 没有任何染料给出正的上界，就保持 0
+            P[s] = 0.0
 
-    return [float(x) for x in P], float(B)
+    # 返回和 lam（升序）一一对应的功率列表，以及 B
+    return P.tolist(), float(B)
+
 
 
 
