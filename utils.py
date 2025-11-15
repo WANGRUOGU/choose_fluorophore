@@ -420,7 +420,12 @@ def build_effective_with_lasers(wl, dye_db, groups, laser_wavelengths, mode, pow
         if not cols:
             Z = np.zeros((W, 0))
             return Z, Z, [], []
-
+if fluor == "Pacific Blue":
+    val_405 = _interp_at(wl, ex, 405)
+    val_488 = _interp_at(wl, ex, 488)
+    import streamlit as st
+    st.write("PB ex(405) = ", float(val_405))
+    st.write("PB ex(488) = ", float(val_488))
         E_raw = np.stack(cols, axis=1)
         denom = np.linalg.norm(E_raw, axis=0, keepdims=True) + 1e-12
         E_norm = E_raw / denom
