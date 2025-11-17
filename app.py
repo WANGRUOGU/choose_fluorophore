@@ -540,7 +540,7 @@ def run(groups, mode, laser_strategy, laser_list):
             ))
         fig.update_layout(
             xaxis_title="Wavelength (nm)",
-            yaxis_title="Normalized intensity (relative to B)",
+            yaxis_title="Normalized intensity",
             yaxis=dict(range=[0, 1.05]),
         )
         st.plotly_chart(fig, use_container_width=True)
