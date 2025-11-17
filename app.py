@@ -107,6 +107,13 @@ def _get_eub338_pool():
 
     return []
 
+# -------------------- Detection channels (nm) --------------------
+DETECTION_CHANNELS = np.array([
+    414, 423, 432, 441, 450, 459, 468, 477, 486,
+    494, 503, 512, 521, 530, 539, 548, 557, 566,
+    575, 583, 592, 601, 610, 619, 628, 637, 646,
+    655, 664, 673, 681, 690, 717
+], dtype=float)
 
 # -------------------- Sorting helper --------------------
 def _sort_by_emission_peak(wavelengths, labels):
@@ -365,11 +372,12 @@ def run(groups, mode, laser_strategy, laser_list):
         )
         st.plotly_chart(fig, use_container_width=True)
 
-        # --- Simulated rods + unmixing ---
-        C = 23
-        chan = 494.0 + 8.9 * np.arange(C)
+        # ---------- Simulations (always shown) ----------
+        chan = DETECTION_CHANNELS
+        C = len(chan)
         E = cached_interpolate_E_on_channels(wl, E_norm[:, sel_idx], chan)
-
+        
+        # auto-size canvas to ensure each fluor has 3 rods
         Atrue, Ahat = simulate_rods_and_unmix(E, rods_per=3)
 
         colL, colR = st.columns(2)
@@ -537,15 +545,12 @@ def run(groups, mode, laser_strategy, laser_list):
         )
         st.plotly_chart(fig, use_container_width=True)
 
-        # ---- Simulated rods + unmixing (based on effective spectra) ----
-        C = 23
-        chan = 494.0 + 8.9 * np.arange(C)
-        E = cached_interpolate_E_on_channels(
-            wl,
-            E_raw_sel / (B + 1e-12),
-            chan,
-        )
-
+        # ---------- Simulations (always shown) ----------
+        chan = DETECTION_CHANNELS
+        C = len(chan)
+        # Keep alignment with viewer choice
+        E = cached_interpolate_E_on_channels(wl, E_raw_sel/(B+1e-12), chan)
+        
         Atrue, Ahat = simulate_rods_and_unmix(E, rods_per=3)
 
         colL, colR = st.columns(2)
