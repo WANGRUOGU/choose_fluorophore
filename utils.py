@@ -179,51 +179,53 @@ def _interp_at(w, y, x):
 
 def derive_powers_simultaneous(wl, dye_db, selection_labels, laser_wavelengths):
     """
-    Simultaneous 模式下，严格按照下面逻辑确定各激光功率：
+    Calibrate laser powers in Simultaneous mode.
 
-    1. 将激光波长排序得到 lam[0] < lam[1] < ...，并定义波段
-       [lam[i], lam[i+1])，最后一段为 [lam[-1], wl[-1]+1)。
+    Idea (segment-based, using only the selected dyes):
 
-    2. 只用 selection_labels 对应的 fluorophore 来标定功率：
-       - 找出每个染料全局 emission 峰值所在的波段；
-       - 某个波段只要有一个峰值落在其中，就称为“有峰值波段”。
+    1. Sort laser wavelengths: lam[0] < lam[1] < ...
+       Define segments [lam[i], lam[i+1]) and the last one [lam[-1], wl[-1] + 1).
 
-    3. 对于“没有峰值”的波段，其左边界激光功率设为 0。
+    2. Use only dyes in `selection_labels` for calibration:
+       - For each dye, find the segment containing its global emission peak.
+       - A segment is called 'active' if at least one selected dye has its peak inside it.
 
-    4. 在最左的“有峰值波段” s0：
-       - 设该段左边界激光的功率 P[s0] = 1；
-       - 对每个染料 j 计算：
-            seg_peak_j = 该段内 emission 的最大值 M_{j,s0}
-            k_j        = excitation(L_s0)*QY*EC
+    3. For segments that are not active, the power of the left boundary laser is set to 0.
+
+    4. For the leftmost active segment s0:
+       - Set P[s0] = 1 for the laser at lam[s0].
+       - For each dye j, compute
+            seg_peak_j = max emission in segment s0
+            k_j        = excitation(lam[s0]) * QY * EC
             value_j    = seg_peak_j * k_j
-         取所有 value_j 的最大值作为全局亮度上限 B。
+         Define the global brightness cap B = max_j(value_j).
 
-    5. 对后续每个“有峰值波段” s：
-       - 对每个染料 j：
-            pre_j = sum_{m < s} excitation(L_m)*QY*EC * P[m]
-            k_js  = excitation(L_s)*QY*EC
-            seg_peak_j = 该段内 emission 的最大值 M_{j,s}
-            需要满足：seg_peak_j * (pre_j + k_js * P[s]) <= B
-            令 f_j(c) = seg_peak_j * (pre_j + k_js * c)，
-            解 f_j(c) = B 得到：
-                c_j = (B/seg_peak_j - pre_j) / k_js
-            只保留 c_j > 0 作为有效上界。
-         在所有有效 c_j 中取最小值，作为该段左边界激光的功率 P[s]。
+    5. For each later active segment s:
+       - For each dye j:
+            seg_peak_j = max emission in segment s
+            pre_j      = sum_{m < s} excitation(lam[m]) * QY * EC * P[m]
+            k_js       = excitation(lam[s]) * QY * EC
+            The constraint is:
+                seg_peak_j * (pre_j + k_js * P[s]) <= B
+            Solving seg_peak_j * (pre_j + k_js * c) = B gives:
+                c_j = (B / seg_peak_j - pre_j) / k_js
+            Keep only c_j > 0 as valid upper bounds.
+         Set P[s] = min_j(c_j) over all valid c_j (or 0 if no valid bound).
 
-    返回值：
-        powers_sorted_by_wavelength: len(lam) 的列表，和升序的 lam 一一对应
-        B: 初始段定义的亮度上限
+    Returns
+    -------
+    powers_sorted_by_wavelength : list[float]
+        Laser powers aligned with sorted `laser_wavelengths`.
+    B : float
+        Global brightness cap as defined in step 4.
     """
-    import numpy as np
-
-    # 1) 激光排序
     lam = np.array(sorted(set(float(l) for l in laser_wavelengths)), dtype=float)
     W = len(wl)
 
     if lam.size == 0:
         return [0.0] * 0, 0.0
 
-    # 2) 只用 selection_labels 对应的染料
+    # Collect dye records for the selected labels
     fluor_names = [s.split(" – ", 1)[1] for s in selection_labels]
     recs = []
     for f in fluor_names:
@@ -237,14 +239,14 @@ def derive_powers_simultaneous(wl, dye_db, selection_labels, laser_wavelengths):
         recs.append(rec)
 
     if not recs:
-        # 没有可用染料，就全部功率设 0
+        # No usable dyes: all powers are zero
         return [0.0] * len(lam), 0.0
 
-    # 分段 helper（和 build_effective_with_lasers 保持一致）
+    # Segment helper (aligned with build_effective_with_lasers)
     segs = _segments_from_lasers(wl, lam)
 
     def seg_peak(rec, seg_index):
-        """该染料 rec 在第 seg_index 段内 emission 最大值。"""
+        """Maximum emission of rec inside segment seg_index."""
         lo, hi = segs[seg_index]
         loi = _nearest_idx_from_grid(wl, lo)
         hii = _nearest_idx_from_grid(wl, hi - 1) + 1
@@ -254,7 +256,7 @@ def derive_powers_simultaneous(wl, dye_db, selection_labels, laser_wavelengths):
         return float(np.max(em[loi:hii]))
 
     def coef_at(rec, l):
-        """在激光波长 l 下的 excitation * QY * EC（用插值方式取 ex(l)）。"""
+        """excitation(l) * QY * EC (using interpolation on excitation)."""
         ex = rec["excitation"]
         qy = rec.get("quantum_yield", None)
         ec = rec.get("extinction_coeff", None)
@@ -263,7 +265,7 @@ def derive_powers_simultaneous(wl, dye_db, selection_labels, laser_wavelengths):
         ex_l = _interp_at(wl, ex, l)
         return float(ex_l * qy * (ec if ec is not None else 1.0))
 
-    # 3) 标记每个波段是否有峰值
+    # Mark active segments: those that contain at least one global emission peak
     seg_has_peak = [False] * len(segs)
     for rec in recs:
         em = rec["emission"]
@@ -278,22 +280,21 @@ def derive_powers_simultaneous(wl, dye_db, selection_labels, laser_wavelengths):
 
     peak_segs = [s for s, u in enumerate(seg_has_peak) if u]
 
-    # 初始化功率（默认 0）
+    # Initialize powers with zeros
     P = np.zeros(len(lam), dtype=float)
 
     if not peak_segs:
-        # 没有任何有峰值的段，保持全 0
+        # No active segments: everything stays zero
         return P.tolist(), 0.0
 
-    # 4) 最左的有峰值段 s0
+    # Leftmost active segment s0
     s0 = peak_segs[0]
-    # 没有峰值的段左边界激光 power = 0 已经由 P 的初始值保证
     P[s0] = 1.0
 
-    # 用 s0 段定义 B
+    # Define B from segment s0
     B = 0.0
     for rec in recs:
-        m0 = seg_peak(rec, s0)  # 该段内 emission 峰值
+        m0 = seg_peak(rec, s0)
         if m0 <= 0:
             continue
         k0 = coef_at(rec, lam[s0]) * P[s0]
@@ -302,20 +303,19 @@ def derive_powers_simultaneous(wl, dye_db, selection_labels, laser_wavelengths):
             B = val
 
     if B <= 0.0:
-        # 理论上不太会出现，退化情况：所有东西都是 0
+        # Degenerate case: everything is effectively zero
         return P.tolist(), 0.0
 
-    # 5) 对后续每个有峰值段，依次求该段的激光功率
+    # March over later active segments and set their powers
     for s in peak_segs[1:]:
         cand_c = []
 
         for rec in recs:
-            # 该段 emission 峰值
             m_seg = seg_peak(rec, s)
             if m_seg <= 0.0:
                 continue
 
-            # pre_j = 之前所有已经确定的激光在该染料上的总系数
+            # pre_j: contribution from all previously calibrated lasers
             pre_j = 0.0
             for m_idx in range(s):
                 if P[m_idx] == 0.0:
@@ -323,32 +323,24 @@ def derive_powers_simultaneous(wl, dye_db, selection_labels, laser_wavelengths):
                 k_prev = coef_at(rec, lam[m_idx])
                 pre_j += k_prev * P[m_idx]
 
-            # 当前段左边界激光的系数 k_js
+            # Contribution of the current laser
             k_js = coef_at(rec, lam[s])
             if k_js <= 0.0:
-                # 这一段该染料对当前激光不敏感，不会给出上界
+                # This dye does not respond to the current laser
                 continue
 
-            # 解 m_seg * (pre_j + k_js * c) = B
+            # Solve m_seg * (pre_j + k_js * c) = B
             c_j = (B / m_seg - pre_j) / k_js
-
-            # 只保留 c_j > 0 的解作为有效上界
             if c_j > 0.0:
                 cand_c.append(c_j)
 
         if cand_c:
             P[s] = float(max(0.0, min(cand_c)))
         else:
-            # 没有任何染料给出正的上界，就保持 0
+            # No positive upper bound from any dye -> keep at 0
             P[s] = 0.0
 
-    # 返回和 lam（升序）一一对应的功率列表，以及 B
     return P.tolist(), float(B)
-
-
-
-
-
 
 def derive_powers_separate(wl, dye_db, selection_labels, laser_wavelengths):
     """
@@ -396,13 +388,35 @@ def derive_powers_separate(wl, dye_db, selection_labels, laser_wavelengths):
 
 def build_effective_with_lasers(wl, dye_db, groups, laser_wavelengths, mode, powers):
     """
-    Build effective spectra for ALL candidates.
-    - Simultaneous: additive inside each laser's segment; cumulative coefficient within segment.
-    - Separate: build a block per laser and horizontally concatenate the blocks per dye.
-    Returns:
-      E_raw:  W x N  (Simultaneous)  OR  (W*L) x N (Separate)
-      E_norm: same shape, L2 norm by column for optimization
-      labels_pair, idx_groups
+    Build effective spectra for ALL candidates, given laser wavelengths and powers.
+
+    Parameters
+    ----------
+    wl : array-like, shape (W,)
+        Wavelength grid (nm).
+    dye_db : dict
+        Mapping: fluorophore name -> {emission, excitation, quantum_yield, extinction_coeff}.
+    groups : dict[str, list[str]]
+        Mapping: probe/group name -> list of candidate fluorophore names.
+    laser_wavelengths : list[float]
+        Laser wavelengths (nm).
+    mode : {"Simultaneous", "Separate"}
+        - "Simultaneous": additive inside each segment; within a segment, the
+          effective coefficient is the cumulative sum over all lasers up to that segment.
+        - "Separate": build a block per laser and concatenate blocks vertically.
+    powers : list[float]
+        Laser powers aligned with sorted(laser_wavelengths).
+
+    Returns
+    -------
+    E_raw : ndarray
+        Shape (W, N) for "Simultaneous" or (W * L, N) for "Separate".
+    E_norm : ndarray
+        Same shape as E_raw, L2-normalized per column.
+    labels_pair : list[str]
+        List of labels "Probe – Fluor" in column order.
+    idx_groups : list[list[int]]
+        Column indices per group, in the same group order as `groups`.
     """
     W = len(wl)
     lam = np.array(sorted(laser_wavelengths), dtype=float)
@@ -423,6 +437,93 @@ def build_effective_with_lasers(wl, dye_db, groups, laser_wavelengths, mode, pow
             hi_ = lasers_sorted[i_ + 1] if i_ + 1 < len(lasers_sorted) else wl_[-1] + 1
             segs_.append((lo_, hi_))
         return segs_
+
+    cols, labels, idx_groups = [], [], []
+    col_id = 0
+
+    if mode == "Separate":
+        # --------- SEPARATE mode: one block per laser, then vertical concatenation ----------
+        for probe, cand_list in groups.items():
+            idxs = []
+            for fluor in cand_list:
+                rec = dye_db.get(fluor)
+                if rec is None:
+                    continue
+                em = rec["emission"]
+                ex = rec["excitation"]
+                qy = rec["quantum_yield"]
+                ec = rec["extinction_coeff"]
+                if em is None or ex is None or len(em) != W or len(ex) != W:
+                    continue
+
+                per_laser_blocks = []
+                for i, l in enumerate(lam):
+                    k = _interp_at(wl, ex, l) * qy * (ec if ec is not None else 1.0) * pw[i]
+                    per_laser_blocks.append(em * k)
+                eff_concat = np.concatenate(per_laser_blocks, axis=0)
+                cols.append(eff_concat)
+                labels.append(f"{probe} – {fluor}")
+                idxs.append(col_id)
+                col_id += 1
+            if idxs:
+                idx_groups.append(idxs)
+
+        if not cols:
+            Z = np.zeros((W * max(1, len(lam)), 0))
+            return Z, Z, [], []
+
+        E_raw = np.stack(cols, axis=1)
+        denom = np.linalg.norm(E_raw, axis=0, keepdims=True) + 1e-12
+        E_norm = E_raw / denom
+        return E_raw, E_norm, labels, idx_groups
+
+    else:
+        # --------- SIMULTANEOUS mode: segment-wise additive, cumulative coefficient ----------
+        segs = _segments_from_lasers_local(wl, lam)
+        for probe, cand_list in groups.items():
+            idxs = []
+            for fluor in cand_list:
+                rec = dye_db.get(fluor)
+                if rec is None:
+                    continue
+                em = rec["emission"]
+                ex = rec["excitation"]
+                qy = rec["quantum_yield"]
+                ec = rec["extinction_coeff"]
+                if em is None or ex is None or len(em) != W or len(ex) != W:
+                    continue
+
+                eff = np.zeros(W, dtype=float)
+                for i, (lo, hi) in enumerate(segs):
+                    loi = _nearest_idx_from_grid_local(wl, lo)
+                    hii = _nearest_idx_from_grid_local(wl, hi - 1) + 1
+                    # cumulative coefficient within this segment (sum over all lasers up to index i)
+                    total_k = 0.0
+                    for m in range(i + 1):
+                        total_k += (
+                            _interp_at(wl, ex, lam[m]) *
+                            qy *
+                            (ec if ec is not None else 1.0) *
+                            pw[m]
+                        )
+                    eff[loi:hii] += em[loi:hii] * total_k
+
+                cols.append(eff)
+                labels.append(f"{probe} – {fluor}")
+                idxs.append(col_id)
+                col_id += 1
+            if idxs:
+                idx_groups.append(idxs)
+
+        if not cols:
+            Z = np.zeros((W, 0))
+            return Z, Z, [], []
+
+        E_raw = np.stack(cols, axis=1)
+        denom = np.linalg.norm(E_raw, axis=0, keepdims=True) + 1e-12
+        E_norm = E_raw / denom
+        return E_raw, E_norm, labels, idx_groups
+
 
 # =================== Global-unique constraint ===================
 
